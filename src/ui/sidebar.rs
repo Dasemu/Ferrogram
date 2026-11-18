@@ -6,9 +6,10 @@ use iced::{Alignment, Element, Length};
 use super::format;
 use super::icons::Icon;
 use super::theme::{self, FONT_SEMIBOLD};
-use super::widgets::{avatar, badge, icon};
+use super::widgets::{avatar, badge, emoji_line, icon};
 use crate::app::{App, Message, Ui};
 use crate::model::{Chat, ChatKind, ConnState, Message as ChatMessage, SendState};
+use iced::widget::text::Wrapping;
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let t = &app.theme;
@@ -179,9 +180,10 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
         _ => {}
     }
     title_row = title_row.push(
-        text(format::ellipsize(&c.title, 26))
+        text(format::ellipsize(&c.title, 24))
             .size(m.font_m)
             .font(FONT_SEMIBOLD)
+            .wrapping(Wrapping::None)
             .color(fg),
     );
     if c.muted {
@@ -232,12 +234,20 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
         }
         let media_only = last.text.trim().is_empty() && last.media.is_some();
         preview_row = preview_row.push(
-            text(format::ellipsize(&last.preview(), 34))
-                .size(m.font_m)
-                .color(if media_only && !selected { p.link } else { sec }),
+            container(emoji_line(
+                format::ellipsize(
+                    &last.preview(),
+                    if c.kind == ChatKind::Group { 24 } else { 30 },
+                ),
+                m.font_m,
+                if media_only && !selected { p.link } else { sec },
+            ))
+            .width(Length::Fill)
+            .clip(true),
         );
+    } else {
+        preview_row = preview_row.push(Space::new().width(Length::Fill));
     }
-    preview_row = preview_row.push(Space::new().width(Length::Fill));
     if c.unread_count > 0 {
         preview_row = preview_row.push(badge(t, format::badge_count(c.unread_count), c.muted));
     } else if c.pinned {
@@ -283,9 +293,13 @@ fn message_result_row<'a>(app: &'a App, c: &'a Chat, msg: &'a ChatMessage) -> El
                     .size(m.font_xs)
                     .color(p.text_secondary),
             ],
-            text(format::ellipsize(&msg.preview(), 38))
-                .size(m.font_m)
-                .color(p.text_secondary),
+            container(emoji_line(
+                format::ellipsize(&msg.preview(), 36),
+                m.font_m,
+                p.text_secondary
+            ))
+            .width(Length::Fill)
+            .clip(true),
         ]
         .spacing(4),
     ]

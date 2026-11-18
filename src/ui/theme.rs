@@ -302,11 +302,6 @@ pub fn bubble(
                 radius,
                 ..Border::default()
             },
-            shadow: Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.18),
-                offset: Vector::new(0.0, 1.0),
-                blur_radius: 1.0,
-            },
             ..container::Style::default()
         }
     }

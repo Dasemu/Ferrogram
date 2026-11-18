@@ -9,7 +9,7 @@ use iced::{Alignment, Color, ContentFit, Element, Length, Padding};
 use super::format;
 use super::icons::{Icon, TAIL_IN, TAIL_OUT};
 use super::theme::{self, FONT_SEMIBOLD, NAME_COLORS};
-use super::widgets::{avatar, icon};
+use super::widgets::{EMOJI_FONT, avatar, emoji_text, icon};
 use crate::app::state::ComposeMode;
 use crate::app::{App, CHAT_SEARCH_ID, COMPOSER_ID, HISTORY_ID, Message, Ui};
 use crate::model::{Chat, ChatKind, Media, Message as ChatMessage, SendState, avatar_color_index};
@@ -38,7 +38,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     };
     let chat = app.chats.get(chat_id);
 
-    let mut col = Column::new().push(header(app, chat));
+    let mut col = Column::new().width(Length::Fill).push(header(app, chat));
     if let Some(s) = &app.chat_search {
         col = col.push(search_bar(app, s));
     }
@@ -62,10 +62,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .padding(16),
         );
     }
-    if let Some(s) = &app.chat_search {
-        if s.submitted {
-            layers = layers.push(search_results(app, s));
-        }
+    if let Some(s) = &app.chat_search
+        && s.submitted
+    {
+        layers = layers.push(search_results(app, s));
     }
     if app.emoji_open {
         layers = layers.push(emoji_panel(app));
@@ -125,6 +125,7 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
         .align_y(Alignment::Center),
     )
     .padding([0, 14])
+    .width(Length::Fill)
     .height(m.header_height)
     .align_y(Alignment::Center)
     .style(theme::fill(p.bg_sidebar))
@@ -161,6 +162,7 @@ fn search_bar<'a>(app: &'a App, s: &'a crate::app::ChatSearch) -> Element<'a, Me
         .align_y(Alignment::Center),
     )
     .padding([4, 16])
+    .width(Length::Fill)
     .style(move |_| container::Style {
         background: Some(p.bg_sidebar.into()),
         border: iced::Border {
@@ -203,9 +205,11 @@ fn search_results<'a>(app: &'a App, s: &'a crate::app::ChatSearch) -> Element<'a
                             .size(m.font_xs)
                             .color(p.text_secondary),
                     ],
-                    text(format::ellipsize(&msg.preview(), 60))
-                        .size(m.font_s)
-                        .color(p.text_secondary),
+                    emoji_text(
+                        format::ellipsize(&msg.preview(), 60),
+                        m.font_s,
+                        p.text_secondary
+                    ),
                 ]
                 .spacing(2),
             )
@@ -346,15 +350,16 @@ fn message_row<'a>(
     let is_group = chat.is_some_and(|c| c.kind == ChatKind::Group) && !out;
 
     let mut body = Column::new().spacing(4);
-    if show_name && !out {
-        if let Some(name) = &msg.sender_name {
-            body = body.push(
-                text(name.clone())
-                    .size(m.font_s)
-                    .font(FONT_SEMIBOLD)
-                    .color(sender_color(msg.sender_id)),
-            );
-        }
+    if show_name
+        && !out
+        && let Some(name) = &msg.sender_name
+    {
+        body = body.push(
+            text(name.clone())
+                .size(m.font_s)
+                .font(FONT_SEMIBOLD)
+                .color(sender_color(msg.sender_id)),
+        );
     }
     if let Some(reply_id) = msg.reply_to {
         body = body.push(reply_quote(app, chat, reply_id, out));
@@ -399,7 +404,7 @@ fn message_row<'a>(
         && msg.reactions.is_empty()
         && !msg.text.is_empty();
     if !msg.text.is_empty() {
-        let txt = text(msg.text.clone()).size(m.font_m).color(p.text_primary);
+        let txt = emoji_text(msg.text.clone(), m.font_m, p.text_primary);
         if let (true, Some(mt)) = (short, meta.take_if(|_| short)) {
             body = body.push(row![txt, Space::new().width(10), mt].align_y(Alignment::End));
         } else {
@@ -412,7 +417,7 @@ fn message_row<'a>(
             bottom = bottom.push(
                 button(
                     row![
-                        text(r.emoji.clone()).size(m.font_s),
+                        text(r.emoji.clone()).size(m.font_s).font(EMOJI_FONT),
                         text(r.count.to_string())
                             .size(m.font_xs)
                             .font(FONT_SEMIBOLD),
@@ -537,9 +542,7 @@ fn reply_quote<'a>(
             container(Space::new().width(3).height(34)).style(theme::pill(bar, 2.0)),
             column![
                 text(name).size(m.font_s).font(FONT_SEMIBOLD).color(color),
-                text(format::ellipsize(&preview, 40))
-                    .size(m.font_s)
-                    .color(p.text_primary),
+                emoji_text(format::ellipsize(&preview, 40), m.font_s, p.text_primary),
             ]
             .spacing(1),
         ]
@@ -613,7 +616,7 @@ fn media_view<'a>(app: &'a App, msg: &'a ChatMessage, media: &'a Media) -> Eleme
             .padding([2, 0])
             .into()
         }
-        Media::Sticker { emoji } => text(emoji.clone()).size(72).into(),
+        Media::Sticker { emoji } => text(emoji.clone()).size(72).font(EMOJI_FONT).into(),
         Media::Other { label } => text(label.clone())
             .size(m.font_m)
             .color(if out { p.time_out } else { p.link })
@@ -627,7 +630,7 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> Element<'a, Message> 
     let mut reactions = row![].spacing(2);
     for e in QUICK_REACTIONS {
         reactions = reactions.push(
-            button(text(e).size(20))
+            button(text(e).size(20).font(EMOJI_FONT))
                 .padding([4, 6])
                 .on_press(Message::Ui(Ui::React(msg.id, e.to_owned())))
                 .style(theme::icon_button(p, true)),
@@ -701,7 +704,7 @@ fn emoji_panel(app: &App) -> Element<'_, Message> {
         let mut r = row![].spacing(2);
         for e in chunk {
             r = r.push(
-                button(text(*e).size(22))
+                button(text(*e).size(22).font(EMOJI_FONT))
                     .padding([4, 6])
                     .on_press(Message::Ui(Ui::InsertEmoji(e)))
                     .style(theme::icon_button(p, false)),
@@ -757,9 +760,7 @@ fn compose_bar(app: &App) -> Element<'_, Message> {
             container(Space::new().width(2).height(34)).style(theme::pill(p.link, 1.0)),
             column![
                 text(title).size(m.font_s).font(FONT_SEMIBOLD).color(p.link),
-                text(format::ellipsize(&preview, 70))
-                    .size(m.font_s)
-                    .color(p.text_primary),
+                emoji_text(format::ellipsize(&preview, 70), m.font_s, p.text_primary),
             ]
             .spacing(1)
             .width(Length::Fill),
@@ -772,6 +773,7 @@ fn compose_bar(app: &App) -> Element<'_, Message> {
         .align_y(Alignment::Center),
     )
     .padding([6, 16])
+    .width(Length::Fill)
     .style(theme::fill(p.bg_sidebar))
     .into()
 }
@@ -811,6 +813,7 @@ fn composer(app: &App) -> Element<'_, Message> {
         .align_y(Alignment::Center),
     )
     .padding([2, 6])
+    .width(Length::Fill)
     .height(m.composer_height)
     .align_y(Alignment::Center)
     .style(theme::fill(p.bg_sidebar))
