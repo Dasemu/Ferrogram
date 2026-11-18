@@ -16,6 +16,16 @@ fn main() -> iced::Result {
         );
         return Ok(());
     }
+    // Renderer choice (architecture §1): the CPU renderer (tiny-skia) keeps
+    // idle RSS around 30 MB, while wgpu costs 100+ MB for its device and
+    // pipelines. Default to tiny-skia; `FERRO_RENDERER=wgpu` or an explicit
+    // `ICED_BACKEND` opts back into the GPU path.
+    if std::env::var_os("ICED_BACKEND").is_none()
+        && std::env::var("FERRO_RENDERER").as_deref() != Ok("wgpu")
+    {
+        // SAFETY: called at the top of `main`, before any thread is spawned.
+        unsafe { std::env::set_var("ICED_BACKEND", "tiny-skia") };
+    }
     let config = Config::from_env(&args);
     ferrogram::logging::init((!config.mock).then(|| config.log_path()).as_deref());
     tracing::info!(

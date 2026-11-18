@@ -76,7 +76,7 @@ Never commit these values.
 `--mock` login codes: `12345` asks for the 2FA password `hunter2`; `22222`
 signs in directly. In mock mode "Echo Bot" replies to whatever you send.
 
-Environment variables: `FERRO_THEME=light`, `FERRO_TRACE_STARTUP=1` (logs
+Environment variables: `FERRO_THEME=light`, `FERRO_RENDERER=wgpu` (GPU renderer; the default is the CPU renderer tiny-skia, ~30 MB idle), `FERRO_TRACE_STARTUP=1` (logs
 `first_frame_ms`), `FERROGRAM_NOTIFY_SENDER_ONLY=1`, `FERROGRAM_NO_NOTIFY=1`,
 `RUST_LOG=debug`.
 
