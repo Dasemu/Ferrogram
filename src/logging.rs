@@ -182,7 +182,9 @@ pub fn init(log_path: Option<&Path>) {
         stderr: true,
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,grammers=warn,wgpu=warn,naga=warn,cosmic_text=warn")
+        EnvFilter::new(
+            "info,grammers=warn,wgpu=warn,naga=warn,cosmic_text=warn,iced_winit=warn,winit=warn",
+        )
     });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)

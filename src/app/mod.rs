@@ -894,6 +894,7 @@ impl App {
                 })
             }
             Done::ApiReady(Err(e)) => {
+                warn!(error = %e, "telegram client unavailable");
                 self.conn = ConnState::Disconnected;
                 self.auth(AuthEvent::Restored(Err(e)))
             }
