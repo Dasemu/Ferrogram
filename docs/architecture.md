@@ -241,3 +241,54 @@ pub struct FerroTheme { pub palette: Palette, pub metrics: Metrics, pub dark: bo
 * Protocol client design and library choice → `docs/protocol.md`.
 * Screens and navigation map.
 * Palette table.
+
+### 11.1 Ferrogram: extra top-level modules
+
+The shared layout is kept; Ferrogram adds three small top-level modules
+because they are used by more than one of the fixed modules:
+
+| File | Why it is top-level |
+|---|---|
+| `src/model.rs` | Domain types (`Chat`, `Message`, `Media`, `Reaction`, `ConnState`) shared by `net`, `store` and `app`. Keeps `store` from depending on `app`. |
+| `src/logging.rs` | `tracing` init, 5 MB rotating file, and the scrubbing writer (§6). |
+| `src/desktop.rs` | `notify-rust` notifications (§9). |
+
+`app/screenshot.rs` holds the `--screenshot` script; `ui/format.rs` and
+`ui/widgets.rs` hold pure formatting helpers and shared widgets.
+
+### 11.2 Screens and navigation
+
+```
+Restoring ──▶ Phone ──▶ Code ──▶ (Password) ──▶ Main
+   │  ▲          ▲        │           │            │
+   │  └──────────┴── Back ┘───────────┘            │ session revoked / Log out
+   └──────────────(stored session)────────────────▶│──▶ Phone
+Main = Sidebar (menu · search · chat list | search results)
+     + Chat pane (header · in-chat search · history · reply/edit bar · composer)
+     + overlays (message context menu, emoji panel, photo viewer, toast)
+```
+
+Keyboard: `Enter` sends, `Esc` closes the top-most layer (menu → viewer →
+context menu → emoji → reply/edit → in-chat search → sidebar search).
+Right-click a bubble for the context menu (reactions, Reply, Edit, Copy,
+Delete); double-click a bubble to reply. Files can be attached with the
+paperclip (XDG portal file chooser) or dropped onto the window.
+
+### 11.3 Palette (Telegram Desktop "Night", recreated by eye)
+
+| Token | Value | Token | Value |
+|---|---|---|---|
+| `bg_app` / `bg_panel` | `#0e1621` | `bg_sidebar` | `#17212b` |
+| `bg_selected` | `#2b5278` | `bg_hover` | `#202b36` |
+| `bubble_out` | `#2b5278` | `bubble_in` | `#182533` |
+| `text_primary` | `#f5f5f5` | `text_secondary` | `#7f91a4` |
+| `accent` | `#5288c1` | `link` | `#6ab3f3` |
+| `badge` | `#3e6a96` | `badge_muted` | `#3b4856` |
+| `time_in` | `#6d7f8f` | `time_out` / `check_out` | `#7da8d3` / `#64b5f6` |
+| `bg_input` | `#242f3d` | `danger` | `#ec3942` |
+
+Metrics: sidebar 340 px, chat row 62 px with 50 px avatars, header 54 px,
+bubble radius 14 px (4 px on the tail corner), max bubble width 470 px,
+Inter 14.5 px body / 12 px meta. A light "Day" palette exists
+(`FERRO_THEME=light`). Avatar placeholders use Telegram's seven gradient
+colours chosen by `id % 7`.
