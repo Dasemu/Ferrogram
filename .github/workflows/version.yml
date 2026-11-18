@@ -1,0 +1,58 @@
+name: Version
+
+# development push        -> bump PATCH
+# merged development->main -> bump MINOR, reset PATCH
+# direct push to main      -> bump PATCH
+on:
+  push:
+    branches: [main, development]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: version-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release)') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decide bump kind
+        id: kind
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+          REF: ${{ github.ref_name }}
+        run: |
+          kind=patch
+          if [ "$REF" = "main" ] && printf '%s' "$MSG" | grep -Eq "^Merge pull request #[0-9]+ from [^ ]+/development"; then
+            kind=minor
+          fi
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+      - name: Bump version in Cargo.toml
+        id: bump
+        env:
+          KIND: ${{ steps.kind.outputs.kind }}
+        run: |
+          cur=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          IFS=. read -r major minor patch <<< "$cur"
+          if [ "$KIND" = "minor" ]; then minor=$((minor + 1)); patch=0; else patch=$((patch + 1)); fi
+          new="$major.$minor.$patch"
+          sed -i "0,/^version = \"$cur\"/s//version = \"$new\"/" Cargo.toml
+          if [ -f Cargo.lock ]; then
+            awk -v new="$new" 'BEGIN{p=0} /^name = "ferrogram"$/{p=1} p && /^version = /{sub(/".*"/, "\"" new "\""); p=0} {print}' Cargo.lock > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock
+          fi
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+      - name: Commit
+        env:
+          NEW: ${{ steps.bump.outputs.new }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock 2>/dev/null || git add Cargo.toml
+          git commit -m "chore(release): v$NEW [skip ci]"
+          git push
