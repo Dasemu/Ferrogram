@@ -24,7 +24,7 @@ use crate::model::{
 use crate::net::{Event, TelegramApi, UploadKind};
 
 /// Fixed "now" so screenshots and tests are deterministic (2026-11-18 14:32 UTC).
-pub const MOCK_NOW: i64 = 1_795_098_720;
+pub const MOCK_NOW: i64 = 1_795_012_320;
 pub const SELF_ID: i64 = 100;
 pub const ALICE: ChatId = 201;
 pub const ECHO_BOT: ChatId = 206;
@@ -415,15 +415,15 @@ fn chats_and_history() -> (Vec<Chat>, BTreeMap<ChatId, Vec<Message>>) {
             "Next book: The Left Hand of Darkness",
         )],
     );
-    if let Some(v) = hist.get_mut(&-303) {
-        if let Some(m) = v.last_mut() {
-            m.text.clear();
-            m.media = Some(Media::Photo {
-                id: 9002,
-                width: 800,
-                height: 600,
-            });
-        }
+    if let Some(v) = hist.get_mut(&-303)
+        && let Some(m) = v.last_mut()
+    {
+        m.text.clear();
+        m.media = Some(Media::Photo {
+            id: 9002,
+            width: 800,
+            height: 600,
+        });
     }
     if let Some(c) = chats.iter_mut().find(|c| c.id == -303) {
         c.last_message = hist.get(&-303).and_then(|v| v.last().cloned());
@@ -509,10 +509,10 @@ impl FakeTelegram {
 
     /// Inject a server-side event, as if it came from the update stream.
     pub fn push_event(&self, ev: Event) {
-        if let Ok(mut s) = self.st() {
-            if let Event::NewMessage(m) = &ev {
-                s.history.entry(m.chat_id).or_default().push(m.clone());
-            }
+        if let Ok(mut s) = self.st()
+            && let Event::NewMessage(m) = &ev
+        {
+            s.history.entry(m.chat_id).or_default().push(m.clone());
         }
         let _ = self.events_tx.send(ev);
     }
@@ -556,19 +556,19 @@ impl FakeTelegram {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(900)).await;
             let _ = tx.send(Event::ReadOutbox { chat, max_id: id });
-            if chat == ECHO_BOT {
-                if let Ok(echo_id) = echo_id {
-                    tokio::time::sleep(Duration::from_millis(600)).await;
-                    let now = chrono::Utc::now().timestamp();
-                    let reply = if text.is_empty() {
-                        "Nice file!".to_owned()
-                    } else {
-                        text
-                    };
-                    let mut m = msg(ECHO_BOT, echo_id, false, now, &reply);
-                    m.reply_to = Some(id);
-                    let _ = tx.send(Event::NewMessage(m));
-                }
+            if chat == ECHO_BOT
+                && let Ok(echo_id) = echo_id
+            {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let now = chrono::Utc::now().timestamp();
+                let reply = if text.is_empty() {
+                    "Nice file!".to_owned()
+                } else {
+                    text
+                };
+                let mut m = msg(ECHO_BOT, echo_id, false, now, &reply);
+                m.reply_to = Some(id);
+                let _ = tx.send(Event::NewMessage(m));
             }
         });
     }
