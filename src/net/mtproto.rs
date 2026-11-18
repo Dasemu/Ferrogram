@@ -145,10 +145,10 @@ impl GrammersApi {
 
     fn convert(&self, m: &grammers_client::message::Message) -> Option<Message> {
         let mut out = message_from_tl(&m.raw)?;
-        if let Some(sender) = m.sender() {
-            if out.sender_name.is_none() {
-                out.sender_name = sender.name().map(str::to_owned);
-            }
+        if let Some(sender) = m.sender()
+            && out.sender_name.is_none()
+        {
+            out.sender_name = sender.name().map(str::to_owned);
         }
         Some(out)
     }
@@ -261,7 +261,7 @@ impl TelegramApi for Grammers {
         let api = &self.0;
         let token = lock(&api.login_token)?
             .take()
-            .ok_or_else(|| Error::Auth(AuthError::InvalidCode))?;
+            .ok_or(Error::Auth(AuthError::InvalidCode))?;
         match api.client.sign_in(&token, &code).await {
             Ok(u) => {
                 let out = api.outcome_user(&u);
@@ -288,7 +288,7 @@ impl TelegramApi for Grammers {
         let api = &self.0;
         let token = lock(&api.password_token)?
             .take()
-            .ok_or_else(|| Error::Auth(AuthError::InvalidPassword))?;
+            .ok_or(Error::Auth(AuthError::InvalidPassword))?;
         // SRP is computed by grammers (`check_password`).
         match api
             .client

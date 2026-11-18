@@ -100,10 +100,10 @@ impl ChatList {
                 sort_chats(&mut self.chats);
             }
             Event::MessageEdited(m) => {
-                if let Some(c) = self.get_mut(m.chat_id) {
-                    if c.last_message.as_ref().is_some_and(|l| l.id == m.id) {
-                        c.last_message = Some(m.clone());
-                    }
+                if let Some(c) = self.get_mut(m.chat_id)
+                    && c.last_message.as_ref().is_some_and(|l| l.id == m.id)
+                {
+                    c.last_message = Some(m.clone());
                 }
             }
             Event::MessagesDeleted { chat, ids } => {
@@ -432,10 +432,10 @@ impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
         self.order.push_back(k);
         self.bytes += size;
         while self.bytes > self.budget && self.order.len() > 1 {
-            if let Some(old) = self.order.pop_front() {
-                if let Some((_, s)) = self.map.remove(&old) {
-                    self.bytes -= s;
-                }
+            if let Some(old) = self.order.pop_front()
+                && let Some((_, s)) = self.map.remove(&old)
+            {
+                self.bytes -= s;
             }
         }
     }

@@ -34,10 +34,10 @@ impl Vault {
     }
 
     fn key(&self, create: bool) -> Result<Option<Key>> {
-        if let Some(k) = self.secrets.get(VAULT_KEY)? {
-            if k.expose().len() == 32 {
-                return Ok(Some(*Key::from_slice(k.expose())));
-            }
+        if let Some(k) = self.secrets.get(VAULT_KEY)?
+            && k.expose().len() == 32
+        {
+            return Ok(Some(*Key::from_slice(k.expose())));
         }
         if !create {
             return Ok(None);

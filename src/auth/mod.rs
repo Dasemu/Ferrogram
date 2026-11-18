@@ -17,9 +17,10 @@ pub enum SignInOutcome {
     PasswordRequired { hint: Option<String> },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum AuthState {
     /// Checking the keyring for a stored session.
+    #[default]
     Restoring,
     Phone {
         input: String,
@@ -46,12 +47,6 @@ pub enum AuthState {
 pub struct UserSummary {
     pub id: i64,
     pub name: String,
-}
-
-impl Default for AuthState {
-    fn default() -> Self {
-        Self::Restoring
-    }
 }
 
 #[derive(Debug, Clone)]

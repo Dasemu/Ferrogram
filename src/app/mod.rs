@@ -445,7 +445,7 @@ impl App {
                                 for id in ids {
                                     out.extend(s.search_local(id, q.trim(), 5)?);
                                 }
-                                out.sort_by(|a, b| b.date.cmp(&a.date));
+                                out.sort_by_key(|m| std::cmp::Reverse(m.date));
                                 out.truncate(30);
                                 Ok(out)
                             })
@@ -660,33 +660,34 @@ impl App {
             }
             Ui::Focus(f) => {
                 self.focused = f;
-                if f {
-                    if let Some(chat) = self.selected {
-                        let had_unread = self.chats.get(chat).is_some_and(|c| c.unread_count > 0);
-                        self.chats.mark_read(chat);
-                        if had_unread {
-                            return self.api_call(move |api| {
-                                Box::pin(async move { api.mark_read(chat).await })
-                            });
-                        }
+                if f && let Some(chat) = self.selected {
+                    let had_unread = self.chats.get(chat).is_some_and(|c| c.unread_count > 0);
+                    self.chats.mark_read(chat);
+                    if had_unread {
+                        return self.api_call(move |api| {
+                            Box::pin(async move { api.mark_read(chat).await })
+                        });
                     }
                 }
                 Task::none()
             }
             Ui::Escape => {
-                if self.main_menu {
-                    self.main_menu = false;
-                } else if self.viewer.take().is_some() {
-                } else if self.menu_for.take().is_some() {
-                } else if self.emoji_open {
-                    self.emoji_open = false;
+                // Close the top-most layer only, like the official client.
+                let closed = std::mem::take(&mut self.main_menu)
+                    || self.viewer.take().is_some()
+                    || self.menu_for.take().is_some()
+                    || std::mem::take(&mut self.emoji_open);
+                if closed {
+                    Task::none()
                 } else if self.compose_mode != ComposeMode::Normal {
-                    return self.update_ui(Ui::CancelCompose);
+                    self.update_ui(Ui::CancelCompose)
                 } else if self.chat_search.take().is_some() {
+                    Task::none()
                 } else if !self.sidebar_query.is_empty() {
-                    return self.update_ui(Ui::ClearSidebarSearch);
+                    self.update_ui(Ui::ClearSidebarSearch)
+                } else {
+                    Task::none()
                 }
-                Task::none()
             }
             Ui::Tick => {
                 if !self.first_frame_logged {
@@ -896,10 +897,10 @@ impl App {
             }
             Done::Restored(r) => {
                 let user = r.as_ref().ok().cloned().flatten();
-                if let Err(e) = &r {
-                    if e.is_session_revoked() {
-                        return self.session_revoked();
-                    }
+                if let Err(e) = &r
+                    && e.is_session_revoked()
+                {
+                    return self.session_revoked();
                 }
                 let t = self.auth(AuthEvent::Restored(r));
                 if let Some(u) = user {
