@@ -26,12 +26,16 @@ pub fn scrub(line: &str) -> String {
         let start = i;
         let mut j = i;
         let mut digits = 0;
-        if chars[j] == '+' {
+        // Separators are only accepted in `+`-prefixed (international) numbers,
+        // so timestamps like 2026-11-18 are left alone.
+        let plus = chars[j] == '+';
+        if plus {
             j += 1;
         }
         while j < chars.len()
             && (chars[j].is_ascii_digit()
-                || ((chars[j] == ' ' || chars[j] == '-')
+                || (plus
+                    && (chars[j] == ' ' || chars[j] == '-')
                     && j + 1 < chars.len()
                     && chars[j + 1].is_ascii_digit()
                     && digits > 0))
@@ -85,15 +89,15 @@ impl Write for ScrubWriter {
         if self.0.stderr {
             let _ = io::stderr().write_all(text.as_bytes());
         }
-        if let Some(f) = &self.0.file {
-            if let Ok(mut f) = f.lock() {
-                let _ = f.write_all(text.as_bytes());
-            }
+        if let Some(f) = &self.0.file
+            && let Ok(mut f) = f.lock()
+        {
+            let _ = f.write_all(text.as_bytes());
         }
-        if let Some(s) = &self.0.sink {
-            if let Ok(mut s) = s.lock() {
-                s.extend_from_slice(text.as_bytes());
-            }
+        if let Some(s) = &self.0.sink
+            && let Ok(mut s) = s.lock()
+        {
+            s.extend_from_slice(text.as_bytes());
         }
         Ok(buf.len())
     }
@@ -197,6 +201,7 @@ mod tests {
         assert_eq!(scrub("id 15550109999"), "id [num•••99]");
         assert_eq!(scrub("chat 12345 msg 42"), "chat 12345 msg 42");
         assert_eq!(scrub("ünïcode 1234567"), "ünïcode [num•••67]");
+        assert_eq!(scrub("2026-11-18T23:20:30Z"), "2026-11-18T23:20:30Z");
     }
 
     #[test]
