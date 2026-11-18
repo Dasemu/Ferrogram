@@ -804,12 +804,14 @@ impl App {
             }
             Event::SessionRevoked => return self.session_revoked(),
             Event::NewMessage(m) => {
-                if crate::app::state::should_notify(
-                    self.chats.get(m.chat_id),
-                    m,
-                    self.selected,
-                    self.focused,
-                ) {
+                if self.config.notifications
+                    && crate::app::state::should_notify(
+                        self.chats.get(m.chat_id),
+                        m,
+                        self.selected,
+                        self.focused,
+                    )
+                {
                     let (title, body) = state::notification_text(
                         self.chats.get(m.chat_id),
                         m,

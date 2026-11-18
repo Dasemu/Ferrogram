@@ -47,6 +47,8 @@ pub struct Config {
     pub trace_startup: bool,
     /// Notification privacy: when false only the sender is shown.
     pub notification_preview: bool,
+    /// Desktop notifications on/off (`FERROGRAM_NO_NOTIFY=1` disables).
+    pub notifications: bool,
 }
 
 impl Config {
@@ -79,10 +81,11 @@ impl Config {
             state_dir,
             config_dir,
             mock: mock || screenshot.is_some(),
-            screenshot,
+            screenshot: screenshot.clone(),
             light_theme: std::env::var("FERRO_THEME").is_ok_and(|v| v == "light"),
             trace_startup: env_flag("FERRO_TRACE_STARTUP"),
             notification_preview: !env_flag("FERROGRAM_NOTIFY_SENDER_ONLY"),
+            notifications: !env_flag("FERROGRAM_NO_NOTIFY") && screenshot.is_none(),
         }
     }
 
