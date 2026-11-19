@@ -1,0 +1,43 @@
+[package]
+name = "ferrogram"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Lightweight native Telegram desktop client written in Rust (unofficial)"
+repository = "https://github.com/Dasemu/Ferrogram"
+publish = false
+
+[dependencies]
+iced = { version = "0.14", features = ["tokio", "image", "advanced", "svg"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+grammers-client = "0.12"
+grammers-session = { version = "0.12", default-features = false, features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+keyring = "4.2"
+secrecy = "0.10"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+directories = "6"
+notify-rust = "4"
+chacha20poly1305 = "0.10"
+png = "0.18"
+futures = "0.3"
+async-trait = "0.1"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+opt-level = 3
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
