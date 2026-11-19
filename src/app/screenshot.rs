@@ -77,6 +77,15 @@ pub fn script(config: &Config) -> Task<Message> {
             ),
             (1000, ui(Ui::MessageMenu(Some(145)))),
         ],
+        ScreenshotTarget::Emoji => vec![
+            (400, ui(Ui::SelectChat(crate::mock::EMOJI_GROUP))),
+            (
+                900,
+                ui(Ui::ComposerChanged(
+                    "On my way \u{1F680} 1\u{FE0F}\u{20E3} \u{1F1EA}\u{1F1F8} \u{1F44D}\u{1F3FD} \u{A9}\u{FE0F}".into(),
+                )),
+            ),
+        ],
         ScreenshotTarget::Settings => vec![
             (400, ui(Ui::SelectChat(ALICE))),
             (900, ui(Ui::OpenSettings)),

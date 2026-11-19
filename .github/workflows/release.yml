@@ -95,6 +95,7 @@ jobs:
           cp packaging/dev.ferro.ferrogram.desktop "dist/$name/packaging/dev.ferro.ferrogram.desktop"
           cp packaging/dev.ferro.ferrogram.svg "dist/$name/packaging/dev.ferro.ferrogram.svg"
           cp assets/fonts/Inter-LICENSE.txt "dist/$name/licenses/Inter-OFL.txt"
+          cp assets/fonts/NotoColorEmoji-LICENSE.txt "dist/$name/licenses/NotoColorEmoji-OFL.txt"
           cp assets/icons/LICENSE.txt "dist/$name/licenses/Lucide-ISC.txt"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
