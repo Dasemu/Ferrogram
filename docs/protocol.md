@@ -73,14 +73,29 @@ state as soon as it is submitted.
 
 ## Credentials and session storage
 
-* `api_id` (not secret) comes from `FERROGRAM_API_ID` or
-  `$XDG_CONFIG_HOME/ferrogram/config.ini`.
-* `api_hash` (secret) comes from `FERROGRAM_API_HASH` or the OS keyring
-  (`dev.ferro.ferrogram` / `api-hash`), filled from the first-run setup
-  screen. A hash given by env var is imported into the keyring. A legacy
-  `api_hash` line in `config.ini` is migrated to the keyring and removed. The
-  hash is never read from or written to a plain file, and is never compiled
-  in.
+* **API credentials** (`config::ApiCredentials::resolve`, a pure function
+  over `CredentialInputs`, with each source injectable for tests). The first
+  complete, well-formed pair wins; malformed pairs are skipped with a warning
+  that never contains the values:
+  1. user override: `config.ini` `api_id` plus the keyring `api-hash`, set
+     from the *"Advanced: use your own API credentials"* login link or
+     `--api-setup`;
+  2. runtime `FERROGRAM_API_ID` / `FERROGRAM_API_HASH` (developers);
+  3. values embedded at build time. `build.rs` reads the same env var names
+     (`cargo:rerun-if-env-changed`), validates the id as a positive i32 and
+     the hash as 32 hex characters (a malformed value fails the build), and
+     emits `FERROGRAM_EMBEDDED_API_*` for `option_env!`. The release
+     workflow fills them from the repository secrets `TELEGRAM_API_ID` /
+     `TELEGRAM_API_HASH`.
+
+  With embedded values the first screen is the phone screen, as in the
+  official client. Without any source (a development build), the setup
+  screen is shown and cannot be skipped. Switching credentials shuts down the
+  old client, clearing its unauthorised session, and starts a new one. A
+  legacy `api_hash` line in `config.ini` is migrated to the keyring. The
+  `api_hash` identifies the app, is extractable from any distributed binary,
+  and is not a user secret; the user's own override is still kept out of
+  plain files.
 * The grammers session (auth keys per DC, peer access hashes, update
   state) is serialised to JSON, encrypted with ChaCha20-Poly1305 using a
   random 256-bit key stored in the OS keyring (`dev.ferro.ferrogram` /

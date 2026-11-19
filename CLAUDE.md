@@ -10,6 +10,7 @@ Unofficial; never ship Telegram assets.
 - `cargo run -- --mock` runs on fake data (code 12345 + password hunter2).
 - Screenshot: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrogram --mock --screenshot <screen> out.png`
 - Shared machine: `export CARGO_BUILD_JOBS=2`.
+- `ferrogram --version` (built-in creds?), `--api-setup`, `--install-desktop-entry`.
 
 ## Architecture
 See `docs/architecture.md` (shared Ferro* skeleton + §11 app specifics) and
@@ -31,8 +32,9 @@ See `docs/architecture.md` (shared Ferro* skeleton + §11 app specifics) and
 - Raw TL structs change per layer: keep them confined to `net/types.rs` and tests.
 
 ## Deployment
-No packaging yet: `cargo build --release` gives `target/release/ferrogram`.
-Users supply `FERROGRAM_API_ID`/`FERROGRAM_API_HASH` (my.telegram.org).
+`release.yml` (tag `v*` / manual) builds Linux x86_64 with repo secrets
+`TELEGRAM_API_ID`/`TELEGRAM_API_HASH` embedded via `build.rs`, and uploads a tarball
+(binary, README, licences, `packaging/` desktop entry + icon) to the GitHub Release.
 
 ## Gotchas
 - Keep iced default features (x11/wayland backends); `default-features=false` breaks softbuffer.
@@ -41,5 +43,5 @@ Users supply `FERROGRAM_API_ID`/`FERROGRAM_API_HASH` (my.telegram.org).
 - Emoji need the `Noto Color Emoji` font span (`widgets::emoji_text`), else monochrome fallbacks.
 - Containers holding a `Fill` row still need `.width(Fill)` or their background shrinks.
 - `Dialog::peer_ref()` in grammers unwraps; use `peer().to_ref().await` instead.
-- api_hash lives only in the keyring (`api-hash`); never add it back to config.ini.
+- Credentials: override (keyring `api-hash` + config.ini `api_id`) → env → embedded. Never commit real values.
 - Logout/revoke must rebuild `GrammersApi` (fresh SenderPool + EventHub subscription).

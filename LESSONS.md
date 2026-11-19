@@ -2,6 +2,18 @@
 
 Things learned while building Ferrogram, newest first.
 
+- **Embed app credentials with build.rs, not only `option_env!`.** A build
+  script can validate the values (and fail the build on a typo),
+  `cargo:rerun-if-env-changed` rebuilds when they change, and the values
+  never appear in build output. Plain `option_env!` would happily ship
+  `"12a"` as an api_id.
+- **The api_hash is an app identifier, not a user secret.** Every Telegram
+  client ships one, and it can be extracted from the binary. Users should
+  never have to see it: the override belongs behind an "Advanced" link.
+- **Make credential resolution a pure function over injectable inputs**
+  (keyring, env lookup, embedded values) so CI covers every path without
+  real secrets.
+
 - **Take-once channels break re-login.** An event receiver or update pump
   taken on first use silently stops delivering events after logout → login.
   Make subscriptions restartable (`EventHub`), and rebuild the protocol
