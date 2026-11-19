@@ -27,7 +27,6 @@ pub fn modal<'a>(
     on_dismiss: Message,
 ) -> Element<'a, Message> {
     opaque(mouse_area(center(opaque(card)).style(theme::fill(theme::SCRIM))).on_press(on_dismiss))
-        .into()
 }
 
 pub fn avatar<'a>(id: i64, title: &str, kind: Option<ChatKind>, size: f32) -> Element<'a, Message> {
