@@ -1,0 +1,76 @@
+name: Release
+
+# Builds the Linux x86_64 release with Ferrogram's own Telegram API
+# credentials embedded (repository secrets TELEGRAM_API_ID and
+# TELEGRAM_API_HASH, see README "Maintainers") and publishes a tarball as a
+# GitHub Release asset. CI (ci.yml) never needs these secrets.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/update (e.g. v0.2.0). Published as a draft."
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    env:
+      FERROGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      FERROGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Require API credential secrets
+        run: |
+          if [ -z "$FERROGRAM_API_ID" ] || [ -z "$FERROGRAM_API_HASH" ]; then
+            echo "::error::Repository secrets TELEGRAM_API_ID and TELEGRAM_API_HASH must be set (Settings → Secrets and variables → Actions). See README → Maintainers."
+            exit 1
+          fi
+          case "$TAG" in v*) ;; *) echo "::error::tag must start with v (got '$TAG')"; exit 1;; esac
+      - uses: actions/checkout@v4
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libfontconfig1-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary (credentials embedded by build.rs)
+        run: cargo build --release --locked
+      - name: Verify the credentials were embedded
+        run: |
+          ./target/release/ferrogram --version | tee /dev/stderr | grep -q "built-in Telegram API credentials: yes"
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          name="ferrogram-${TAG}-linux-x86_64"
+          mkdir -p "dist/$name/licenses"
+          cp target/release/ferrogram README.md LICENSE "dist/$name/"
+          cp packaging/dev.ferro.ferrogram.desktop packaging/dev.ferro.ferrogram.svg "dist/$name/"
+          cp assets/fonts/Inter-LICENSE.txt "dist/$name/licenses/Inter-OFL.txt"
+          cp assets/icons/LICENSE.txt "dist/$name/licenses/Lucide-ISC.txt"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "tarball=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferrogram-linux-x86_64
+          path: dist/*.tar.gz*
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Ferrogram ${{ env.TAG }}
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.tarball }}.sha256
