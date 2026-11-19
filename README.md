@@ -151,6 +151,14 @@ Environment variables: `FERRO_THEME=light`, `FERRO_RENDERER=wgpu` (GPU renderer;
 `first_frame_ms`), `FERROGRAM_NOTIFY_SENDER_ONLY=1`, `FERROGRAM_NO_NOTIFY=1`,
 `RUST_LOG=debug`.
 
+Tray (Linux, StatusNotifierItem: KDE Plasma and most panels): closing the window
+keeps Ferrogram running in the tray; left click toggles the window. The menu has
+Show/Hide, mute notifications (1 hour / until re-enabled), Start minimized and Quit.
+Unread messages in unmuted chats turn the icon to "needs attention". Without a tray
+host, closing quits. `--minimized` starts with only the tray icon; Settings (main
+menu) has Close to tray, Start minimized and Launch at login (off by default).
+A second launch shows the running window. Windows/macOS: tray not implemented.
+
 Files:
 
 * `~/.local/share/ferrogram/cache.sqlite3` is the message cache. It is
@@ -180,7 +188,7 @@ ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" \
 ```
 
 Screens: `login-phone`, `login-code`, `login-password`, `chats`, `search`,
-`reply`, `media`.
+`reply`, `media`, `settings`.
 
 ## Development
 
