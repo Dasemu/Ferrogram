@@ -35,6 +35,28 @@ modelled on Telegram Desktop's dark theme.
   visible and the session restore is retried with backoff. You are never
   sent back to the phone screen just because you are offline.
 
+## Install
+
+Download `ferrogram-vX.Y.Z-linux-x86_64.tar.gz` from the
+[Releases](https://github.com/Dasemu/Ferrogram/releases) page, then:
+
+```sh
+tar xzf ferrogram-*-linux-x86_64.tar.gz
+cd ferrogram-*-linux-x86_64
+./ferrogram --install-desktop-entry   # adds Ferrogram to the KDE/GNOME app menu
+./ferrogram
+```
+
+Then log in like in the official app: phone number → code → two-step
+password if you have one. Release builds ship with Ferrogram's own Telegram
+API credentials, so there is nothing to configure.
+`./ferrogram --version` shows whether a build has them.
+
+`--install-desktop-entry` writes `dev.ferro.ferrogram.desktop` to
+`~/.local/share/applications/` and the icon to
+`~/.local/share/icons/hicolor/scalable/apps/`. The entry's `Exec` points at
+the binary you ran it from.
+
 ## Build
 
 Requires Rust stable (edition 2024) and, on Linux, these development
@@ -51,32 +73,61 @@ them) but are not the main target.
 
 ## Telegram API credentials
 
-Every Telegram client needs an `api_id` and `api_hash`. Ferrogram never ships
-any; use your own:
+Every Telegram client identifies itself with an `api_id` and `api_hash`
+registered at my.telegram.org. Ferrogram resolves them at runtime in this
+order:
 
-1. Log in at <https://my.telegram.org> with your phone number.
-2. Open **API development tools** and create an application (any title).
-3. Copy the `api_id` (a number) and `api_hash` (32 hex characters).
+1. **Your own override**: the small *"Advanced: use your own API
+   credentials"* link on the login screen, or `ferrogram --api-setup`. The
+   `api_hash` is stored only in the OS keyring (`dev.ferro.ferrogram` /
+   `api-hash`); the `api_id` goes to `~/.config/ferrogram/config.ini`
+   (mode 0600). *Use built-in credentials* on the same screen removes it.
+2. **Runtime environment** (for developers): `FERROGRAM_API_ID` and
+   `FERROGRAM_API_HASH`.
+3. **Built-in values**, embedded at compile time in official release builds.
 
-On first start, Ferrogram asks for both on a setup screen. The **`api_hash`
-is stored only in the OS keyring** (`dev.ferro.ferrogram` / `api-hash`). The
-non-secret `api_id` goes to `~/.config/ferrogram/config.ini` (mode 0600).
+A development build without any of these shows the setup screen, with a note
+that official release builds don't need it.
 
-Alternatively, set environment variables. `FERROGRAM_API_HASH` is imported
-into the keyring on first use, so you only need it once:
+To build with your own app's values embedded:
 
 ```sh
-export FERROGRAM_API_ID=123456
-export FERROGRAM_API_HASH=0123456789abcdef0123456789abcdef
+FERROGRAM_API_ID=123456 FERROGRAM_API_HASH=0123456789abcdef0123456789abcdef \
+  cargo build --release
 ```
 
-An `api_hash = …` line left in `config.ini` by an older version is moved into
-the keyring and removed from the file. Never commit these values.
+`build.rs` validates them: the id must be a positive integer and the hash
+exactly 32 hex characters. Malformed values fail the build. Never commit
+real values. Local `.env*` files are git-ignored.
+
+> **About the "secret":** the `api_hash` identifies the *application*, not
+> you. It can be extracted from any distributed binary, which is true of
+> every Telegram client, official ones included. It is not a user secret and
+> gives no access to anyone's account. Your account is protected by your
+> login code, your 2FA password and the session key in your keyring.
+
+### Maintainers: credentials for release builds
+
+1. Log in at <https://my.telegram.org> → **API development tools** → create
+   an application for Ferrogram (do not reuse Telegram Desktop's id).
+2. Copy its `api_id` and `api_hash`.
+3. In GitHub, open the repository's **Settings → Secrets and variables →
+   Actions** and add the repository secrets `TELEGRAM_API_ID` and
+   `TELEGRAM_API_HASH`.
+4. Push a `v*` tag (`git tag v0.2.0 && git push origin v0.2.0`), or run the
+   **Release** workflow manually (*Actions → Release → Run workflow*, which
+   creates a draft release).
+
+`.github/workflows/release.yml` fails immediately if either secret is missing.
+It checks that `--version` reports built-in credentials, and uploads
+`ferrogram-<tag>-linux-x86_64.tar.gz` and its `.sha256` file to the GitHub
+Release. The tarball holds the binary, the README, the licences, the desktop
+entry and the icon. CI (`ci.yml`) never needs the secrets.
 
 ## Run
 
 ```sh
-./target/release/ferrogram           # real account
+./target/release/ferrogram           # real account (see credentials above)
 ./target/release/ferrogram --mock    # demo data, no network, nothing stored
 ```
 
