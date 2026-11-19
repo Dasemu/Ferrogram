@@ -653,3 +653,48 @@ async fn store_roundtrip_of_fake_dialogs() {
     let unauth = FakeTelegram::new(FakeOptions::default());
     assert!(unauth.dialogs(10).await.unwrap_err().is_session_revoked());
 }
+
+#[test]
+fn advanced_api_setup_is_optional_and_cancellable() {
+    let mut app = mock_app();
+    let _ = app.update(Message::Done(Done::Restored(Ok(None))));
+    assert!(
+        app.setup.is_none(),
+        "phone screen first, like the official client"
+    );
+    let _ = app.update(Message::Ui(Ui::OpenApiSetup));
+    assert!(app.setup.as_ref().unwrap().advanced);
+    let _ = app.update(Message::Ui(Ui::SetupApiId("12x34".into())));
+    assert_eq!(app.setup.as_ref().unwrap().api_id, "1234");
+    // Malformed hash is rejected locally.
+    let _ = app.update(Message::Ui(Ui::SetupApiHash("short".into())));
+    let _ = app.update(Message::Ui(Ui::SetupSubmit));
+    assert!(app.setup.as_ref().unwrap().error.is_some());
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(
+        app.setup.is_none(),
+        "Esc/Cancel returns to the phone screen"
+    );
+}
+
+#[test]
+fn missing_credentials_force_setup_without_cancel() {
+    let mut app = mock_app();
+    let _ = app.update(Message::Done(Done::ApiReady(Err(
+        ferrogram::error::Error::Auth(ferrogram::error::AuthError::MissingApiCredentials),
+    ))));
+    let f = app.setup.clone().unwrap();
+    assert!(!f.advanced);
+    let _ = app.update(Message::Ui(Ui::CancelSetup));
+    assert!(
+        app.setup.is_some(),
+        "a dev build without credentials cannot skip setup"
+    );
+}
+
+#[test]
+fn api_setup_flag_opens_the_form() {
+    let mut cfg = Config::from_env(&["ferrogram".into(), "--mock".into(), "--api-setup".into()]);
+    cfg.notifications = false;
+    assert!(cfg.api_setup);
+}
