@@ -1418,6 +1418,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "zbus 5.19.0",
 ]
 

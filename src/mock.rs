@@ -28,6 +28,8 @@ pub const SELF_ID: i64 = 100;
 pub const ALICE: ChatId = 201;
 pub const ECHO_BOT: ChatId = 206;
 pub const RUST_GROUP: ChatId = -301;
+/// Group whose title, senders and messages carry the tricky emoji sequences.
+pub const EMOJI_GROUP: ChatId = -305;
 pub const DEV_CHANNEL: ChatId = -CHANNEL_OFFSET - 401;
 pub const NEWS_CHANNEL: ChatId = -CHANNEL_OFFSET - 402;
 /// Login code that leads to the 2FA screen.
@@ -264,6 +266,46 @@ fn chats_and_history() -> (Vec<Chat>, BTreeMap<ChatId, Vec<Message>>) {
                 ana,
                 MOCK_NOW - 25 * MIN,
                 "Leo: has anyone tried the new borrow checker?",
+            ),
+        ],
+    );
+    let mia = (321, "Mia \u{1F469}\u{200D}\u{1F4BB}");
+    let kai = (322, "Kai \u{1F1EF}\u{1F1F5}");
+    add(
+        EMOJI_GROUP,
+        ChatKind::Group,
+        "Emoji lab \u{1F9EA}\u{1F1EA}\u{1F1F8}",
+        2,
+        false,
+        false,
+        vec![
+            group_msg(
+                EMOJI_GROUP,
+                1,
+                mia,
+                MOCK_NOW - 50 * MIN,
+                "Keycaps: 1\u{FE0F}\u{20E3} 2\u{FE0F}\u{20E3} #\u{FE0F}\u{20E3} *\u{FE0F}\u{20E3} but plain 12 # stay text",
+            ),
+            group_msg(
+                EMOJI_GROUP,
+                2,
+                kai,
+                MOCK_NOW - 40 * MIN,
+                "Flags \u{1F1EA}\u{1F1F8}\u{1F1EF}\u{1F1F5}\u{1F1E9}\u{1F1EA} \u{1F3F3}\u{FE0F}\u{200D}\u{1F308} and a family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+            ),
+            group_msg(
+                EMOJI_GROUP,
+                3,
+                mia,
+                MOCK_NOW - 30 * MIN,
+                "Skin tones \u{1F44B}\u{1F3FB}\u{1F44B}\u{1F3FD}\u{1F44B}\u{1F3FF} \u{1F9D1}\u{1F3FD}\u{200D}\u{2695}\u{FE0F}",
+            ),
+            group_msg(
+                EMOJI_GROUP,
+                4,
+                kai,
+                MOCK_NOW - 20 * MIN,
+                "Marks: \u{A9}\u{FE0F} \u{AE}\u{FE0F} \u{2122}\u{FE0F} \u{203C}\u{FE0F} \u{3030}\u{FE0F} \u{3297}\u{FE0F} vs plain \u{A9} \u{AE} \u{2122}",
             ),
         ],
     );

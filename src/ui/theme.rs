@@ -5,6 +5,9 @@
 use iced::widget::{button, container, scrollable, svg, text_input};
 use iced::{Background, Border, Color, Font, Shadow, Theme, Vector, border, font};
 
+/// Bundled Noto Color Emoji (CBDT, SIL OFL 1.1) so emoji render in colour with
+/// no system font installed. Same family name as the system package.
+pub const NOTO_COLOR_EMOJI: &[u8] = include_bytes!("../../assets/fonts/NotoColorEmoji.ttf");
 pub const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
 pub const INTER_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/Inter-SemiBold.ttf");
 

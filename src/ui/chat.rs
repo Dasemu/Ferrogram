@@ -9,7 +9,7 @@ use iced::{Alignment, Color, ContentFit, Element, Length, Padding};
 use super::format;
 use super::icons::{Icon, TAIL_IN, TAIL_OUT};
 use super::theme::{self, FONT_SEMIBOLD, NAME_COLORS};
-use super::widgets::{EMOJI_FONT, avatar_photo, emoji_text, icon};
+use super::widgets::{EMOJI_FONT, avatar_photo, emoji_plain, emoji_text, emoji_title, icon};
 use crate::app::state::ComposeMode;
 use crate::app::{App, CHAT_SEARCH_ID, COMPOSER_ID, HISTORY_ID, Message, Ui};
 use crate::model::{Chat, ChatKind, Media, Message as ChatMessage, SendState, avatar_color_index};
@@ -123,10 +123,7 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
                 m.avatar_header
             ),
             column![
-                text(title)
-                    .size(m.font_l - 0.5)
-                    .font(FONT_SEMIBOLD)
-                    .color(p.text_primary),
+                emoji_title(title.to_string(), m.font_l - 0.5, p.text_primary),
                 text(status)
                     .size(m.font_s)
                     .color(if live { p.link } else { p.text_secondary }),
@@ -212,10 +209,7 @@ fn search_results<'a>(app: &'a App, s: &'a crate::app::ChatSearch) -> Element<'a
             button(
                 column![
                     row![
-                        text(who)
-                            .size(m.font_s)
-                            .font(FONT_SEMIBOLD)
-                            .color(p.text_primary),
+                        emoji_title(who.to_string(), m.font_s, p.text_primary),
                         Space::new().width(Length::Fill),
                         text(format::list_time(msg.date, app.now, app.tz_offset))
                             .size(m.font_xs)
@@ -370,12 +364,11 @@ fn message_row<'a>(
         && !out
         && let Some(name) = &msg.sender_name
     {
-        body = body.push(
-            text(name.clone())
-                .size(m.font_s)
-                .font(FONT_SEMIBOLD)
-                .color(sender_color(msg.sender_id)),
-        );
+        body = body.push(emoji_title(
+            name.clone(),
+            m.font_s,
+            sender_color(msg.sender_id),
+        ));
     }
     if let Some(reply_id) = msg.reply_to {
         body = body.push(reply_quote(app, chat, reply_id, out));
@@ -563,7 +556,7 @@ fn reply_quote<'a>(
         row![
             container(Space::new().width(3).height(34)).style(theme::pill(bar, 2.0)),
             column![
-                text(name).size(m.font_s).font(FONT_SEMIBOLD).color(color),
+                emoji_title(name.to_string(), m.font_s, color),
                 emoji_text(format::ellipsize(&preview, 40), m.font_s, p.text_primary),
             ]
             .spacing(1),
@@ -627,10 +620,7 @@ fn media_view<'a>(app: &'a App, msg: &'a ChatMessage, media: &'a Media) -> Eleme
             row![
                 circle,
                 column![
-                    text(format::ellipsize(name, 32))
-                        .size(m.font_m)
-                        .font(FONT_SEMIBOLD)
-                        .color(p.text_primary),
+                    emoji_title(format::ellipsize(name, 32), m.font_m, p.text_primary),
                     text(format::file_size(*size)).size(m.font_s).color(if out {
                         p.time_out
                     } else {
@@ -795,7 +785,7 @@ fn compose_bar(app: &App) -> Element<'_, Message> {
             icon(ic, 22.0, p.link),
             container(Space::new().width(2).height(34)).style(theme::pill(p.link, 1.0)),
             column![
-                text(title).size(m.font_s).font(FONT_SEMIBOLD).color(p.link),
+                emoji_title(title.to_string(), m.font_s, p.link),
                 emoji_text(format::ellipsize(&preview, 70), m.font_s, p.text_primary),
             ]
             .spacing(1)
@@ -837,9 +827,7 @@ fn pending_file_bar<'a>(app: &'a App, f: &'a crate::app::PendingFile) -> Element
                     .size(m.font_s)
                     .font(FONT_SEMIBOLD)
                     .color(p.link),
-                text(format::ellipsize(&f.name, 70))
-                    .size(m.font_s)
-                    .color(p.text_primary),
+                emoji_plain(format::ellipsize(&f.name, 70), m.font_s, p.text_primary),
             ]
             .spacing(1)
             .width(Length::Fill),

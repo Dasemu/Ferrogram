@@ -6,7 +6,7 @@ use iced::{Alignment, Element, Length};
 use super::format;
 use super::icons::Icon;
 use super::theme::{self, FONT_SEMIBOLD};
-use super::widgets::{avatar, avatar_photo, badge, emoji_line, icon};
+use super::widgets::{avatar, avatar_photo, badge, emoji_line, emoji_plain, emoji_title, icon};
 use crate::app::{App, Message, Ui};
 use crate::model::{Chat, ChatKind, ConnState, GlobalHit, Message as ChatMessage, SendState};
 use iced::widget::text::Wrapping;
@@ -124,10 +124,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             column![
                 row![
                     avatar(app.me.as_ref().map_or(0, |u| u.id), &name, None, 40.0),
-                    text(name)
-                        .size(m.font_m)
-                        .font(FONT_SEMIBOLD)
-                        .color(p.text_primary),
+                    emoji_title(name, m.font_m, p.text_primary),
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
@@ -204,13 +201,7 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
         ChatKind::Bot => title_row = title_row.push(icon(Icon::Bot, 15.0, fg)),
         _ => {}
     }
-    title_row = title_row.push(
-        text(format::ellipsize(&c.title, 24))
-            .size(m.font_m)
-            .font(FONT_SEMIBOLD)
-            .wrapping(Wrapping::None)
-            .color(fg),
-    );
+    title_row = title_row.push(emoji_title(format::ellipsize(&c.title, 24), m.font_m, fg));
     if c.muted {
         title_row = title_row.push(icon(
             Icon::Muted,
@@ -278,12 +269,11 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
                 None
             };
         if let Some(pre) = prefix {
-            preview_row =
-                preview_row.push(text(format!("{pre}: ")).size(m.font_m).color(if selected {
-                    fg
-                } else {
-                    p.text_primary
-                }));
+            preview_row = preview_row.push(emoji_plain(
+                format!("{pre}: "),
+                m.font_m,
+                if selected { fg } else { p.text_primary },
+            ));
         }
         let media_only = last.text.trim().is_empty() && last.media.is_some();
         preview_row = preview_row.push(
@@ -350,10 +340,11 @@ fn global_result_row<'a>(app: &'a App, hit: &'a GlobalHit) -> Element<'a, Messag
         ),
         column![
             row![
-                text(format::ellipsize(&hit.chat_title, 24))
-                    .size(m.font_m)
-                    .font(FONT_SEMIBOLD)
-                    .color(p.text_primary),
+                emoji_title(
+                    format::ellipsize(&hit.chat_title, 24),
+                    m.font_m,
+                    p.text_primary
+                ),
                 Space::new().width(Length::Fill),
                 text(format::list_time(msg.date, app.now, app.tz_offset))
                     .size(m.font_xs)
@@ -394,10 +385,7 @@ fn message_result_row<'a>(app: &'a App, c: &'a Chat, msg: &'a ChatMessage) -> El
         ),
         column![
             row![
-                text(format::ellipsize(&c.title, 24))
-                    .size(m.font_m)
-                    .font(FONT_SEMIBOLD)
-                    .color(p.text_primary),
+                emoji_title(format::ellipsize(&c.title, 24), m.font_m, p.text_primary),
                 Space::new().width(Length::Fill),
                 text(format::list_time(msg.date, app.now, app.tz_offset))
                     .size(m.font_xs)
