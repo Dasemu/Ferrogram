@@ -41,6 +41,9 @@ pub enum Ui {
     OpenResult(ChatId, MessageId),
     /// The sidebar query settled (debounce): run the server-side search.
     GlobalSearchDue(String),
+    /// The composer was idle for a second: sync the draft of that chat
+    /// (only if `version` is still current).
+    DraftDue(ChatId, u64),
     // chat pane
     HistoryScrolled(Viewport),
     ComposerChanged(String),

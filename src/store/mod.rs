@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Media, Message, MessageId, Reaction, SendState,
+    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Draft, Media, Message, MessageId, Reaction, SendState,
 };
 
 pub mod avatars;
@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema.sql"),
     include_str!("migration_002.sql"),
     include_str!("migration_003.sql"),
+    include_str!("migration_004.sql"),
 ];
 
 /// Cheap-to-clone handle. Sync methods are for `boot()` and tests; the app
@@ -99,12 +100,14 @@ impl Store {
         let tx = conn.transaction()?;
         for c in chats {
             tx.execute(
-                "INSERT INTO chats (id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "INSERT INTO chats (id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id,
+                   draft_text, draft_reply, draft_date)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, title=excluded.title, unread=excluded.unread,
                    muted=excluded.muted, pinned=excluded.pinned, read_outbox=excluded.read_outbox,
                    read_inbox=excluded.read_inbox, last_date=excluded.last_date, last_message_id=excluded.last_message_id,
-                   photo_id=excluded.photo_id",
+                   photo_id=excluded.photo_id, draft_text=excluded.draft_text,
+                   draft_reply=excluded.draft_reply, draft_date=excluded.draft_date",
                 params![
                     c.id,
                     c.kind.as_str(),
@@ -117,6 +120,9 @@ impl Store {
                     c.last_date,
                     c.last_message.as_ref().map(|m| m.id),
                     c.photo_id,
+                    c.draft.as_ref().map(|d| d.text.as_str()),
+                    c.draft.as_ref().and_then(|d| d.reply_to),
+                    c.draft.as_ref().map(|d| d.date),
                 ],
             )?;
             if let Some(m) = &c.last_message {
@@ -154,7 +160,8 @@ impl Store {
     pub fn load_chats(&self) -> Result<Vec<Chat>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id
+            "SELECT id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id,
+                    draft_text, draft_reply, draft_date
              FROM chats ORDER BY pinned DESC, last_date DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -170,6 +177,11 @@ impl Store {
             c.read_inbox_max_id = r.get(7)?;
             c.last_date = r.get(8)?;
             c.photo_id = r.get(10)?;
+            c.draft = r.get::<_, Option<String>>(11)?.map(|text| Draft {
+                text,
+                reply_to: r.get(12).ok().flatten(),
+                date: r.get(13).ok().flatten().unwrap_or(0),
+            });
             Ok((c, r.get::<_, Option<MessageId>>(9)?))
         })?;
         let mut out = Vec::new();
@@ -181,6 +193,20 @@ impl Store {
             out.push(chat);
         }
         Ok(out)
+    }
+
+    /// Set (or with `None` clear) a chat's draft.
+    pub fn set_draft(&self, chat: ChatId, draft: Option<&Draft>) -> Result<()> {
+        self.conn()?.execute(
+            "UPDATE chats SET draft_text = ?2, draft_reply = ?3, draft_date = ?4 WHERE id = ?1",
+            params![
+                chat,
+                draft.map(|d| d.text.as_str()),
+                draft.and_then(|d| d.reply_to),
+                draft.map(|d| d.date)
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn set_unread(&self, chat: ChatId, unread: u32, read_inbox: MessageId) -> Result<()> {
@@ -488,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_database_migrates_to_v3_keeping_chats() {
+    fn v2_database_migrates_forward_keeping_chats() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("old.sqlite3");
         {
@@ -508,6 +534,42 @@ mod tests {
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].title, "Old chat");
         assert_eq!(chats[0].photo_id, None);
+    }
+
+    #[test]
+    fn drafts_persist_through_chat_upserts_and_clear() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_chats(&[chat(1, 5, false), chat(2, 4, false)])
+            .unwrap();
+        assert!(s.load_chats().unwrap().iter().all(|c| c.draft.is_none()));
+        let d = Draft {
+            text: "half a thought".into(),
+            reply_to: Some(77),
+            date: 1234,
+        };
+        s.set_draft(1, Some(&d)).unwrap();
+        let loaded = s.load_chats().unwrap();
+        let c1 = loaded.iter().find(|c| c.id == 1).unwrap();
+        assert_eq!(c1.draft, Some(d.clone()));
+        assert!(loaded.iter().find(|c| c.id == 2).unwrap().draft.is_none());
+        // The server's chat list is authoritative: an upsert without a draft clears it.
+        s.upsert_chats(&[chat(1, 6, false)]).unwrap();
+        assert!(s.load_chats().unwrap().iter().all(|c| c.draft.is_none()));
+        // And one with a draft stores it.
+        let mut with = chat(2, 4, false);
+        with.draft = Some(d.clone());
+        s.upsert_chats(&[with]).unwrap();
+        assert_eq!(
+            s.load_chats()
+                .unwrap()
+                .iter()
+                .find(|c| c.id == 2)
+                .unwrap()
+                .draft,
+            Some(d)
+        );
+        s.set_draft(2, None).unwrap();
+        assert!(s.load_chats().unwrap().iter().all(|c| c.draft.is_none()));
     }
 
     #[test]

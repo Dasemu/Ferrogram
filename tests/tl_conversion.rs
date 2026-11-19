@@ -619,3 +619,91 @@ fn user_status_maps_to_presence() {
         })
     );
 }
+
+fn draft_message(text: &str, reply: Option<i32>) -> tl::enums::DraftMessage {
+    tl::enums::DraftMessage::Message(tl::types::DraftMessage {
+        no_webpage: false,
+        invert_media: false,
+        reply_to: reply.map(|id| {
+            tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                reply_to_msg_id: id,
+                top_msg_id: None,
+                reply_to_peer_id: None,
+                quote_text: None,
+                quote_entities: None,
+                quote_offset: None,
+                monoforum_peer_id: None,
+                todo_item_id: None,
+                poll_option: None,
+                quote_rich: None,
+            })
+        }),
+        message: text.into(),
+        entities: None,
+        media: None,
+        date: 1_795_000_100,
+        effect: None,
+        suggested_post: None,
+        rich_message: None,
+    })
+}
+
+#[test]
+fn drafts_convert_from_updates_and_dialogs() {
+    use ferrogram::model::Draft;
+    use ferrogram::net::types::draft_from_tl;
+
+    let d = draft_from_tl(&wire(draft_message("see you at 8", Some(41)))).unwrap();
+    assert_eq!(
+        d,
+        Draft {
+            text: "see you at 8".into(),
+            reply_to: Some(41),
+            date: 1_795_000_100
+        }
+    );
+    // Empty text and the "empty" constructor both mean "no draft".
+    assert!(draft_from_tl(&wire(draft_message("", None))).is_none());
+    assert!(
+        draft_from_tl(&tl::enums::DraftMessage::Empty(
+            tl::types::DraftMessageEmpty { date: None }
+        ))
+        .is_none()
+    );
+
+    let upd = tl::enums::Update::DraftMessage(tl::types::UpdateDraftMessage {
+        peer: channel(9),
+        top_msg_id: None,
+        saved_peer_id: None,
+        draft: draft_message("wip", None),
+    });
+    match event_from_update(&wire(upd)) {
+        Some(Event::Draft { chat, draft }) => {
+            assert_eq!(chat, -CHANNEL_OFFSET - 9);
+            assert_eq!(draft.unwrap().text, "wip");
+        }
+        other => panic!("{other:?}"),
+    }
+    // Cleared draft.
+    let cleared = tl::enums::Update::DraftMessage(tl::types::UpdateDraftMessage {
+        peer: user(5),
+        top_msg_id: None,
+        saved_peer_id: None,
+        draft: tl::enums::DraftMessage::Empty(tl::types::DraftMessageEmpty { date: None }),
+    });
+    assert_eq!(
+        event_from_update(&wire(cleared)),
+        Some(Event::Draft {
+            chat: 5,
+            draft: None
+        })
+    );
+    // Drafts of forum topics are not the chat's draft.
+    let topic = tl::enums::Update::DraftMessage(tl::types::UpdateDraftMessage {
+        peer: channel(9),
+        top_msg_id: Some(2),
+        saved_peer_id: None,
+        draft: draft_message("topic", None),
+    });
+    assert_eq!(event_from_update(&wire(topic)), None);
+}

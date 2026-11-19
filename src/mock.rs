@@ -420,6 +420,13 @@ fn chats_and_history() -> (Vec<Chat>, BTreeMap<ChatId, Vec<Message>>) {
         if [ALICE, RUST_GROUP, DEV_CHANNEL, -303].contains(&c.id) {
             c.photo_id = Some(7_000 + c.id.rem_euclid(1000));
         }
+        if c.id == -304 {
+            c.draft = Some(crate::model::Draft {
+                text: "I'll bring the cookies".into(),
+                reply_to: None,
+                date: MOCK_NOW - 600,
+            });
+        }
         if c.id == ALICE {
             c.presence = Presence::Online {
                 until: MOCK_NOW + 5 * MIN,
@@ -874,6 +881,25 @@ impl TelegramApi for FakeTelegram {
     async fn download_avatar(&self, _chat: ChatId, photo_id: i64) -> Result<Vec<u8>> {
         self.call("download_avatar").await?;
         mock_avatar_png(photo_id, 160)
+    }
+
+    async fn save_draft(
+        &self,
+        chat: ChatId,
+        text: String,
+        reply_to: Option<MessageId>,
+    ) -> Result<()> {
+        self.call("save_draft").await?;
+        self.require_auth()?;
+        let draft = (!text.is_empty()).then(|| crate::model::Draft {
+            text,
+            reply_to,
+            date: chrono::Utc::now().timestamp(),
+        });
+        if let Some(c) = self.st()?.chats.iter_mut().find(|c| c.id == chat) {
+            c.draft = draft;
+        }
+        Ok(())
     }
 
     async fn set_typing(&self, _chat: ChatId, active: bool) -> Result<()> {

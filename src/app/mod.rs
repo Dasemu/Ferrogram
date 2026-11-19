@@ -142,6 +142,8 @@ pub struct App {
     /// The server has no more dialogs after the ones loaded.
     pub dialogs_exhausted: bool,
     pub dialogs_loading: bool,
+    /// Bumped on every composer change; a `DraftDue` only fires for the latest.
+    pub draft_version: u64,
     pub typing: TypingTracker,
     pub typing_throttle: TypingThrottle,
     pub viewer: Option<(ChatId, MessageId)>,
@@ -233,6 +235,7 @@ impl App {
             user_names: HashMap::new(),
             dialogs_exhausted: false,
             dialogs_loading: false,
+            draft_version: 0,
             typing: TypingTracker::default(),
             typing_throttle: TypingThrottle::default(),
             viewer: None,
@@ -463,6 +466,25 @@ impl App {
         Task::perform(f(api), |r| Message::Done(Done::Call(r)))
     }
 
+    /// A background call whose failure is only logged (typing indicators and
+    /// draft sync must never pop up a toast).
+    fn api_call_quiet<F>(&self, what: &'static str, f: F) -> Task<Message>
+    where
+        F: FnOnce(ApiHandle) -> futures::future::BoxFuture<'static, crate::error::Result<()>>
+            + Send
+            + 'static,
+    {
+        let Some(api) = self.api.clone() else {
+            return Task::none();
+        };
+        Task::perform(f(api), move |r| {
+            if let Err(e) = r {
+                warn!(error = %e, what, "background call failed");
+            }
+            Message::Done(Done::Call(Ok(())))
+        })
+    }
+
     /// An optimistic call that restores `old` if it fails.
     fn api_call_or_rollback<F>(&self, old: ChatMessage, f: F) -> Task<Message>
     where
@@ -565,10 +587,15 @@ impl App {
     /// Make `conversation` the open one and reset per-chat UI state.
     fn switch_to(&mut self, chat: ChatId, conversation: Conversation) -> Task<Message> {
         let stop_typing = match self.typing_throttle.reset() {
-            Some(old) => {
-                self.api_call(move |api| Box::pin(async move { api.set_typing(old, false).await }))
-            }
+            Some(old) => self.api_call_quiet("typing", move |api| {
+                Box::pin(async move { api.set_typing(old, false).await })
+            }),
             None => Task::none(),
+        };
+        // Leaving a chat saves what was typed there as its draft.
+        let save_draft = match self.selected {
+            Some(old) if old != chat => self.sync_draft(old),
+            _ => Task::none(),
         };
         self.selected = Some(chat);
         self.conversation = Some(conversation);
@@ -582,8 +609,10 @@ impl App {
         if !self.conversation.as_ref().is_some_and(|c| c.detached) {
             self.chats.mark_read(chat);
         }
+        self.restore_draft(chat);
         Task::batch([
             stop_typing,
+            save_draft,
             self.fetch_avatars(),
             operation::focus(Id::new(COMPOSER_ID)),
         ])
@@ -666,6 +695,45 @@ impl App {
             ));
         }
         Task::batch(tasks)
+    }
+
+    /// Put the chat's saved draft (text and reply target) into the composer.
+    fn restore_draft(&mut self, chat: ChatId) {
+        let draft = self.chats.get(chat).and_then(|c| c.draft.clone());
+        match draft {
+            Some(d) => {
+                self.composer = d.text;
+                self.compose_mode = d.reply_to.map_or(ComposeMode::Normal, ComposeMode::Reply);
+            }
+            None => {
+                self.composer.clear();
+                self.compose_mode = ComposeMode::Normal;
+            }
+        }
+    }
+
+    /// Store the composer as `chat`'s draft locally and on the server, if it
+    /// differs from what is saved. While editing a message the composer is
+    /// not a draft (the real draft was saved when the edit began).
+    fn sync_draft(&mut self, chat: ChatId) -> Task<Message> {
+        if matches!(self.compose_mode, ComposeMode::Edit(_)) || self.api.is_none() {
+            return Task::none();
+        }
+        let draft = state::composer_draft(&self.composer, self.compose_mode, self.now_ts());
+        let saved = self.chats.get(chat).and_then(|c| c.draft.clone());
+        match (&draft, &saved) {
+            (None, None) => return Task::none(),
+            (Some(a), Some(b)) if a.same_content(b) => return Task::none(),
+            _ => {}
+        }
+        self.chats.set_draft(chat, draft.clone());
+        let local = draft.clone();
+        let store = self.store_bg(move |s| s.set_draft(chat, local.as_ref()));
+        let (text, reply) = draft.map_or((String::new(), None), |d| (d.text, d.reply_to));
+        let net = self.api_call_quiet("draft", move |api| {
+            Box::pin(async move { api.save_draft(chat, text, reply).await })
+        });
+        Task::batch([store, net])
     }
 
     /// The profile photo to draw for `chat`, if it is loaded and current.
@@ -781,12 +849,12 @@ impl App {
             .on_input(chat, Self::now_ms(), has_text, allowed)
         {
             TypingStep::Nothing => Task::none(),
-            TypingStep::Send => {
-                self.api_call(move |api| Box::pin(async move { api.set_typing(chat, true).await }))
-            }
-            TypingStep::Cancel(c) => {
-                self.api_call(move |api| Box::pin(async move { api.set_typing(c, false).await }))
-            }
+            TypingStep::Send => self.api_call_quiet("typing", move |api| {
+                Box::pin(async move { api.set_typing(chat, true).await })
+            }),
+            TypingStep::Cancel(c) => self.api_call_quiet("typing", move |api| {
+                Box::pin(async move { api.set_typing(c, false).await })
+            }),
         }
     }
 
@@ -986,7 +1054,26 @@ impl App {
             }
             Ui::ComposerChanged(s) => {
                 self.composer = s;
-                self.update_typing()
+                let typing = self.update_typing();
+                let Some(chat) = self.selected else {
+                    return typing;
+                };
+                self.draft_version += 1;
+                let version = self.draft_version;
+                let due = Task::perform(
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(state::DRAFT_SYNC_DELAY_MS)).await;
+                    },
+                    move |()| Message::Ui(Ui::DraftDue(chat, version)),
+                );
+                Task::batch([typing, due])
+            }
+            Ui::DraftDue(chat, version) => {
+                if self.selected == Some(chat) && version == self.draft_version {
+                    self.sync_draft(chat)
+                } else {
+                    Task::none()
+                }
             }
             Ui::Send => {
                 if self.pending_file.is_some() {
@@ -1052,11 +1139,17 @@ impl App {
             }
             Ui::Edit(id) if id > 0 => {
                 self.menu_for = None;
+                // Keep what was being typed as the draft while editing.
+                let stash = match self.selected {
+                    Some(chat) => self.sync_draft(chat),
+                    None => Task::none(),
+                };
                 if let Some(m) = self.conversation.as_ref().and_then(|c| c.get(id)) {
                     self.composer = m.text.clone();
                     self.compose_mode = ComposeMode::Edit(id);
                 }
                 Task::batch([
+                    stash,
                     operation::focus(Id::new(COMPOSER_ID)),
                     operation::move_cursor_to_end(Id::new(COMPOSER_ID)),
                 ])
@@ -1125,10 +1218,20 @@ impl App {
             }
             Ui::CancelCompose => {
                 if matches!(self.compose_mode, ComposeMode::Edit(_)) {
-                    self.composer.clear();
+                    // Back to the draft that was stashed when the edit began.
+                    self.compose_mode = ComposeMode::Normal;
+                    if let Some(chat) = self.selected {
+                        self.restore_draft(chat);
+                    } else {
+                        self.composer.clear();
+                    }
+                    return Task::none();
                 }
                 self.compose_mode = ComposeMode::Normal;
-                Task::none()
+                match self.selected {
+                    Some(chat) => self.sync_draft(chat),
+                    None => Task::none(),
+                }
             }
             Ui::ToggleChatSearch => {
                 if self.chat_search.take().is_none() {
@@ -1305,10 +1408,14 @@ impl App {
                 return Task::none();
             };
             conv.edit_local(id, &text);
+            self.restore_draft(chat);
             return self.api_call_or_rollback(old, move |api| {
                 Box::pin(async move { api.edit_message(chat, id, text).await })
             });
         }
+        // A sent message consumes the draft (the server clears it too).
+        self.chats.set_draft(chat, None);
+        let clear_draft = self.store_bg(move |s| s.set_draft(chat, None));
         let reply_to = match mode {
             ComposeMode::Reply(id) => Some(id),
             _ => None,
@@ -1333,6 +1440,7 @@ impl App {
         };
         Task::batch([
             reattach,
+            clear_draft,
             Task::perform(
                 async move { api.send_text(chat, text, reply_to).await },
                 move |result| Message::Done(Done::Sent { chat, temp, result }),
@@ -1347,6 +1455,7 @@ impl App {
         };
         let caption = std::mem::take(&mut self.composer);
         self.typing_throttle.reset();
+        self.chats.set_draft(chat, None);
         let reply_to = match std::mem::replace(&mut self.compose_mode, ComposeMode::Normal) {
             ComposeMode::Reply(id) => Some(id),
             _ => None,
@@ -1366,10 +1475,14 @@ impl App {
             return Task::none();
         };
         let PendingFile { path, kind, .. } = file;
-        Task::perform(
-            async move { api.send_file(chat, path, kind, caption, reply_to).await },
-            move |result| Message::Done(Done::Sent { chat, temp, result }),
-        )
+        let clear_draft = self.store_bg(move |s| s.set_draft(chat, None));
+        Task::batch([
+            clear_draft,
+            Task::perform(
+                async move { api.send_file(chat, path, kind, caption, reply_to).await },
+                move |result| Message::Done(Done::Sent { chat, temp, result }),
+            ),
+        ])
     }
 
     /// Click on a file: download it into the private open-cache and hand it
@@ -1492,6 +1605,22 @@ impl App {
             Event::ReadOutbox { chat, max_id } => {
                 let (chat, max_id) = (*chat, *max_id);
                 tasks.push(self.store_bg(move |s| s.set_read_outbox(chat, max_id)));
+            }
+            Event::Draft { chat, draft } => {
+                let (chat, d) = (*chat, draft.clone());
+                // Another device changed the draft: show it unless the user
+                // is typing here right now.
+                if self.selected == Some(chat)
+                    && self.composer.trim().is_empty()
+                    && !matches!(self.compose_mode, ComposeMode::Edit(_))
+                {
+                    self.composer = d.as_ref().map_or_else(String::new, |d| d.text.clone());
+                    self.compose_mode = d
+                        .as_ref()
+                        .and_then(|d| d.reply_to)
+                        .map_or(ComposeMode::Normal, ComposeMode::Reply);
+                }
+                tasks.push(self.store_bg(move |s| s.set_draft(chat, d.as_ref())));
             }
             Event::Typing { chat, user, action } => {
                 if Some(*user) != self.me.as_ref().map(|u| u.id) {

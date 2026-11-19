@@ -195,6 +195,7 @@ impl GrammersApi {
             chat.read_outbox_max_id = info.read_outbox;
             chat.photo_id = peer_photo_id(d.peer());
             chat.presence = peer_presence(d.peer(), now);
+            chat.draft = info.draft;
             chat.last_message = d.last_message.as_ref().and_then(|m| self.convert(m));
             chat.last_date = chat.last_message.as_ref().map_or(0, |m| m.date);
             out.push(chat);
@@ -620,6 +621,46 @@ impl TelegramApi for Grammers {
             }
         }
         Ok(bytes)
+    }
+
+    async fn save_draft(
+        &self,
+        chat: ChatId,
+        text: String,
+        reply_to: Option<MessageId>,
+    ) -> Result<()> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        api.client
+            .invoke(&tl::functions::messages::SaveDraft {
+                no_webpage: false,
+                invert_media: false,
+                reply_to: reply_to.map(|id| {
+                    tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                        reply_to_msg_id: id,
+                        top_msg_id: None,
+                        reply_to_peer_id: None,
+                        quote_text: None,
+                        quote_entities: None,
+                        quote_offset: None,
+                        monoforum_peer_id: None,
+                        todo_item_id: None,
+                        poll_option: None,
+                        quote_rich: None,
+                    })
+                }),
+                peer: peer.into(),
+                message: text,
+                entities: None,
+                media: None,
+                effect: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await
+            .map(drop)
+            .map_err(map_err)
     }
 
     async fn set_typing(&self, chat: ChatId, active: bool) -> Result<()> {

@@ -20,7 +20,7 @@ use secrecy::SecretString;
 use crate::auth::SignInOutcome;
 use crate::error::{Phone, Result};
 use crate::model::{
-    Chat, ChatId, ConnState, GlobalHit, Message, MessageId, Presence, Reaction, TypingAction,
+    Chat, ChatId, ConnState, Draft, GlobalHit, Message, MessageId, Presence, Reaction, TypingAction,
 };
 
 /// Hard cap on photo bytes downloaded for display.
@@ -64,6 +64,11 @@ pub enum Event {
     UserStatus {
         user: i64,
         presence: Presence,
+    },
+    /// The draft of `chat` changed (on another device). `None` = cleared.
+    Draft {
+        chat: ChatId,
+        draft: Option<Draft>,
     },
     SessionRevoked,
 }
@@ -142,6 +147,14 @@ pub trait TelegramApi: Send + Sync {
     /// The small (160 px) profile photo `photo_id` of `chat` (JPEG).
     /// Capped at [`crate::store::avatars::MAX_AVATAR_BYTES`].
     async fn download_avatar(&self, chat: ChatId, photo_id: i64) -> Result<Vec<u8>>;
+    /// Save (or, with empty text, clear) the draft of `chat` on the server,
+    /// the way the official client syncs drafts between devices.
+    async fn save_draft(
+        &self,
+        chat: ChatId,
+        text: String,
+        reply_to: Option<MessageId>,
+    ) -> Result<()>;
     /// Tell the peer we are typing (`true`) or stopped (`false`).
     async fn set_typing(&self, chat: ChatId, active: bool) -> Result<()>;
     /// Save a message's media (file, photo) to `path`.

@@ -66,6 +66,36 @@ pub struct Chat {
     pub photo_id: Option<i64>,
     /// Last-seen status of the other side of a private chat (not persisted).
     pub presence: Presence,
+    /// Unsent text for this chat (synced with the server).
+    pub draft: Option<Draft>,
+}
+
+/// A draft message. The body is private: `Debug` only prints its length.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub text: String,
+    pub reply_to: Option<MessageId>,
+    /// Unix seconds of the last change.
+    pub date: i64,
+}
+
+impl fmt::Debug for Draft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Draft")
+            .field(
+                "text",
+                &format_args!("MessageBody(len={})", self.text.len()),
+            )
+            .field("reply_to", &self.reply_to)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Draft {
+    /// Same content (ignoring the timestamp)?
+    pub fn same_content(&self, other: &Draft) -> bool {
+        self.text == other.text && self.reply_to == other.reply_to
+    }
 }
 
 /// A user's online status as Telegram reports it (privacy settings can
@@ -113,6 +143,7 @@ impl Chat {
             last_date: 0,
             photo_id: None,
             presence: Presence::Unknown,
+            draft: None,
         }
     }
 

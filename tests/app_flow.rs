@@ -1217,3 +1217,163 @@ async fn jumping_inside_the_loaded_window_does_not_refetch() {
     );
     assert_eq!(app.highlight, Some(148));
 }
+
+// -------------------------------------------------------------- drafts
+
+#[tokio::test]
+async fn fake_backend_saves_and_clears_drafts() {
+    let api = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        ..Default::default()
+    });
+    api.save_draft(ALICE, "later".into(), Some(3))
+        .await
+        .unwrap();
+    let chats = api.dialogs(50).await.unwrap();
+    let d = chats
+        .iter()
+        .find(|c| c.id == ALICE)
+        .unwrap()
+        .draft
+        .clone()
+        .unwrap();
+    assert_eq!((d.text.as_str(), d.reply_to), ("later", Some(3)));
+    api.save_draft(ALICE, String::new(), None).await.unwrap();
+    let chats = api.dialogs(50).await.unwrap();
+    assert!(
+        chats
+            .iter()
+            .find(|c| c.id == ALICE)
+            .unwrap()
+            .draft
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn drafts_follow_the_user_between_chats() {
+    let mut app = signed_in_app();
+    // The mock account already has a draft in "Book Club" (-304).
+    assert_eq!(
+        app.chats.get(-304).unwrap().draft.as_ref().unwrap().text,
+        "I'll bring the cookies"
+    );
+    let _ = app.update(Message::Ui(Ui::SelectChat(-304)));
+    assert_eq!(app.composer, "I'll bring the cookies", "restored on open");
+
+    // Type something in Alice's chat, leave, and come back.
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    assert_eq!(app.composer, "", "no draft there: a clean composer");
+    let _ = app.update(Message::Ui(Ui::Reply(148)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("on my way".into())));
+    let _ = app.update(Message::Ui(Ui::SelectChat(-304)));
+    let d = app.chats.get(ALICE).unwrap().draft.clone().unwrap();
+    assert_eq!(d.text, "on my way");
+    assert_eq!(d.reply_to, Some(148));
+    assert_eq!(app.composer, "I'll bring the cookies");
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    assert_eq!(app.composer, "on my way");
+    assert_eq!(app.compose_mode, ComposeMode::Reply(148));
+
+    // Emptying the box deletes the draft when leaving.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(String::new())));
+    let _ = app.update(Message::Ui(Ui::CancelCompose));
+    let _ = app.update(Message::Ui(Ui::SelectChat(-304)));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_none());
+}
+
+#[tokio::test]
+async fn draft_sync_waits_for_a_pause_in_typing() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("a".into())));
+    let first = app.draft_version;
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("ab".into())));
+    assert!(app.draft_version > first);
+    // The timer from the first keystroke is stale: nothing saved yet.
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, first)));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_none());
+    // The latest timer saves it.
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, app.draft_version)));
+    assert_eq!(
+        app.chats.get(ALICE).unwrap().draft.as_ref().unwrap().text,
+        "ab"
+    );
+    // A timer for a chat that is no longer open does nothing.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("abc".into())));
+    let v = app.draft_version;
+    let _ = app.update(Message::Ui(Ui::SelectChat(-304)));
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, v)));
+    assert_eq!(app.composer, "I'll bring the cookies");
+}
+
+#[tokio::test]
+async fn sending_consumes_the_draft_and_edits_keep_it() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: ALICE,
+        before: None,
+        result: Ok(mock::mock_history(ALICE)),
+    }));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("draft text".into())));
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, app.draft_version)));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_some());
+
+    // Editing a message stashes the draft and gets it back afterwards.
+    let _ = app.update(Message::Ui(Ui::Edit(149)));
+    assert_eq!(app.composer, "You're the best!");
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("You're the best!!".into())));
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, app.draft_version)));
+    assert_eq!(
+        app.chats.get(ALICE).unwrap().draft.as_ref().unwrap().text,
+        "draft text",
+        "edit text is never saved as the draft"
+    );
+    let _ = app.update(Message::Ui(Ui::CancelCompose));
+    assert_eq!(app.composer, "draft text");
+    assert_eq!(app.compose_mode, ComposeMode::Normal);
+
+    let _ = app.update(Message::Ui(Ui::Send));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_none());
+    assert!(app.composer.is_empty());
+}
+
+#[tokio::test]
+async fn drafts_from_other_devices_do_not_clobber_typing() {
+    use ferrogram::model::Draft;
+    let mut app = signed_in_app();
+    let remote = |text: &str| {
+        Message::Net(Event::Draft {
+            chat: ALICE,
+            draft: Some(Draft {
+                text: text.into(),
+                reply_to: None,
+                date: 10,
+            }),
+        })
+    };
+    // Not the open chat: only the list changes.
+    let _ = app.update(remote("from phone"));
+    assert_eq!(
+        app.chats.get(ALICE).unwrap().draft.as_ref().unwrap().text,
+        "from phone"
+    );
+    // Open chat with an empty composer: the draft appears (like the official client).
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    assert_eq!(app.composer, "from phone");
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(String::new())));
+    let _ = app.update(remote("newer from phone"));
+    assert_eq!(app.composer, "newer from phone");
+    // While the user is typing it is left alone.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("mine".into())));
+    let _ = app.update(remote("another"));
+    assert_eq!(app.composer, "mine");
+    // Cleared remotely.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(String::new())));
+    let _ = app.update(Message::Net(Event::Draft {
+        chat: ALICE,
+        draft: None,
+    }));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_none());
+}

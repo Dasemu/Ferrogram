@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::model::{Chat, ChatId, ChatKind, Message, MessageId, Reaction, SendState, TypingAction};
+use crate::model::{
+    Chat, ChatId, ChatKind, Draft, Message, MessageId, Reaction, SendState, TypingAction,
+};
 use crate::net::Event;
 
 /// Max messages kept in memory per open conversation (architecture §3).
@@ -145,6 +147,11 @@ impl ChatList {
                     c.unread_count = *still_unread;
                 }
             }
+            Event::Draft { chat, draft } => {
+                if let Some(c) = self.get_mut(*chat) {
+                    c.draft = draft.clone();
+                }
+            }
             Event::UserStatus { user, presence } => {
                 // A private chat's id is the user's id.
                 if let Some(c) = self.get_mut(*user) {
@@ -155,6 +162,13 @@ impl ChatList {
             | Event::Typing { .. }
             | Event::Connection(_)
             | Event::SessionRevoked => {}
+        }
+    }
+
+    /// Set (or clear) a chat's draft locally.
+    pub fn set_draft(&mut self, id: ChatId, draft: Option<Draft>) {
+        if let Some(c) = self.get_mut(id) {
+            c.draft = draft;
         }
     }
 
@@ -198,6 +212,28 @@ pub fn sort_chats(chats: &mut [Chat]) {
             .then(a.id.cmp(&b.id))
     });
 }
+
+// ------------------------------------------------------------------- drafts
+
+/// The draft the composer currently represents: its text (a text of only
+/// whitespace is no draft) and the message being replied to. Edits are not
+/// drafts.
+pub fn composer_draft(composer: &str, mode: ComposeMode, now: i64) -> Option<Draft> {
+    if matches!(mode, ComposeMode::Edit(_)) || composer.trim().is_empty() {
+        return None;
+    }
+    Some(Draft {
+        text: composer.to_owned(),
+        reply_to: match mode {
+            ComposeMode::Reply(id) if id > 0 => Some(id),
+            _ => None,
+        },
+        date: now,
+    })
+}
+
+/// Wait this long after the last keystroke before syncing a draft.
+pub const DRAFT_SYNC_DELAY_MS: u64 = 1_000;
 
 // ------------------------------------------------------------------- typing
 
@@ -1198,6 +1234,67 @@ mod tests {
         let mut live = Conversation::new(1);
         live.apply_event(&Event::NewMessage(M::text(1, 5, false, 1, "x")));
         assert!(live.get(5).is_some());
+    }
+
+    #[test]
+    fn composer_draft_rules() {
+        let d = composer_draft("hello  ", ComposeMode::Normal, 5).unwrap();
+        assert_eq!((d.text.as_str(), d.reply_to, d.date), ("hello  ", None, 5));
+        assert_eq!(
+            composer_draft("hi", ComposeMode::Reply(12), 1)
+                .unwrap()
+                .reply_to,
+            Some(12)
+        );
+        // Pending (negative id) targets are not saved as reply targets.
+        assert_eq!(
+            composer_draft("hi", ComposeMode::Reply(-1), 1)
+                .unwrap()
+                .reply_to,
+            None
+        );
+        assert!(composer_draft("   \n", ComposeMode::Normal, 1).is_none());
+        assert!(composer_draft("", ComposeMode::Normal, 1).is_none());
+        assert!(composer_draft("edited text", ComposeMode::Edit(3), 1).is_none());
+        let a = composer_draft("x", ComposeMode::Normal, 1).unwrap();
+        let b = composer_draft("x", ComposeMode::Normal, 99).unwrap();
+        assert!(a.same_content(&b));
+        assert!(!a.same_content(&composer_draft("x", ComposeMode::Reply(2), 1).unwrap()));
+        assert!(!format!("{a:?}").contains("\"x\""));
+    }
+
+    #[test]
+    fn draft_events_update_the_chat_list() {
+        let mut l = ChatList::new(vec![chat(1, 1)]);
+        let d = Draft {
+            text: "wip".into(),
+            reply_to: None,
+            date: 3,
+        };
+        l.apply_event(
+            &Event::Draft {
+                chat: 1,
+                draft: Some(d.clone()),
+            },
+            None,
+        );
+        assert_eq!(l.get(1).unwrap().draft, Some(d));
+        l.apply_event(
+            &Event::Draft {
+                chat: 1,
+                draft: None,
+            },
+            None,
+        );
+        assert!(l.get(1).unwrap().draft.is_none());
+        // Unknown chats are ignored.
+        l.apply_event(
+            &Event::Draft {
+                chat: 9,
+                draft: None,
+            },
+            None,
+        );
     }
 
     #[test]

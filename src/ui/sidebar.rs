@@ -245,6 +245,22 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
             .width(Length::Fill)
             .clip(true),
         );
+    } else if let Some(draft) = &c.draft {
+        // Like Telegram Desktop: a red "Draft:" label before the text.
+        preview_row = preview_row.push(text("Draft: ").size(m.font_m).color(if selected {
+            fg
+        } else {
+            p.danger
+        }));
+        preview_row = preview_row.push(
+            container(emoji_line(
+                format::ellipsize(&draft.text, 30),
+                m.font_m,
+                if selected { fg } else { sec },
+            ))
+            .width(Length::Fill)
+            .clip(true),
+        );
     } else if let Some(last) = &c.last_message {
         let prefix =
             if last.outgoing && c.kind != ChatKind::SavedMessages && c.kind != ChatKind::Channel {
