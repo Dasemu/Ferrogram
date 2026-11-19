@@ -118,6 +118,12 @@ impl Config {
         self.cache_dir.join("open")
     }
 
+    /// Images pasted from the clipboard wait here until sent or cancelled
+    /// (private files; leftovers are removed at startup).
+    pub fn paste_dir(&self) -> PathBuf {
+        self.cache_dir.join("paste")
+    }
+
     pub fn cache_db_path(&self) -> PathBuf {
         self.data_dir.join("cache.sqlite3")
     }

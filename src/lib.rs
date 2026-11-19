@@ -5,6 +5,7 @@
 pub mod app;
 pub mod auth;
 pub mod autostart;
+pub mod clipboard;
 pub mod config;
 pub mod desktop;
 pub mod error;

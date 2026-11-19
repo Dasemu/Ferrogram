@@ -685,6 +685,14 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> Element<'a, Message> 
             false,
         ));
     }
+    if matches!(msg.media, Some(Media::Photo { .. })) {
+        items = items.push(item(
+            Icon::Copy,
+            "Copy Image",
+            Message::Ui(Ui::CopyImage(msg.chat_id, msg.id)),
+            false,
+        ));
+    }
     if matches!(msg.media, Some(Media::File { .. } | Media::Photo { .. })) {
         items = items.push(item(
             Icon::Download,
@@ -861,6 +869,7 @@ fn composer(app: &App) -> Element<'_, Message> {
             text_input("Write a message…", &app.composer)
                 .id(COMPOSER_ID)
                 .on_input(|s| Message::Ui(Ui::ComposerChanged(s)))
+                .on_paste(|s| Message::Ui(Ui::TextPasted(s)))
                 .on_submit(Message::Ui(Ui::Send))
                 .padding([10, 2])
                 .size(m.font_m)

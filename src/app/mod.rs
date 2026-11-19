@@ -99,6 +99,8 @@ pub struct PendingFile {
     pub name: String,
     pub size: u64,
     pub kind: UploadKind,
+    /// A pasted image we wrote ourselves: deleted once sent or cancelled.
+    pub temp: bool,
 }
 
 pub struct App {
@@ -126,6 +128,8 @@ pub struct App {
     pub composer: String,
     pub compose_mode: ComposeMode,
     pub pending_file: Option<PendingFile>,
+    /// Text the composer just got from a paste, with the time (ms).
+    pub last_paste: Option<(String, i64)>,
     pub emoji_open: bool,
     pub menu_for: Option<MessageId>,
     pub chat_search: Option<ChatSearch>,
@@ -260,6 +264,7 @@ impl App {
             composer: String::new(),
             compose_mode: ComposeMode::Normal,
             pending_file: None,
+            last_paste: None,
             emoji_open: false,
             menu_for: None,
             chat_search: None,
@@ -349,6 +354,13 @@ impl App {
             app.start_tray(minimized)
         };
 
+        // Pasted images left behind by a crash (they are deleted on send/cancel).
+        if !app.config.mock {
+            let dir = app.config.paste_dir();
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(dir);
+            });
+        }
         // Cached avatars from disk are on screen with the first frame.
         let avatars = app.fetch_avatars();
         (app, Task::batch([open, tray, task, script, avatars]))
@@ -600,6 +612,15 @@ impl App {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 ..
             }) => Some(Message::Ui(Ui::Escape)),
+            // Ctrl+V (any layout: the physical key). Delivered even when the
+            // composer captured it for the text paste.
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyV),
+                modifiers,
+                ..
+            }) if modifiers.command() && !modifiers.shift() && !modifiers.alt() => {
+                Some(Message::Ui(Ui::Paste))
+            }
             _ => None,
         })];
         // Tray menu, second launch and notification clicks.
@@ -1390,9 +1411,31 @@ impl App {
                 None => Task::none(),
             },
             Ui::CancelPendingFile => {
-                self.pending_file = None;
+                self.drop_pending();
                 Task::none()
             }
+            Ui::Paste => {
+                if self.selected.is_none()
+                    || !self.auth.is_signed_in()
+                    || self.settings_open
+                    || self.viewer.is_some()
+                {
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(crate::clipboard::read_blocking)
+                            .await
+                            .unwrap_or(crate::clipboard::Clip::Nothing)
+                    },
+                    |c| Message::Done(Done::Pasted(c)),
+                )
+            }
+            Ui::TextPasted(s) => {
+                self.last_paste = Some((s, Self::now_ms()));
+                Task::none()
+            }
+            Ui::CopyImage(chat, id) => self.copy_image(chat, id),
             Ui::ToggleEmoji => {
                 self.emoji_open = !self.emoji_open;
                 Task::none()
@@ -1674,7 +1717,7 @@ impl App {
                     || std::mem::take(&mut self.main_menu)
                     || self.viewer.take().is_some()
                     || self.menu_for.take().is_some()
-                    || self.pending_file.take().is_some()
+                    || self.drop_pending()
                     || std::mem::take(&mut self.emoji_open);
                 if closed {
                     Task::none()
@@ -1775,6 +1818,100 @@ impl App {
         ])
     }
 
+    /// Forget the pending file; a pasted temp image is deleted. `true` when
+    /// there was one.
+    fn drop_pending(&mut self) -> bool {
+        let Some(f) = self.pending_file.take() else {
+            return false;
+        };
+        if f.temp {
+            // A tiny unlink on a plain thread: no runtime needed in `update`.
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_file(f.path);
+            });
+        }
+        true
+    }
+
+    /// The composer pasted text for the same Ctrl+V (a copied file's path):
+    /// take it out again, the file is what the user meant.
+    fn undo_text_paste(&mut self) {
+        if let Some((pasted, at)) = self.last_paste.take()
+            && Self::now_ms() - at < 3_000
+        {
+            self.composer = crate::clipboard::strip_pasted(&self.composer, &pasted);
+        }
+    }
+
+    fn on_pasted(&mut self, clip: crate::clipboard::Clip) -> Task<Message> {
+        use crate::clipboard::Clip;
+        if self.selected.is_none() || !self.auth.is_signed_in() {
+            return Task::none();
+        }
+        match clip {
+            Clip::Nothing => Task::none(),
+            Clip::Files(files) => {
+                self.undo_text_paste();
+                let n = files.len();
+                let Some(first) = files.into_iter().next() else {
+                    return Task::none();
+                };
+                let attach = self.update_ui(Ui::FilePicked(Some(first)));
+                if n > 1 {
+                    let t =
+                        self.toast("Only one file is sent at a time: attached the first.".into());
+                    Task::batch([attach, t])
+                } else {
+                    attach
+                }
+            }
+            Clip::Image(png) => {
+                self.undo_text_paste();
+                let dir = self.config.paste_dir();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            crate::clipboard::save_pasted(&dir, &png)
+                        })
+                        .await
+                        .map_err(|_| Error::Cancelled)?
+                        .map_err(Error::from)
+                    },
+                    |r| Message::Done(Done::PasteSaved(r)),
+                )
+            }
+        }
+    }
+
+    /// "Copy image": the cached photo bytes, or a fresh download, decoded
+    /// (with the usual caps) and put on the system clipboard.
+    fn copy_image(&mut self, chat: ChatId, id: MessageId) -> Task<Message> {
+        self.menu_for = None;
+        let cached = match self.photos.peek(&(chat, id)) {
+            Some(image::Handle::Bytes(_, b)) => Some(b.to_vec()),
+            _ => None,
+        };
+        let api = self.api.clone();
+        Task::perform(
+            async move {
+                let bytes = match (cached, api) {
+                    (Some(b), _) => b,
+                    (None, Some(api)) => api.download_photo(chat, id).await?,
+                    (None, None) => return Err(Error::Net("not connected".into())),
+                };
+                tokio::task::spawn_blocking(move || {
+                    let px = crate::clipboard::decode_photo(&bytes)
+                        .ok_or_else(|| Error::Protocol("image not copyable".into()))?;
+                    crate::clipboard::write_image_blocking(px)
+                        .map_err(|_| Error::Io("clipboard unavailable".into()))
+                })
+                .await
+                .map_err(|_| Error::Cancelled)?
+            },
+            |r| Message::Done(Done::ImageCopied(r)),
+        )
+    }
+
     fn send_file(&mut self, file: PendingFile) -> Task<Message> {
         let Some(chat) = self.selected else {
             return Task::none();
@@ -1800,12 +1937,25 @@ impl App {
         let Some(api) = self.api.clone() else {
             return Task::none();
         };
-        let PendingFile { path, kind, .. } = file;
+        let PendingFile {
+            path,
+            kind,
+            temp: is_paste,
+            ..
+        } = file;
         let clear_draft = self.store_bg(move |s| s.set_draft(chat, None));
         Task::batch([
             clear_draft,
             Task::perform(
-                async move { api.send_file(chat, path, kind, caption, reply_to).await },
+                async move {
+                    let r = api
+                        .send_file(chat, path.clone(), kind, caption, reply_to)
+                        .await;
+                    if is_paste {
+                        let _ = tokio::fs::remove_file(&path).await;
+                    }
+                    r
+                },
                 move |result| Message::Done(Done::Sent { chat, temp, result }),
             ),
         ])
@@ -2369,7 +2519,9 @@ impl App {
             Done::FileStat { path, result } => match result {
                 Ok((_, true)) => self.toast("Folders can't be sent. Drop a file instead.".into()),
                 Ok((size, false)) => {
+                    self.drop_pending();
                     self.pending_file = Some(PendingFile {
+                        temp: path.starts_with(self.config.paste_dir()),
                         name: path
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -2396,6 +2548,11 @@ impl App {
                 )
             }
             Done::SavePicked { path: None, .. } => Task::none(),
+            Done::Pasted(clip) => self.on_pasted(clip),
+            Done::PasteSaved(Ok(path)) => self.update_ui(Ui::FilePicked(Some(path))),
+            Done::PasteSaved(Err(e)) => self.on_error(e),
+            Done::ImageCopied(Ok(())) => self.toast("Image copied.".into()),
+            Done::ImageCopied(Err(e)) => self.on_error(e),
             Done::MediaSaved(Ok(())) => self.toast("File saved.".into()),
             Done::MediaSaved(Err(e)) => self.on_error(e),
             Done::Photo { key, result } => {

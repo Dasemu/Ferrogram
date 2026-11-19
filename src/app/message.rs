@@ -52,6 +52,14 @@ pub enum Ui {
     FilePicked(Option<PathBuf>),
     FileDropped(PathBuf),
     SendPendingFile,
+    /// Ctrl+V: look for copied files or an image on the system clipboard
+    /// (text is pasted by the focused text field itself).
+    Paste,
+    /// The composer inserted this pasted text (to undo it when the clipboard
+    /// turns out to hold a file whose path was offered as text too).
+    TextPasted(String),
+    /// "Copy image" on a photo message.
+    CopyImage(ChatId, MessageId),
     CancelPendingFile,
     ToggleEmoji,
     InsertEmoji(&'static str),
@@ -157,6 +165,11 @@ pub enum Done {
         path: Option<PathBuf>,
     },
     MediaSaved(Result<(), Error>),
+    /// The clipboard content found after Ctrl+V.
+    Pasted(crate::clipboard::Clip),
+    /// A pasted image was written to a private temporary file.
+    PasteSaved(Result<PathBuf, Error>),
+    ImageCopied(Result<(), Error>),
     Photo {
         key: (ChatId, MessageId),
         result: Result<Vec<u8>, Error>,

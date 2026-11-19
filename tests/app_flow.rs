@@ -1378,3 +1378,128 @@ async fn drafts_from_other_devices_do_not_clobber_typing() {
     }));
     assert!(app.chats.get(ALICE).unwrap().draft.is_none());
 }
+
+fn wait_until_gone(path: &std::path::Path) -> bool {
+    for _ in 0..100 {
+        if !path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[test]
+fn pasted_image_gets_the_attach_preview_and_caption_flow() {
+    use ferrogram::clipboard;
+    use ferrogram::net::UploadKind;
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = signed_in_app();
+    app.config.cache_dir = dir.path().to_path_buf();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let png = mock::mock_photo_png(3, 32, 32);
+    let path = clipboard::save_pasted(&app.config.paste_dir(), &png).unwrap();
+
+    // Clipboard task finished: file is written, then stat'ed like a picked file.
+    let _ = app.update(Message::Done(Done::PasteSaved(Ok(path.clone()))));
+    let _ = app.update(Message::Done(Done::FileStat {
+        path: path.clone(),
+        result: Ok((png.len() as u64, false)),
+    }));
+    let f = app.pending_file.clone().expect("preview shown");
+    assert!(f.temp, "pasted images are temporary files");
+    assert_eq!(
+        f.kind,
+        UploadKind::Photo,
+        "sent as a photo, like the picker"
+    );
+
+    // Caption flow: the composer text becomes the caption.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("look at this".into())));
+    let _ = app.update(Message::Ui(Ui::SendPendingFile));
+    assert!(app.pending_file.is_none());
+    assert!(app.composer.is_empty());
+    let last = app
+        .conversation
+        .as_ref()
+        .unwrap()
+        .messages()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(last.text, "look at this");
+    assert_eq!(last.state, SendState::Sending);
+
+    // Cancelling the preview deletes the temp file.
+    let path2 = clipboard::save_pasted(&app.config.paste_dir(), &png).unwrap();
+    let _ = app.update(Message::Done(Done::FileStat {
+        path: path2.clone(),
+        result: Ok((png.len() as u64, false)),
+    }));
+    assert!(app.pending_file.is_some());
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(app.pending_file.is_none());
+    assert!(wait_until_gone(&path2), "temp image removed on cancel");
+}
+
+#[test]
+fn pasting_a_copied_file_removes_the_path_text_the_field_inserted() {
+    use ferrogram::clipboard::Clip;
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    // The composer already took the text form of the clipboard.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(
+        "hi file:///tmp/cat.jpg".into(),
+    )));
+    let _ = app.update(Message::Ui(Ui::TextPasted("file:///tmp/cat.jpg".into())));
+    let _ = app.update(Message::Done(Done::Pasted(Clip::Files(vec![
+        "/tmp/cat.jpg".into(),
+        "/tmp/dog.jpg".into(),
+    ]))));
+    assert_eq!(app.composer, "hi ");
+    assert!(
+        app.toast.as_deref().unwrap().contains("first"),
+        "extra files are reported"
+    );
+}
+
+#[test]
+fn pasting_plain_text_or_without_a_chat_changes_nothing() {
+    use ferrogram::clipboard::Clip;
+    let mut app = signed_in_app();
+    // No chat open: nothing to attach to.
+    let _ = app.update(Message::Done(Done::Pasted(Clip::Image(vec![1, 2, 3]))));
+    assert!(app.pending_file.is_none());
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("keep".into())));
+    let _ = app.update(Message::Ui(Ui::TextPasted("keep".into())));
+    let _ = app.update(Message::Done(Done::Pasted(Clip::Nothing)));
+    assert_eq!(app.composer, "keep", "text paste stays with the text field");
+    assert!(app.pending_file.is_none());
+}
+
+#[test]
+fn stale_text_paste_is_not_stripped_by_a_later_image_paste() {
+    use ferrogram::clipboard::Clip;
+    let mut app = signed_in_app();
+    app.config.cache_dir = tempfile::tempdir().unwrap().keep();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("abc".into())));
+    app.last_paste = Some(("abc".into(), 0)); // pasted long ago
+    let _ = app.update(Message::Done(Done::Pasted(Clip::Image(
+        mock::mock_photo_png(1, 8, 8),
+    ))));
+    assert_eq!(app.composer, "abc");
+}
+
+#[test]
+fn copy_image_closes_the_menu() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::MessageMenu(Some(143))));
+    assert_eq!(app.menu_for, Some(143));
+    let _ = app.update(Message::Ui(Ui::CopyImage(ALICE, 143)));
+    assert_eq!(app.menu_for, None);
+    let _ = app.update(Message::Done(Done::ImageCopied(Ok(()))));
+    assert_eq!(app.toast.as_deref(), Some("Image copied."));
+}
