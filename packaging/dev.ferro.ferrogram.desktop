@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ferrogram
+GenericName=Telegram Client
+Comment=Lightweight unofficial Telegram desktop client
+Exec=ferrogram
+Icon=dev.ferro.ferrogram
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=telegram;chat;messenger;
+StartupWMClass=dev.ferro.ferrogram
+SingleMainWindow=true
