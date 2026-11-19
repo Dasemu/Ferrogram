@@ -769,7 +769,14 @@ impl App {
             }
             let (api, disk) = (api.clone(), self.avatar_disk.clone());
             tasks.push(Task::perform(
-                async move { load_avatar(api, disk, key).await },
+                async move {
+                    let bytes = load_avatar(api, disk, key).await?;
+                    // Decode (and cut the circle) off the UI thread.
+                    tokio::task::spawn_blocking(move || crate::media::AvatarImage::decode(&bytes))
+                        .await
+                        .map_err(|_| Error::Cancelled)?
+                        .ok_or_else(|| Error::Protocol("avatar undecodable".into()))
+                },
                 move |result| {
                     Message::Done(Done::Avatar {
                         chat: key.0,
@@ -2090,14 +2097,12 @@ impl App {
                 let key = (chat, photo_id);
                 self.avatar_loading.remove(&key);
                 match result {
-                    Ok(bytes) => {
-                        let size = state::image_dimensions(&bytes)
-                            .map_or(AVATAR_COST, |(w, h)| (w as usize) * (h as usize) * 4);
-                        self.avatars.insert(
-                            chat,
-                            (photo_id, image::Handle::from_bytes(bytes)),
-                            size,
-                        );
+                    Ok(img) => {
+                        let size = (img.width as usize) * (img.height as usize) * 4;
+                        let handle =
+                            image::Handle::from_rgba(img.width, img.height, (*img.rgba).clone());
+                        self.avatars
+                            .insert(chat, (photo_id, handle), size.max(AVATAR_COST / 4));
                     }
                     // Not available right now (offline, disk miss): the next
                     // trigger (chat list refresh, opening a chat) retries.

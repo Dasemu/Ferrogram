@@ -34,8 +34,7 @@ pub fn avatar_photo<'a>(
             image(h.clone())
                 .width(size)
                 .height(size)
-                .content_fit(iced::ContentFit::Cover)
-                .border_radius(size / 2.0),
+                .content_fit(iced::ContentFit::Cover),
         )
         .width(size)
         .height(size)

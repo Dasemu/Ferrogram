@@ -1382,6 +1382,7 @@ dependencies = [
  "grammers-client",
  "grammers-session",
  "iced",
+ "image",
  "keyring",
  "notify-rust",
  "open",

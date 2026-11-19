@@ -702,6 +702,7 @@ fn api_setup_flag_opens_the_form() {
 // ------------------------------------------------ avatars, typing, files
 
 use ferrogram::app::load_avatar;
+use ferrogram::media::AvatarImage;
 use ferrogram::model::{Media, Presence, TypingAction};
 use ferrogram::store::avatars::AvatarDisk;
 
@@ -782,7 +783,7 @@ fn avatar_state_follows_photo_id_and_chat_list() {
     let _ = app.update(Message::Done(Done::Avatar {
         chat: ALICE,
         photo_id: pid,
-        result: Ok(png.clone()),
+        result: Ok(AvatarImage::decode(&png).unwrap()),
     }));
     assert!(app.avatar(ALICE).is_some());
 
@@ -820,7 +821,7 @@ fn avatar_cache_is_bounded_and_cleared_on_logout() {
         let _ = app.update(Message::Done(Done::Avatar {
             chat,
             photo_id: 1,
-            result: Ok(png.clone()),
+            result: Ok(AvatarImage::decode(&png).unwrap()),
         }));
     }
     assert!(app.avatars.bytes() <= ferrogram::app::AVATAR_BUDGET);

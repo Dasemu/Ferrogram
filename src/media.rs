@@ -4,6 +4,7 @@
 //! [`crate::desktop`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::model::{ChatId, MessageId};
 
@@ -138,6 +139,50 @@ pub fn open_path(dir: &Path, chat: ChatId, id: MessageId, name: &str) -> PathBuf
     dir.join(format!("{chat}_{id}")).join(safe_file_name(name))
 }
 
+/// A decoded profile photo, already cut to a circle (alpha mask), so every
+/// renderer draws it round. Pixels are shared, not copied, between messages.
+#[derive(Clone)]
+pub struct AvatarImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<Vec<u8>>,
+}
+
+impl std::fmt::Debug for AvatarImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AvatarImage({}x{})", self.width, self.height)
+    }
+}
+
+impl AvatarImage {
+    /// Decode a JPEG/PNG avatar. Dimensions are validated from the header
+    /// first (see [`crate::app::state::avatar_is_acceptable`]), so a hostile
+    /// file cannot make the decoder allocate more than a few megabytes.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if !crate::app::state::avatar_is_acceptable(bytes) {
+            return None;
+        }
+        let mut img = image::load_from_memory(bytes).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let r = cx.min(cy);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+            // One pixel of anti-aliasing on the edge of the circle.
+            let cover = (r - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+            px.0[3] = (f32::from(px.0[3]) * cover) as u8;
+        }
+        Some(Self {
+            width: w,
+            height: h,
+            rgba: Arc::new(img.into_raw()),
+        })
+    }
+}
+
 /// Mark a downloaded file owner-read/write only: no execute bit, whatever
 /// the umask says.
 pub fn make_non_executable(path: &Path) {
@@ -147,6 +192,34 @@ pub fn make_non_executable(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avatars_decode_to_a_circle() {
+        let png = crate::mock::mock_avatar_png(3, 64).unwrap();
+        let a = AvatarImage::decode(&png).unwrap();
+        assert_eq!((a.width, a.height), (64, 64));
+        assert_eq!(a.rgba.len(), 64 * 64 * 4);
+        let alpha = |x: usize, y: usize| a.rgba[(y * 64 + x) * 4 + 3];
+        assert_eq!(alpha(0, 0), 0, "corners are transparent");
+        assert_eq!(alpha(63, 63), 0);
+        assert_eq!(alpha(32, 32), 255, "centre is opaque");
+        assert!(alpha(32, 1) > 0, "edge midpoints are inside the circle");
+    }
+
+    #[test]
+    fn hostile_avatars_are_refused_not_decoded() {
+        assert!(AvatarImage::decode(b"").is_none());
+        assert!(AvatarImage::decode(b"not an image").is_none());
+        // Valid PNG header claiming 40000 x 40000 pixels: refused from the header alone.
+        let mut bomb = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bomb.extend_from_slice(&40_000u32.to_be_bytes());
+        bomb.extend_from_slice(&40_000u32.to_be_bytes());
+        bomb.extend_from_slice(&[8, 6, 0, 0, 0]);
+        assert!(AvatarImage::decode(&bomb).is_none());
+        // Truncated real image: decoder error, not a panic.
+        let png = crate::mock::mock_avatar_png(3, 64).unwrap();
+        assert!(AvatarImage::decode(&png[..png.len() / 2]).is_none());
+    }
 
     #[test]
     fn executables_are_save_only() {

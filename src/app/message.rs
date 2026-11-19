@@ -154,7 +154,7 @@ pub enum Done {
     Avatar {
         chat: ChatId,
         photo_id: i64,
-        result: Result<Vec<u8>, Error>,
+        result: Result<crate::media::AvatarImage, Error>,
     },
     /// A received file was downloaded and is ready for the system handler.
     FileReady(Result<PathBuf, Error>),
