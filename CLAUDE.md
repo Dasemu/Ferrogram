@@ -41,3 +41,5 @@ Users supply `FERROGRAM_API_ID`/`FERROGRAM_API_HASH` (my.telegram.org).
 - Emoji need the `Noto Color Emoji` font span (`widgets::emoji_text`), else monochrome fallbacks.
 - Containers holding a `Fill` row still need `.width(Fill)` or their background shrinks.
 - `Dialog::peer_ref()` in grammers unwraps; use `peer().to_ref().await` instead.
+- api_hash lives only in the keyring (`api-hash`); never add it back to config.ini.
+- Logout/revoke must rebuild `GrammersApi` (fresh SenderPool + EventHub subscription).

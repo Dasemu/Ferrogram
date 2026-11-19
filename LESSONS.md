@@ -2,6 +2,25 @@
 
 Things learned while building Ferrogram, newest first.
 
+- **Take-once channels break re-login.** An event receiver or update pump
+  taken on first use silently stops delivering events after logout → login.
+  Make subscriptions restartable (`EventHub`), and rebuild the protocol
+  client on logout/revoke.
+- **Offline ≠ logged out.** Treating a network error from `restore()` as
+  "show the phone screen" costs a fresh SMS, risks FLOOD_WAIT and can
+  overwrite a good session. Retry transient errors with backoff and keep the
+  cache visible.
+- **A cache is not a history.** Serving "older" pages from SQLite without
+  knowing that the range is contiguous hides gaps. Track network-confirmed
+  ranges per chat.
+- **`tokio::time::sleep()` needs a runtime when called, not when awaited.**
+  Wrap it in `async { … }` inside `Task::perform`, or unit tests that drive
+  `update()` without a runtime panic.
+- **Notification bodies are markup** on KDE/freedesktop. Escape `& < >` in
+  both title and body, and coalesce bursts (catch-up after a reconnect).
+- **Check image headers before decoding** and cap bytes and pixels, so a
+  hostile "photo" cannot exhaust memory.
+
 - **grammers-session's SQLite storage clashes with rusqlite.** Its default
   `sqlite-storage` feature pulls `libsql` (another SQLite) and writes the auth
   key unencrypted. Disable default features and implement `Session` yourself;

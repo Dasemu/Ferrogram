@@ -28,7 +28,10 @@ app ──▶ net::TelegramApi (trait, async_trait)
 `send_text`, `send_file`, `edit_message`, `delete_messages`, `react`,
 `mark_read`, `search`, `download_photo`, `events`.
 
-`events()` returns the live stream of `net::Event`
+`events()` returns the live stream of `net::Event`. It is backed by
+`net::EventHub`: a new subscription takes over from the previous one (whose
+stream ends), and events emitted while nobody listens are kept in a small
+bounded backlog
 (`NewMessage`, `MessageEdited`, `MessagesDeleted`, `Reactions`,
 `ReadOutbox`, `ReadInbox`, `Connection`, `SessionRevoked`). The app
 subscribes to it with `Subscription::run_with`.
@@ -70,8 +73,14 @@ state as soon as it is submitted.
 
 ## Credentials and session storage
 
-* `api_id` / `api_hash` come from `FERROGRAM_API_ID` / `FERROGRAM_API_HASH`
-  or `$XDG_CONFIG_HOME/ferrogram/config.ini`; never compiled in.
+* `api_id` (not secret) comes from `FERROGRAM_API_ID` or
+  `$XDG_CONFIG_HOME/ferrogram/config.ini`.
+* `api_hash` (secret) comes from `FERROGRAM_API_HASH` or the OS keyring
+  (`dev.ferro.ferrogram` / `api-hash`), filled from the first-run setup
+  screen. A hash given by env var is imported into the keyring. A legacy
+  `api_hash` line in `config.ini` is migrated to the keyring and removed. The
+  hash is never read from or written to a plain file, and is never compiled
+  in.
 * The grammers session (auth keys per DC, peer access hashes, update
   state) is serialised to JSON, encrypted with ChaCha20-Poly1305 using a
   random 256-bit key stored in the OS keyring (`dev.ferro.ferrogram` /
@@ -79,6 +88,43 @@ state as soon as it is submitted.
   (mode 0600). It is saved after login, and every 20 s if dirty.
 * If no keyring is available the app shows an error on the login screen
   and never falls back to a plain file.
+* If the blob cannot be decrypted or parsed (lost or reset keyring key,
+  corrupt file), it is deleted, a fresh session is started and a toast asks
+  the user to log in again. Keyring *access* errors are reported instead,
+  because the blob may still be fine.
+* Logout and revoke call `EncryptedSession::clear()`, which marks the session
+  closed: the periodic flusher stops, and no late save can write the old key
+  back. The app then builds a **new** `GrammersApi`, with a new SenderPool,
+  update receiver and event hub. Nothing from the old session is reused.
+* The SQLite cache is plain text, but owner-only (directory 0700, files
+  0600, including `-wal` and `-shm`).
+
+## History contiguity
+
+`history_ranges(chat_id, lo, hi)` (store migration 2) records the id range
+that the *network* has proven complete in the cache:
+
+* A newest page (`before = None`) proves `[min, max]` of the page.
+* A page `before = b` proves `[min, b - 1]`.
+* A short page proves everything down to the start (`lo = 0`).
+* Ranges are unioned when they touch or overlap. A disjoint newer range
+  replaces the old one, because the old one can no longer be proven
+  contiguous with the present.
+
+`load_older_cached(chat, before)` serves a page from the cache only if
+`lo < before <= hi + 1` and the page is full (or `lo == 0`). Otherwise it
+returns nothing and the app asks the network. Example: an old cache of 1–50
+and a fresh network page 901–950 give range `[901, 950]`, so paging before 901
+goes to the network instead of jumping straight to message 50.
+
+## Offline start
+
+`restore()` failing with a transient error (`Net`, `Cancelled`) keeps the app
+in `Restoring`. The cached chat list stays on screen with a "Waiting for
+network…" banner, and the restore is retried with the same exponential
+backoff. Only a definite `Ok(None)` (not authorised) or a revoked session
+shows the phone screen. Per-request failures show a toast and never change
+the connection state.
 
 ## Reconnects
 
