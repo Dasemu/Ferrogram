@@ -112,9 +112,69 @@ pub fn notify(title: String, body: String) {
     }
 }
 
+pub const DESKTOP_ENTRY: &str = include_str!("../packaging/dev.ferro.ferrogram.desktop");
+pub const APP_ICON_SVG: &str = include_str!("../packaging/dev.ferro.ferrogram.svg");
+
+/// The desktop entry with `Exec` pointing at `exec` (quoted per the spec).
+pub fn desktop_entry_for(exec: &std::path::Path) -> String {
+    let quoted = format!(
+        "\"{}\"",
+        exec.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    );
+    DESKTOP_ENTRY
+        .lines()
+        .map(|l| {
+            if l.starts_with("Exec=") {
+                format!("Exec={quoted}")
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+/// `--install-desktop-entry`: write the .desktop file and the SVG icon under
+/// `data_home` (normally `~/.local/share`). Returns the two paths.
+pub fn install_desktop_entry(
+    data_home: &std::path::Path,
+    exec: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let apps = data_home.join("applications");
+    let icons = data_home.join("icons/hicolor/scalable/apps");
+    std::fs::create_dir_all(&apps)?;
+    std::fs::create_dir_all(&icons)?;
+    let entry = apps.join(format!("{APP_ID}.desktop"));
+    let icon = icons.join(format!("{APP_ID}.svg"));
+    std::fs::write(&entry, desktop_entry_for(exec))?;
+    std::fs::write(&icon, APP_ICON_SVG)?;
+    Ok((entry, icon))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_entry_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = std::path::Path::new("/opt/Ferro gram/ferrogram");
+        let (entry, icon) = install_desktop_entry(dir.path(), exe).unwrap();
+        let text = std::fs::read_to_string(&entry).unwrap();
+        assert!(
+            text.contains("Exec=\"/opt/Ferro gram/ferrogram\""),
+            "{text}"
+        );
+        assert!(text.contains("Icon=dev.ferro.ferrogram"));
+        assert!(text.contains("StartupWMClass=dev.ferro.ferrogram"));
+        assert!(entry.ends_with("applications/dev.ferro.ferrogram.desktop"));
+        assert!(icon.ends_with("icons/hicolor/scalable/apps/dev.ferro.ferrogram.svg"));
+        assert!(std::fs::read_to_string(icon).unwrap().contains("<svg"));
+    }
 
     #[test]
     fn chat_titles_are_escaped_too() {

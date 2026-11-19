@@ -10,8 +10,9 @@ fn main() -> iced::Result {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
             "Ferrogram — unofficial Telegram client\n\n\
-             USAGE: ferrogram [--mock] [--screenshot <screen> <out.png>]\n\n\
-             screens: login-phone login-code login-password chats search reply media\n\
+             USAGE: ferrogram [--mock] [--api-setup] [--install-desktop-entry]\n\
+                    [--screenshot <screen> <out.png>]\n\n\
+             screens: login-phone login-code login-password api-setup chats search reply media\n\
              env: FERROGRAM_API_ID, FERROGRAM_API_HASH, FERRO_THEME=light, FERRO_TRACE_STARTUP=1"
         );
         return Ok(());
@@ -25,6 +26,42 @@ fn main() -> iced::Result {
     {
         // SAFETY: called at the top of `main`, before any thread is spawned.
         unsafe { std::env::set_var("ICED_BACKEND", "tiny-skia") };
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "ferrogram {}\nbuilt-in Telegram API credentials: {}",
+            env!("CARGO_PKG_VERSION"),
+            if ferrogram::config::embedded_credentials().is_some() {
+                "yes"
+            } else {
+                "no (development build)"
+            }
+        );
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--install-desktop-entry") {
+        let data_home = directories::BaseDirs::new().map(|d| d.data_dir().to_path_buf());
+        let exe = std::env::current_exe();
+        return match (data_home, exe) {
+            (Some(home), Ok(exe)) => match ferrogram::desktop::install_desktop_entry(&home, &exe) {
+                Ok((entry, icon)) => {
+                    println!(
+                        "installed {}\ninstalled {}",
+                        entry.display(),
+                        icon.display()
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("could not install desktop entry: {e}");
+                    std::process::exit(1)
+                }
+            },
+            _ => {
+                eprintln!("could not determine the data directory or executable path");
+                std::process::exit(1)
+            }
+        };
     }
     let config = Config::from_env(&args);
     ferrogram::logging::init((!config.mock).then(|| config.log_path()).as_deref());
