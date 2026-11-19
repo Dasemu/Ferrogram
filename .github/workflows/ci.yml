@@ -19,7 +19,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev \
-            libxkbcommon-dev libwayland-dev libx11-dev libfontconfig1-dev libssl-dev
+            libxkbcommon-dev libwayland-dev libx11-dev libfontconfig1-dev libssl-dev dbus
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -29,4 +29,8 @@ jobs:
       - name: cargo clippy -- -D warnings
         run: cargo clippy --all-targets -- -D warnings
       - name: cargo test
-        run: cargo test --all-targets
+        # A private session bus lets the StatusNotifierItem test run; without
+        # FERRO_REQUIRE_BUS it would silently skip.
+        env:
+          FERRO_REQUIRE_BUS: "1"
+        run: dbus-run-session -- cargo test --all-targets

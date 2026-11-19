@@ -21,6 +21,7 @@ pub enum ScreenshotTarget {
     Reply,
     Media,
     ApiSetup,
+    Settings,
 }
 
 impl ScreenshotTarget {
@@ -34,6 +35,7 @@ impl ScreenshotTarget {
             "reply" => Self::Reply,
             "media" => Self::Media,
             "api-setup" => Self::ApiSetup,
+            "settings" => Self::Settings,
             _ => return None,
         })
     }
@@ -56,6 +58,8 @@ pub struct Config {
     pub notifications: bool,
     /// `--api-setup`: open "use your own API credentials" on start.
     pub api_setup: bool,
+    /// `--minimized`: start with no window, only the tray icon.
+    pub minimized: bool,
 }
 
 impl Config {
@@ -99,6 +103,7 @@ impl Config {
             notification_preview: !env_flag("FERROGRAM_NOTIFY_SENDER_ONLY"),
             notifications: !env_flag("FERROGRAM_NO_NOTIFY") && screenshot.is_none(),
             api_setup: args.iter().any(|a| a == "--api-setup"),
+            minimized: args.iter().any(|a| a == "--minimized"),
         }
     }
 
@@ -117,6 +122,11 @@ impl Config {
 
     pub fn session_blob_path(&self) -> PathBuf {
         self.data_dir.join("session.enc")
+    }
+
+    /// Background-mode preferences (see `prefs`).
+    pub fn prefs_path(&self) -> PathBuf {
+        self.config_dir.join("settings.ini")
     }
 
     pub fn log_path(&self) -> PathBuf {

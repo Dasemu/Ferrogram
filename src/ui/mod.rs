@@ -4,6 +4,7 @@ pub mod chat;
 pub mod format;
 pub mod icons;
 pub mod login;
+pub mod settings;
 pub mod sidebar;
 pub mod theme;
 pub mod widgets;
@@ -37,6 +38,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     if let Some(viewer) = chat::media_viewer(app) {
         layers = layers.push(opaque(viewer));
+    }
+    if app.settings_open {
+        layers = layers.push(settings::view(app));
     }
     layers.into()
 }

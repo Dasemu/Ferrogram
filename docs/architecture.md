@@ -292,3 +292,24 @@ bubble radius 14 px (4 px on the tail corner), max bubble width 470 px,
 Inter 14.5 px body / 12 px meta. A light "Day" palette exists
 (`FERRO_THEME=light`). Avatar placeholders use Telegram's seven gradient
 colours chosen by `id % 7`.
+
+### 11.4 Background mode (tray)
+
+* `iced::daemon` (zero windows allowed). `app/background.rs` is a pure state
+  machine (`WindowState`: open, tray status, close-to-tray) returning an
+  `Action` (Open / CloseWindow / Focus / Exit). Invariant: the window is only
+  hidden while a tray host exists, and it reopens if the host disappears.
+* Hiding really closes the window (renderer surfaces freed), drops decoded
+  images, and trims the heap (`memory::release_to_os`). Size/position are
+  remembered and restored on show (position unknown on Wayland).
+* `src/tray/`: `TrayModel` + `Entry` (pure, tested), `sni.rs` (ksni service,
+  Linux only), `stub.rs` (Windows/macOS: not implemented, closing quits),
+  `icon.rs` (app SVG -> ARGB32 22/32/48, red dot variant for attention).
+  Menu: Show/Hide, mute 1 h / until re-enabled, Start minimized, Quit.
+  Tooltip `Ferrogram - N unread`; status NeedsAttention while unmuted chats
+  have unread messages.
+* `remote.rs`: process-wide queue for requests from the tray, second launch
+  (`instance.rs`, abstract Unix socket, Linux) and notification clicks.
+* `prefs.rs`: `settings.ini` (close_to_tray, start_minimized, mute).
+  `autostart.rs`: `~/.config/autostart/dev.ferro.ferrogram.desktop` with
+  `--minimized`; the file is the setting. Mock mode writes neither.

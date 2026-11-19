@@ -2,6 +2,14 @@
 
 Things learned while building Ferrogram, newest first.
 
+- **dbusmenu ids are renumbered whenever the menu changes** (ksni offsets
+  them), and zbus proxies cache properties: tests must read `GetLayout` first
+  and use uncached proxies.
+- **`exit_on_close_request: false` + `iced::daemon`** is what makes "close to
+  tray" possible; answer `CloseRequested` yourself or the app exits.
+- **Never hide without a tray host.** Registration can fail or the panel can
+  restart; a hidden window with no tray is an unreachable process.
+
 - **iced's `image::border_radius` is not drawn by the tiny-skia renderer.**
   Round avatars by masking the pixels (alpha) when decoding, so every
   renderer agrees. Decode on a blocking thread.

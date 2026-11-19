@@ -388,6 +388,32 @@ pub fn primary_button(p: Palette) -> impl Fn(&Theme, button::Status) -> button::
     }
 }
 
+/// On/off switch in the settings panel (accent when on, like the official
+/// client's toggles).
+pub fn switch(
+    p: Palette,
+) -> impl Fn(&Theme, iced::widget::toggler::Status) -> iced::widget::toggler::Style {
+    use iced::widget::toggler::{Status, Style};
+    move |_, status| {
+        let on = match status {
+            Status::Active { is_toggled } | Status::Hovered { is_toggled } => is_toggled,
+            Status::Disabled { is_toggled } => is_toggled,
+        };
+        let off_track = p.badge_muted;
+        Style {
+            background: Background::Color(if on { p.accent } else { off_track }),
+            background_border_width: 0.0,
+            background_border_color: Color::TRANSPARENT,
+            foreground: Background::Color(Color::WHITE),
+            foreground_border_width: 0.0,
+            foreground_border_color: Color::TRANSPARENT,
+            text_color: Some(p.text_primary),
+            border_radius: None,
+            padding_ratio: 0.2,
+        }
+    }
+}
+
 pub fn link_button(p: Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, _| button::Style {
         background: None,
