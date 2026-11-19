@@ -20,9 +20,12 @@ use secrecy::SecretString;
 use crate::auth::SignInOutcome;
 use crate::error::{Phone, Result};
 use crate::model::{
-    Chat, ChatId, ConnState, Draft, Folder, GlobalHit, Message, MessageId, Presence, Reaction,
-    TypingAction,
+    Chat, ChatId, ConnState, Draft, Folder, GlobalHit, Message, MessageId, PeerInfo, Presence,
+    Reaction, SharedKind, SharedPage, TypingAction,
 };
+
+/// Hard cap on a shared-content thumbnail.
+pub const MAX_THUMB_BYTES: usize = 512 * 1024;
 
 /// Hard cap on photo bytes downloaded for display.
 pub const MAX_PHOTO_BYTES: usize = 20 * 1024 * 1024;
@@ -70,6 +73,12 @@ pub enum Event {
     Draft {
         chat: ChatId,
         draft: Option<Draft>,
+    },
+    /// A chat was muted or unmuted (`updateNotifySettings`), maybe on
+    /// another device.
+    Muted {
+        chat: ChatId,
+        muted: bool,
     },
     /// A folder was created, edited (`Some`) or deleted (`None`), maybe on
     /// another device (`updateDialogFilter`).
@@ -171,6 +180,24 @@ pub trait TelegramApi: Send + Sync {
     async fn set_typing(&self, chat: ChatId, active: bool) -> Result<()>;
     /// Save a message's media (file, photo) to `path`.
     async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()>;
+    /// Bio / description, username, phone (when visible) and member count
+    /// for the info panel (`users.getFullUser`, `messages.getFullChat`,
+    /// `channels.getFullChannel`).
+    async fn peer_info(&self, chat: ChatId) -> Result<PeerInfo>;
+    /// Mute (forever) or unmute a chat (`account.updateNotifySettings`).
+    async fn set_muted(&self, chat: ChatId, muted: bool) -> Result<()>;
+    /// One page of a shared-content tab (`messages.search` with the tab's
+    /// filter), newest first, older than `offset_id` (0 = from the newest).
+    async fn shared_media(
+        &self,
+        chat: ChatId,
+        kind: SharedKind,
+        offset_id: MessageId,
+        limit: usize,
+    ) -> Result<SharedPage>;
+    /// A small preview (JPEG/PNG, at most [`MAX_THUMB_BYTES`]) of a photo,
+    /// video or GIF message.
+    async fn download_thumb(&self, chat: ChatId, id: MessageId) -> Result<Vec<u8>>;
     /// The account's chat folders in order (`messages.getDialogFilters`).
     async fn dialog_filters(&self) -> Result<Vec<Folder>>;
     /// Create or replace a folder (`messages.updateDialogFilter`); a new

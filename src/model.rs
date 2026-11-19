@@ -340,6 +340,148 @@ impl Folder {
     }
 }
 
+/// What the info panel shows about a chat or user (from the "full" peer
+/// objects). Private text: `Debug` prints only what is present.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct PeerInfo {
+    /// Bio (users) or description (groups, channels).
+    pub about: Option<String>,
+    pub username: Option<String>,
+    /// Only when the user's privacy settings let us see it.
+    pub phone: Option<String>,
+    /// Members of a group or subscribers of a channel, when Telegram says.
+    pub members: Option<u32>,
+}
+
+impl fmt::Debug for PeerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerInfo")
+            .field("has_about", &self.about.is_some())
+            .field("has_username", &self.username.is_some())
+            .field("has_phone", &self.phone.is_some())
+            .field("members", &self.members)
+            .finish()
+    }
+}
+
+/// The shared-content tabs of the info panel; each is one
+/// `messages.search` filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SharedKind {
+    /// Photos and videos (`inputMessagesFilterPhotoVideo`).
+    Media,
+    /// Documents (`inputMessagesFilterDocument`).
+    Files,
+    /// Messages with links (`inputMessagesFilterUrl`).
+    Links,
+    /// Audio files (`inputMessagesFilterMusic`).
+    Music,
+    /// Voice messages (`inputMessagesFilterVoice`).
+    Voice,
+    /// Animations (`inputMessagesFilterGif`).
+    Gifs,
+}
+
+impl SharedKind {
+    pub const ALL: [SharedKind; 6] = [
+        Self::Media,
+        Self::Files,
+        Self::Links,
+        Self::Music,
+        Self::Voice,
+        Self::Gifs,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Media => "Media",
+            Self::Files => "Files",
+            Self::Links => "Links",
+            Self::Music => "Music",
+            Self::Voice => "Voice",
+            Self::Gifs => "GIFs",
+        }
+    }
+
+    /// Tabs that show thumbnails.
+    pub fn has_thumbs(self) -> bool {
+        matches!(self, Self::Media | Self::Gifs)
+    }
+}
+
+/// One entry of a shared-content tab.
+#[derive(Clone, PartialEq)]
+pub struct SharedItem {
+    pub id: MessageId,
+    pub date: i64,
+    pub body: SharedBody,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum SharedBody {
+    Photo {
+        width: u32,
+        height: u32,
+    },
+    Video {
+        width: u32,
+        height: u32,
+        seconds: u32,
+    },
+    Gif {
+        width: u32,
+        height: u32,
+    },
+    File {
+        name: String,
+        size: u64,
+        mime: String,
+    },
+    Link {
+        url: String,
+        title: Option<String>,
+        description: Option<String>,
+        site: Option<String>,
+    },
+    Audio {
+        title: Option<String>,
+        performer: Option<String>,
+        name: Option<String>,
+        seconds: u32,
+    },
+    Voice {
+        seconds: u32,
+    },
+}
+
+impl fmt::Debug for SharedItem {
+    // File names, links and titles are private.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedItem")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedItem {
+    /// Does this item show a thumbnail?
+    pub fn has_thumb(&self) -> bool {
+        matches!(
+            self.body,
+            SharedBody::Photo { .. } | SharedBody::Video { .. } | SharedBody::Gif { .. }
+        )
+    }
+}
+
+/// One page of a shared-content tab, newest first.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SharedPage {
+    pub items: Vec<SharedItem>,
+    /// Offset for the next (older) page: the id of the oldest message the
+    /// server returned. `None` = no more pages.
+    pub next: Option<MessageId>,
+}
+
 /// A message found by the server-side (global) search, with enough chat
 /// information to show and open a chat that is not in the loaded list.
 #[derive(Clone, PartialEq)]

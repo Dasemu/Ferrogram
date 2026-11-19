@@ -7,8 +7,8 @@ use grammers_client::tl;
 
 use super::Event;
 use crate::model::{
-    CHANNEL_OFFSET, ChatId, Draft, Folder, Media, Message, Presence, Reaction, SendState,
-    TypingAction,
+    CHANNEL_OFFSET, ChatId, Draft, Folder, Media, Message, PeerInfo, Presence, Reaction, SendState,
+    SharedBody, SharedItem, SharedKind, SharedPage, TypingAction,
 };
 
 /// `tl::Peer` → Bot-API style chat id.
@@ -245,6 +245,18 @@ pub fn event_from_update_as(update: &tl::enums::Update, self_id: i64) -> Option<
                 .and_then(|f| folder_from_tl(f, self_id))
                 .map(|(f, _)| f),
         }),
+        U::NotifySettings(u) => match &u.peer {
+            tl::enums::NotifyPeer::Peer(p) => {
+                let tl::enums::PeerNotifySettings::Settings(ns) = &u.notify_settings;
+                Some(Event::Muted {
+                    chat: peer_to_chat_id(&p.peer),
+                    muted: ns
+                        .mute_until
+                        .is_some_and(|t| i64::from(t) > chrono::Utc::now().timestamp()),
+                })
+            }
+            _ => None,
+        },
         U::DialogFilterOrder(u) => Some(Event::FoldersOrder(u.order.clone())),
         U::DialogFilters => Some(Event::FoldersStale),
         U::NewMessage(u) => message_from_tl(&u.message).map(Event::NewMessage),
@@ -376,6 +388,256 @@ pub fn presence_from_tl(s: &tl::enums::UserStatus, now: i64) -> Presence {
         S::LastWeek(_) => Presence::LastWeek,
         S::LastMonth(_) => Presence::LastMonth,
     }
+}
+
+// ------------------------------------------------------------- shared media
+
+/// The `messages.search` filter behind a shared-content tab.
+pub fn shared_filter(kind: SharedKind) -> tl::enums::MessagesFilter {
+    use tl::enums::MessagesFilter as F;
+    match kind {
+        SharedKind::Media => F::InputMessagesFilterPhotoVideo,
+        SharedKind::Files => F::InputMessagesFilterDocument,
+        SharedKind::Links => F::InputMessagesFilterUrl,
+        SharedKind::Music => F::InputMessagesFilterMusic,
+        SharedKind::Voice => F::InputMessagesFilterVoice,
+        SharedKind::Gifs => F::InputMessagesFilterGif,
+    }
+}
+
+/// `text[offset..offset+length]` where both are UTF-16 code units, as
+/// Telegram's entities are. `None` when they do not fall on characters.
+pub fn utf16_slice(text: &str, offset: i32, length: i32) -> Option<String> {
+    let (start, len) = (usize::try_from(offset).ok()?, usize::try_from(length).ok()?);
+    let end = start.checked_add(len)?;
+    let mut units = 0usize;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let w = ch.len_utf16();
+        if units >= start && units + w <= end {
+            out.push(ch);
+        } else if units < start && units + w > start {
+            return None; // starts inside a surrogate pair
+        }
+        units += w;
+        if units >= end {
+            break;
+        }
+    }
+    (units >= end && !out.is_empty()).then_some(out)
+}
+
+/// First link of a message: from its web page preview, else from its
+/// entities. Returns (url, title, description, site).
+fn link_from_message(
+    m: &tl::types::Message,
+) -> Option<(String, Option<String>, Option<String>, Option<String>)> {
+    if let Some(tl::enums::MessageMedia::WebPage(w)) = &m.media
+        && let tl::enums::WebPage::Page(p) = &w.webpage
+        && !p.url.is_empty()
+    {
+        return Some((
+            p.url.clone(),
+            p.title.clone().filter(|t| !t.is_empty()),
+            p.description.clone().filter(|t| !t.is_empty()),
+            p.site_name.clone().filter(|t| !t.is_empty()),
+        ));
+    }
+    for e in m.entities.iter().flatten() {
+        match e {
+            tl::enums::MessageEntity::TextUrl(t) if !t.url.is_empty() => {
+                return Some((t.url.clone(), None, None, None));
+            }
+            tl::enums::MessageEntity::Url(u) => {
+                if let Some(url) = utf16_slice(&m.message, u.offset, u.length) {
+                    return Some((url, None, None, None));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn clamp_u32(v: i64) -> u32 {
+    u32::try_from(v.max(0)).unwrap_or(u32::MAX)
+}
+
+/// One search result of the given tab → list entry. `None` for messages
+/// that do not fit the tab (a filter can return more than we show).
+pub fn shared_item_from_tl(raw: &tl::enums::Message, kind: SharedKind) -> Option<SharedItem> {
+    let tl::enums::Message::Message(m) = raw else {
+        return None;
+    };
+    let date = i64::from(m.date);
+    let item = |body| SharedItem {
+        id: m.id,
+        date,
+        body,
+    };
+    if kind == SharedKind::Links {
+        let (url, title, description, site) = link_from_message(m)?;
+        return Some(item(SharedBody::Link {
+            url,
+            title,
+            description,
+            site,
+        }));
+    }
+    match (&m.media, kind) {
+        (Some(tl::enums::MessageMedia::Photo(p)), SharedKind::Media) => match &p.photo {
+            Some(tl::enums::Photo::Photo(photo)) => {
+                let (width, height) = largest_size(&photo.sizes);
+                Some(item(SharedBody::Photo { width, height }))
+            }
+            _ => None,
+        },
+        (Some(tl::enums::MessageMedia::Document(d)), _) => {
+            let Some(tl::enums::Document::Document(doc)) = &d.document else {
+                return None;
+            };
+            let mut video = None;
+            let mut audio = None;
+            let mut animated = false;
+            let mut name = None;
+            for a in &doc.attributes {
+                match a {
+                    tl::enums::DocumentAttribute::Video(v) => video = Some(v),
+                    tl::enums::DocumentAttribute::Audio(a) => audio = Some(a),
+                    tl::enums::DocumentAttribute::Animated => animated = true,
+                    tl::enums::DocumentAttribute::Filename(f) => name = Some(f.file_name.clone()),
+                    _ => {}
+                }
+            }
+            let dims = |v: &tl::types::DocumentAttributeVideo| {
+                (clamp_u32(i64::from(v.w)), clamp_u32(i64::from(v.h)))
+            };
+            match kind {
+                SharedKind::Media => {
+                    let v = video.filter(|v| !v.round_message || d.video)?;
+                    let (width, height) = dims(v);
+                    Some(item(SharedBody::Video {
+                        width,
+                        height,
+                        seconds: clamp_u32(v.duration as i64),
+                    }))
+                }
+                SharedKind::Gifs => {
+                    let (width, height) = video.map_or((0, 0), dims);
+                    (animated || video.is_some()).then(|| item(SharedBody::Gif { width, height }))
+                }
+                SharedKind::Voice => {
+                    let a = audio.filter(|a| a.voice)?;
+                    Some(item(SharedBody::Voice {
+                        seconds: clamp_u32(i64::from(a.duration)),
+                    }))
+                }
+                SharedKind::Music => {
+                    let a = audio.filter(|a| !a.voice)?;
+                    Some(item(SharedBody::Audio {
+                        title: a.title.clone().filter(|t| !t.is_empty()),
+                        performer: a.performer.clone().filter(|t| !t.is_empty()),
+                        name,
+                        seconds: clamp_u32(i64::from(a.duration)),
+                    }))
+                }
+                SharedKind::Files => Some(item(SharedBody::File {
+                    name: name.unwrap_or_else(|| "File".into()),
+                    size: u64::try_from(doc.size).unwrap_or(0),
+                    mime: doc.mime_type.clone(),
+                })),
+                SharedKind::Links => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A `messages.search` answer → one page. `limit` is what was asked for:
+/// a shorter answer is the end of the list.
+pub fn shared_page_from_tl(
+    messages: &[tl::enums::Message],
+    kind: SharedKind,
+    limit: usize,
+) -> SharedPage {
+    let oldest = messages.iter().filter_map(raw_message_id).min();
+    SharedPage {
+        items: messages
+            .iter()
+            .filter_map(|m| shared_item_from_tl(m, kind))
+            .collect(),
+        next: if messages.len() >= limit {
+            oldest
+        } else {
+            None
+        },
+    }
+}
+
+fn raw_message_id(m: &tl::enums::Message) -> Option<i32> {
+    match m {
+        tl::enums::Message::Message(m) => Some(m.id),
+        tl::enums::Message::Service(m) => Some(m.id),
+        tl::enums::Message::Empty(m) => Some(m.id),
+    }
+}
+
+// ----------------------------------------------------------------- peer info
+
+/// Info from a `users.userFull` answer.
+pub fn peer_info_from_user_full(r: &tl::enums::users::UserFull, user_id: i64) -> PeerInfo {
+    let tl::enums::users::UserFull::Full(r) = r;
+    let tl::enums::UserFull::Full(full) = &r.full_user;
+    let mut info = PeerInfo {
+        about: full.about.clone().filter(|a| !a.trim().is_empty()),
+        ..PeerInfo::default()
+    };
+    for u in &r.users {
+        if let tl::enums::User::User(u) = u
+            && u.id == user_id
+        {
+            info.username = u.username.clone().or_else(|| {
+                u.usernames.iter().flatten().find_map(|n| {
+                    let tl::enums::Username::Username(n) = n;
+                    (n.active).then(|| n.username.clone())
+                })
+            });
+            info.phone = u.phone.clone().filter(|p| !p.is_empty());
+        }
+    }
+    info
+}
+
+/// Info from a `messages.chatFull` answer (basic group or channel).
+pub fn peer_info_from_chat_full(r: &tl::enums::messages::ChatFull, chat: ChatId) -> PeerInfo {
+    let tl::enums::messages::ChatFull::Full(r) = r;
+    let mut info = PeerInfo::default();
+    match &r.full_chat {
+        tl::enums::ChatFull::Full(c) => {
+            info.about = Some(c.about.clone()).filter(|a| !a.trim().is_empty());
+            if let tl::enums::ChatParticipants::Participants(p) = &c.participants {
+                info.members = Some(clamp_u32(p.participants.len() as i64));
+            }
+        }
+        tl::enums::ChatFull::ChannelFull(c) => {
+            info.about = Some(c.about.clone()).filter(|a| !a.trim().is_empty());
+            info.members = c.participants_count.map(|n| clamp_u32(i64::from(n)));
+        }
+        _ => {}
+    }
+    for chat_obj in &r.chats {
+        if let tl::enums::Chat::Channel(c) = chat_obj
+            && channel_chat_id(c.id) == chat
+        {
+            info.username = c.username.clone().or_else(|| {
+                c.usernames.iter().flatten().find_map(|n| {
+                    let tl::enums::Username::Username(n) = n;
+                    n.active.then(|| n.username.clone())
+                })
+            });
+        }
+    }
+    info
 }
 
 // ------------------------------------------------------------------ folders

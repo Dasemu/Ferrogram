@@ -7,7 +7,10 @@ use iced::widget::scrollable::Viewport;
 use crate::app::folders::{EditorFlag, Picker};
 use crate::auth::{SecretInput, SignInOutcome};
 use crate::error::Error;
-use crate::model::{Chat, ChatId, Folder, GlobalHit, Message as ChatMessage, MessageId, User};
+use crate::model::{
+    Chat, ChatId, Folder, GlobalHit, Message as ChatMessage, MessageId, PeerInfo, SharedKind,
+    SharedPage, User,
+};
 use crate::net::{ApiHandle, Event};
 
 #[derive(Debug, Clone)]
@@ -61,6 +64,16 @@ pub enum Ui {
     TextPasted(String),
     /// "Copy image" on a photo message.
     CopyImage(ChatId, MessageId),
+    // chat info panel
+    /// Header click: open or close the info panel of the open chat.
+    ToggleInfo,
+    InfoTab(SharedKind),
+    /// The panel scrolled: load the next page of the tab near its end.
+    InfoScrolled(Viewport),
+    /// Notifications switch (`true` = not muted).
+    SetNotifications(bool),
+    /// Open a shared link in the browser.
+    OpenLink(String),
     // chat folders
     /// A folder tab (`None` = All chats).
     SelectFolder(Option<i32>),
@@ -194,6 +207,27 @@ pub enum Done {
         path: Option<PathBuf>,
     },
     MediaSaved(Result<(), Error>),
+    PeerInfo {
+        chat: ChatId,
+        result: Result<PeerInfo, Error>,
+    },
+    SharedPage {
+        chat: ChatId,
+        kind: SharedKind,
+        offset: MessageId,
+        result: Result<SharedPage, Error>,
+    },
+    Thumb {
+        key: (ChatId, MessageId),
+        result: Result<Vec<u8>, Error>,
+    },
+    /// The mute switch finished; on failure `previous` is restored.
+    MuteDone {
+        chat: ChatId,
+        previous: bool,
+        result: Result<(), Error>,
+    },
+    LinkOpened(Result<(), Error>),
     /// The folder list from the server.
     Folders(Result<Vec<Folder>, Error>),
     /// The editor's folder was saved (or refused).

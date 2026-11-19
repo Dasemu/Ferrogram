@@ -199,6 +199,14 @@ impl Store {
         Ok(out)
     }
 
+    pub fn set_muted(&self, chat: ChatId, muted: bool) -> Result<()> {
+        self.conn()?.execute(
+            "UPDATE chats SET muted = ?2 WHERE id = ?1",
+            params![chat, muted],
+        )?;
+        Ok(())
+    }
+
     /// Set (or with `None` clear) a chat's draft.
     pub fn set_draft(&self, chat: ChatId, draft: Option<&Draft>) -> Result<()> {
         self.conn()?.execute(
