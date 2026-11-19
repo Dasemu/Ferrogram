@@ -1,5 +1,7 @@
 //! Lucide icons (ISC licence, see assets/icons/LICENSE.txt), embedded.
 
+use std::sync::OnceLock;
+
 use iced::widget::svg;
 
 macro_rules! icons {
@@ -8,6 +10,9 @@ macro_rules! icons {
         pub enum Icon { $($name),* }
 
         impl Icon {
+            /// Every icon, in declaration order (index = discriminant).
+            pub const ALL: &'static [Icon] = &[$(Icon::$name),*];
+
             pub fn bytes(self) -> &'static [u8] {
                 match self {
                     $(Self::$name => include_bytes!(concat!("../../assets/icons/", $file))),*
@@ -47,10 +52,45 @@ icons! {
     ArrowDown => "arrow-down.svg",
 }
 
+/// Handles are built once per icon and cloned (an `Arc` bump) by `view()`.
+/// `svg::Handle::from_memory` hashes the whole document and allocates on every
+/// call, which adds up over a chat list that draws a few icons per row.
+static HANDLES: OnceLock<Vec<svg::Handle>> = OnceLock::new();
+
+fn handles() -> &'static [svg::Handle] {
+    HANDLES.get_or_init(|| {
+        Icon::ALL
+            .iter()
+            .map(|i| svg::Handle::from_memory(i.bytes()))
+            .collect()
+    })
+}
+
 impl Icon {
     pub fn handle(self) -> svg::Handle {
-        svg::Handle::from_memory(self.bytes())
+        match handles().get(self as usize) {
+            Some(h) => h.clone(),
+            None => svg::Handle::from_memory(self.bytes()),
+        }
     }
+}
+
+/// Cached handle for the bubble tail (`TAIL_IN` / `TAIL_OUT`).
+pub fn tail_handle(out: bool) -> svg::Handle {
+    static H: OnceLock<[svg::Handle; 2]> = OnceLock::new();
+    let h = H.get_or_init(|| {
+        [
+            svg::Handle::from_memory(TAIL_IN),
+            svg::Handle::from_memory(TAIL_OUT),
+        ]
+    });
+    h[usize::from(out)].clone()
+}
+
+/// Cached handle for the Ferrogram logo.
+pub fn logo_handle() -> svg::Handle {
+    static H: OnceLock<svg::Handle> = OnceLock::new();
+    H.get_or_init(|| svg::Handle::from_memory(LOGO)).clone()
 }
 
 /// Speech-bubble tail (original artwork) drawn next to the last bubble of a

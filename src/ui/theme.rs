@@ -240,6 +240,9 @@ impl FerroTheme {
 
 // ------------------------------------------------------------------ styles
 
+/// Dim layer behind modal cards.
+pub const SCRIM: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.55);
+
 pub fn fill(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
         background: Some(Background::Color(color)),

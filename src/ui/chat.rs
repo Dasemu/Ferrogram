@@ -1,13 +1,13 @@
 //! Right pane: header, history with bubbles, reply/edit bar, composer.
 
 use iced::widget::{
-    Column, Space, button, column, container, image, mouse_area, row, scrollable, stack, svg, text,
-    text_input,
+    Column, Space, button, column, container, image, mouse_area, opaque, row, scrollable, stack,
+    svg, text, text_input,
 };
 use iced::{Alignment, Color, ContentFit, Element, Length, Padding};
 
 use super::format;
-use super::icons::{Icon, TAIL_IN, TAIL_OUT};
+use super::icons::{Icon, tail_handle};
 use super::theme::{self, FONT_SEMIBOLD, NAME_COLORS};
 use super::widgets::{EMOJI_FONT, avatar_photo, emoji_plain, emoji_text, emoji_title, icon};
 use crate::app::state::ComposeMode;
@@ -234,13 +234,13 @@ fn search_results<'a>(app: &'a App, s: &'a crate::app::ChatSearch) -> Element<'a
             container(text("No messages found").size(m.font_s).color(p.text_muted)).padding(12),
         );
     }
-    container(
+    container(opaque(
         container(scrollable(list).style(theme::scroll(p)))
             .width(360)
             .max_height(300)
             .padding(4)
             .style(theme::elevated(p)),
-    )
+    ))
     .align_right(Length::Fill)
     .padding(Padding {
         top: 6.0,
@@ -471,15 +471,11 @@ fn message_row<'a>(
     };
 
     let tail_el: Element<'a, Message> = if tail {
-        svg(svg::Handle::from_memory(if out {
-            TAIL_OUT
-        } else {
-            TAIL_IN
-        }))
-        .width(9)
-        .height(17)
-        .style(theme::tint(if out { p.bubble_out } else { p.bubble_in }))
-        .into()
+        svg(tail_handle(out))
+            .width(9)
+            .height(17)
+            .style(theme::tint(if out { p.bubble_out } else { p.bubble_in }))
+            .into()
     } else {
         Space::new().width(9).into()
     };
@@ -738,7 +734,7 @@ fn emoji_panel(app: &App) -> Element<'_, Message> {
         }
         grid = grid.push(r);
     }
-    container(container(grid).padding(8).style(theme::elevated(p)))
+    container(opaque(container(grid).padding(8).style(theme::elevated(p))))
         .align_right(Length::Fill)
         .align_bottom(Length::Fill)
         .padding(10)

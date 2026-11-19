@@ -1,10 +1,11 @@
 //! Settings panel (background mode): close to tray, start minimized, launch
 //! at login, and the global notification mute.
 
-use iced::widget::{button, column, container, mouse_area, opaque, row, text, toggler};
-use iced::{Alignment, Color, Element, Length};
+use iced::widget::{button, column, container, row, text, toggler};
+use iced::{Alignment, Element, Length};
 
 use super::theme::{self, FONT_SEMIBOLD};
+use super::widgets::modal;
 use crate::app::background::TrayStatus;
 use crate::app::{App, Message, Ui};
 use crate::remote::{MuteRequest, Remote};
@@ -127,11 +128,5 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .padding(20)
         .width(440)
         .style(theme::elevated(p));
-    mouse_area(
-        container(opaque(card))
-            .center(Length::Fill)
-            .style(theme::fill(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
-    )
-    .on_press(Message::Ui(Ui::CloseSettings))
-    .into()
+    modal(card, Message::Ui(Ui::CloseSettings))
 }

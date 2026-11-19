@@ -1,6 +1,6 @@
 //! Small shared view helpers (avatars, icons, badges).
 
-use iced::widget::{container, image, svg, text};
+use iced::widget::{center, container, image, mouse_area, opaque, svg, text};
 use iced::{Alignment, Color, Element, Length};
 
 use super::icons::Icon;
@@ -13,6 +13,20 @@ pub fn icon<'a>(i: Icon, size: f32, color: Color) -> Element<'a, Message> {
         .width(size)
         .height(size)
         .style(theme::tint(color))
+        .into()
+}
+
+/// A modal layer: a dimmed backdrop (click = `on_dismiss`) with `card` in the
+/// middle. The whole layer is `opaque`: iced's `stack` only hides the cursor
+/// from the layers below when the top layer reports a mouse interaction, and a
+/// plain `mouse_area` reports none outside its content. Without it every row
+/// under the dim backdrop kept its hover highlight and pointer shape, so the
+/// chat list flashed under the modal as the mouse moved over it.
+pub fn modal<'a>(
+    card: impl Into<Element<'a, Message>>,
+    on_dismiss: Message,
+) -> Element<'a, Message> {
+    opaque(mouse_area(center(opaque(card)).style(theme::fill(theme::SCRIM))).on_press(on_dismiss))
         .into()
 }
 
