@@ -1,13 +1,13 @@
 //! Right pane: header, history with bubbles, reply/edit bar, composer.
 
 use iced::widget::{
-    Column, Space, button, column, container, image, mouse_area, row, scrollable, stack, svg, text,
-    text_input,
+    Column, Space, button, column, container, image, mouse_area, opaque, row, scrollable, stack,
+    svg, text, text_input,
 };
 use iced::{Alignment, Color, ContentFit, Element, Length, Padding};
 
 use super::format;
-use super::icons::{Icon, TAIL_IN, TAIL_OUT};
+use super::icons::{Icon, tail_handle};
 use super::theme::{self, FONT_SEMIBOLD, NAME_COLORS};
 use super::widgets::{EMOJI_FONT, avatar_photo, emoji_plain, emoji_text, emoji_title, icon};
 use crate::app::state::ComposeMode;
@@ -115,20 +115,30 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
     };
     container(
         row![
-            avatar_photo(
-                chat.and_then(|c| app.avatar(c.id)),
-                chat.map_or(0, |c| c.id),
-                title,
-                chat.map(|c| c.kind),
-                m.avatar_header
-            ),
-            column![
-                emoji_title(title.to_string(), m.font_l - 0.5, p.text_primary),
-                text(status)
-                    .size(m.font_s)
-                    .color(if live { p.link } else { p.text_secondary }),
-            ]
-            .spacing(2),
+            mouse_area(
+                row![
+                    avatar_photo(
+                        chat.and_then(|c| app.avatar(c.id)),
+                        chat.map_or(0, |c| c.id),
+                        title,
+                        chat.map(|c| c.kind),
+                        m.avatar_header
+                    ),
+                    column![
+                        emoji_title(title.to_string(), m.font_l - 0.5, p.text_primary),
+                        text(status).size(m.font_s).color(if live {
+                            p.link
+                        } else {
+                            p.text_secondary
+                        }),
+                    ]
+                    .spacing(2),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+            )
+            .on_press(Message::Ui(Ui::ToggleInfo))
+            .interaction(iced::mouse::Interaction::Pointer),
             Space::new().width(Length::Fill),
             ib(Icon::Search, Some(Message::Ui(Ui::ToggleChatSearch))),
             ib(Icon::Phone, None),
@@ -234,13 +244,13 @@ fn search_results<'a>(app: &'a App, s: &'a crate::app::ChatSearch) -> Element<'a
             container(text("No messages found").size(m.font_s).color(p.text_muted)).padding(12),
         );
     }
-    container(
+    container(opaque(
         container(scrollable(list).style(theme::scroll(p)))
             .width(360)
             .max_height(300)
             .padding(4)
             .style(theme::elevated(p)),
-    )
+    ))
     .align_right(Length::Fill)
     .padding(Padding {
         top: 6.0,
@@ -471,15 +481,11 @@ fn message_row<'a>(
     };
 
     let tail_el: Element<'a, Message> = if tail {
-        svg(svg::Handle::from_memory(if out {
-            TAIL_OUT
-        } else {
-            TAIL_IN
-        }))
-        .width(9)
-        .height(17)
-        .style(theme::tint(if out { p.bubble_out } else { p.bubble_in }))
-        .into()
+        svg(tail_handle(out))
+            .width(9)
+            .height(17)
+            .style(theme::tint(if out { p.bubble_out } else { p.bubble_in }))
+            .into()
     } else {
         Space::new().width(9).into()
     };
@@ -689,6 +695,14 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> Element<'a, Message> 
             false,
         ));
     }
+    if matches!(msg.media, Some(Media::Photo { .. })) {
+        items = items.push(item(
+            Icon::Copy,
+            "Copy Image",
+            Message::Ui(Ui::CopyImage(msg.chat_id, msg.id)),
+            false,
+        ));
+    }
     if matches!(msg.media, Some(Media::File { .. } | Media::Photo { .. })) {
         items = items.push(item(
             Icon::Download,
@@ -738,7 +752,7 @@ fn emoji_panel(app: &App) -> Element<'_, Message> {
         }
         grid = grid.push(r);
     }
-    container(container(grid).padding(8).style(theme::elevated(p)))
+    container(opaque(container(grid).padding(8).style(theme::elevated(p))))
         .align_right(Length::Fill)
         .align_bottom(Length::Fill)
         .padding(10)
@@ -865,6 +879,7 @@ fn composer(app: &App) -> Element<'_, Message> {
             text_input("Write a message…", &app.composer)
                 .id(COMPOSER_ID)
                 .on_input(|s| Message::Ui(Ui::ComposerChanged(s)))
+                .on_paste(|s| Message::Ui(Ui::TextPasted(s)))
                 .on_submit(Message::Ui(Ui::Send))
                 .padding([10, 2])
                 .size(m.font_m)

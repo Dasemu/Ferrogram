@@ -20,6 +20,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migration_002.sql"),
     include_str!("migration_003.sql"),
     include_str!("migration_004.sql"),
+    include_str!("migration_005.sql"),
 ];
 
 /// Cheap-to-clone handle. Sync methods are for `boot()` and tests; the app
@@ -101,13 +102,14 @@ impl Store {
         for c in chats {
             tx.execute(
                 "INSERT INTO chats (id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id,
-                   draft_text, draft_reply, draft_date)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                   draft_text, draft_reply, draft_date, contact)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, title=excluded.title, unread=excluded.unread,
                    muted=excluded.muted, pinned=excluded.pinned, read_outbox=excluded.read_outbox,
                    read_inbox=excluded.read_inbox, last_date=excluded.last_date, last_message_id=excluded.last_message_id,
                    photo_id=excluded.photo_id, draft_text=excluded.draft_text,
-                   draft_reply=excluded.draft_reply, draft_date=excluded.draft_date",
+                   draft_reply=excluded.draft_reply, draft_date=excluded.draft_date,
+                   contact=excluded.contact",
                 params![
                     c.id,
                     c.kind.as_str(),
@@ -123,6 +125,7 @@ impl Store {
                     c.draft.as_ref().map(|d| d.text.as_str()),
                     c.draft.as_ref().and_then(|d| d.reply_to),
                     c.draft.as_ref().map(|d| d.date),
+                    c.contact,
                 ],
             )?;
             if let Some(m) = &c.last_message {
@@ -161,7 +164,7 @@ impl Store {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id,
-                    draft_text, draft_reply, draft_date
+                    draft_text, draft_reply, draft_date, contact
              FROM chats ORDER BY pinned DESC, last_date DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -177,6 +180,7 @@ impl Store {
             c.read_inbox_max_id = r.get(7)?;
             c.last_date = r.get(8)?;
             c.photo_id = r.get(10)?;
+            c.contact = r.get(14)?;
             c.draft = r.get::<_, Option<String>>(11)?.map(|text| Draft {
                 text,
                 reply_to: r.get(12).ok().flatten(),
@@ -193,6 +197,14 @@ impl Store {
             out.push(chat);
         }
         Ok(out)
+    }
+
+    pub fn set_muted(&self, chat: ChatId, muted: bool) -> Result<()> {
+        self.conn()?.execute(
+            "UPDATE chats SET muted = ?2 WHERE id = ?1",
+            params![chat, muted],
+        )?;
+        Ok(())
     }
 
     /// Set (or with `None` clear) a chat's draft.
@@ -385,6 +397,21 @@ impl Store {
             .optional()?)
     }
 
+    /// Cache the folder list (JSON in `kv`) for the first frame.
+    pub fn save_folders(&self, folders: &[crate::model::Folder]) -> Result<()> {
+        let json = serde_json::to_string(folders)
+            .map_err(|_| crate::error::Error::Store("folders encode".into()))?;
+        self.set_kv("folders", &json)
+    }
+
+    /// The cached folders; empty when none or unreadable.
+    pub fn load_folders(&self) -> Result<Vec<crate::model::Folder>> {
+        Ok(self
+            .get_kv("folders")?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default())
+    }
+
     /// Drop everything (logout).
     pub fn clear(&self) -> Result<()> {
         self.conn()?.execute_batch(
@@ -534,6 +561,29 @@ mod tests {
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].title, "Old chat");
         assert_eq!(chats[0].photo_id, None);
+    }
+
+    #[test]
+    fn contact_flag_and_folders_persist() {
+        use crate::model::Folder;
+        let s = Store::open_in_memory().unwrap();
+        let mut c = chat(1, 5, false);
+        c.contact = true;
+        s.upsert_chats(&[c, chat(2, 4, false)]).unwrap();
+        let loaded = s.load_chats().unwrap();
+        assert!(loaded.iter().find(|c| c.id == 1).unwrap().contact);
+        assert!(!loaded.iter().find(|c| c.id == 2).unwrap().contact);
+
+        assert!(s.load_folders().unwrap().is_empty());
+        let mut f = Folder::new(2, "Work");
+        f.groups = true;
+        f.include = vec![1, -1_000_000_000_005];
+        s.save_folders(std::slice::from_ref(&f)).unwrap();
+        assert_eq!(s.load_folders().unwrap(), vec![f]);
+        s.set_kv("folders", "{not json").unwrap();
+        assert!(s.load_folders().unwrap().is_empty(), "garbage is ignored");
+        s.clear().unwrap();
+        assert!(s.load_folders().unwrap().is_empty());
     }
 
     #[test]

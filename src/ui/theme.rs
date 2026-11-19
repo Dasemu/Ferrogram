@@ -240,6 +240,9 @@ impl FerroTheme {
 
 // ------------------------------------------------------------------ styles
 
+/// Dim layer behind modal cards.
+pub const SCRIM: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.55);
+
 pub fn fill(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
         background: Some(Background::Color(color)),
@@ -353,6 +356,19 @@ pub fn icon_button(p: Palette, round: bool) -> impl Fn(&Theme, button::Status) -
             .then_some(Background::Color(p.bg_hover)),
         text_color: p.text_secondary,
         border: border::rounded(if round { 20.0 } else { 6.0 }),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// A folder tab: plain text, accent colour when selected (the underline is
+/// drawn by the strip).
+pub fn folder_tab(p: Palette, selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| button::Style {
+        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+            .then_some(Background::Color(p.bg_hover)),
+        text_color: if selected { p.link } else { p.text_secondary },
+        border: border::rounded(6.0),
         shadow: Shadow::default(),
         snap: true,
     }

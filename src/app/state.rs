@@ -72,6 +72,12 @@ impl ChatList {
             .collect()
     }
 
+    pub fn set_muted(&mut self, id: ChatId, muted: bool) {
+        if let Some(c) = self.get_mut(id) {
+            c.muted = muted;
+        }
+    }
+
     pub fn mark_read(&mut self, id: ChatId) {
         if let Some(c) = self.get_mut(id) {
             c.unread_count = 0;
@@ -158,9 +164,17 @@ impl ChatList {
                     c.presence = *presence;
                 }
             }
+            Event::Muted { chat, muted } => {
+                if let Some(c) = self.get_mut(*chat) {
+                    c.muted = *muted;
+                }
+            }
             Event::Reactions { .. }
             | Event::Typing { .. }
             | Event::Connection(_)
+            | Event::FolderChanged { .. }
+            | Event::FoldersOrder(_)
+            | Event::FoldersStale
             | Event::SessionRevoked => {}
         }
     }

@@ -68,6 +68,9 @@ pub struct Chat {
     pub presence: Presence,
     /// Unsent text for this chat (synced with the server).
     pub draft: Option<Draft>,
+    /// The other side of a private chat is in our contacts (folders can
+    /// include "Contacts" / "Non-contacts").
+    pub contact: bool,
 }
 
 /// A draft message. The body is private: `Debug` only prints its length.
@@ -144,6 +147,7 @@ impl Chat {
             photo_id: None,
             presence: Presence::Unknown,
             draft: None,
+            contact: false,
         }
     }
 
@@ -175,6 +179,322 @@ pub fn avatar_color_index(id: i64) -> usize {
         id.abs()
     };
     (bare % 7) as usize
+}
+
+/// Maximum length of a folder name (Telegram's limit, in characters).
+pub const FOLDER_TITLE_MAX: usize = 12;
+/// Telegram refuses folders with more than this many explicit chats.
+pub const FOLDER_CHATS_MAX: usize = 100;
+
+/// A chat folder ("dialog filter"): a name plus rules deciding which chats
+/// it shows. Membership is evaluated locally, like the official client does.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Folder {
+    pub id: i32,
+    pub title: String,
+    pub emoticon: Option<String>,
+    // Included chat types.
+    pub contacts: bool,
+    pub non_contacts: bool,
+    pub groups: bool,
+    pub channels: bool,
+    pub bots: bool,
+    // Exclusions applied to the types above.
+    pub exclude_muted: bool,
+    pub exclude_read: bool,
+    pub exclude_archived: bool,
+    /// Pinned inside this folder (shown first, in this order).
+    pub pinned: Vec<ChatId>,
+    /// Explicitly included chats (besides `pinned`).
+    pub include: Vec<ChatId>,
+    /// Explicitly excluded chats.
+    pub exclude: Vec<ChatId>,
+    /// A shared folder (chat list invite): only its chats can be edited here.
+    pub shared: bool,
+}
+
+impl fmt::Debug for Folder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Folder")
+            .field("id", &self.id)
+            .field("title_len", &self.title.len())
+            .field("chats", &(self.pinned.len() + self.include.len()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Folder {
+    pub fn new(id: i32, title: impl Into<String>) -> Self {
+        Self {
+            id,
+            title: title.into(),
+            emoticon: None,
+            contacts: false,
+            non_contacts: false,
+            groups: false,
+            channels: false,
+            bots: false,
+            exclude_muted: false,
+            exclude_read: false,
+            exclude_archived: false,
+            pinned: Vec::new(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            shared: false,
+        }
+    }
+
+    /// Does `chat` belong in this folder? Same rules as Telegram Desktop:
+    /// the exclusion list wins, then explicit chats, then the type flags
+    /// narrowed by the muted/read/archived exclusions.
+    pub fn matches(&self, chat: &Chat) -> bool {
+        if self.exclude.contains(&chat.id) {
+            return false;
+        }
+        if self.is_explicit(chat.id) {
+            return true;
+        }
+        if self.exclude_muted && chat.muted {
+            return false;
+        }
+        if self.exclude_read && chat.unread_count == 0 {
+            return false;
+        }
+        match chat.kind {
+            ChatKind::User | ChatKind::SavedMessages => {
+                if chat.contact || chat.kind == ChatKind::SavedMessages {
+                    self.contacts
+                } else {
+                    self.non_contacts
+                }
+            }
+            ChatKind::Bot => self.bots,
+            ChatKind::Group => self.groups,
+            ChatKind::Channel => self.channels,
+        }
+    }
+
+    /// Included by id (pinned or listed), regardless of the type flags.
+    pub fn is_explicit(&self, id: ChatId) -> bool {
+        self.pinned.contains(&id) || self.include.contains(&id)
+    }
+
+    /// Any rule at all? (Telegram rejects a folder that shows nothing.)
+    pub fn has_rules(&self) -> bool {
+        self.contacts
+            || self.non_contacts
+            || self.groups
+            || self.channels
+            || self.bots
+            || !self.pinned.is_empty()
+            || !self.include.is_empty()
+    }
+
+    /// Number of explicitly chosen chats (the server caps this).
+    pub fn explicit_len(&self) -> usize {
+        self.pinned.len() + self.include.len()
+    }
+
+    /// "Add to folder" / "Remove from folder" for one chat, the way the
+    /// official client edits the lists: a chat that is shown now is removed
+    /// (from the explicit lists, and put on the exclusion list when a type
+    /// rule would still pull it in); otherwise it is included.
+    pub fn toggle_chat(&mut self, chat: &Chat) {
+        if self.matches(chat) {
+            self.pinned.retain(|c| *c != chat.id);
+            self.include.retain(|c| *c != chat.id);
+            if self.matches(chat) {
+                self.exclude.push(chat.id);
+            }
+        } else {
+            self.exclude.retain(|c| *c != chat.id);
+            if !self.is_explicit(chat.id) {
+                self.include.push(chat.id);
+            }
+        }
+    }
+
+    /// Short description for the folder list ("3 chats, Groups, Bots").
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        let n = self.explicit_len();
+        if n > 0 {
+            parts.push(format!("{n} chat{}", if n == 1 { "" } else { "s" }));
+        }
+        for (on, name) in [
+            (self.contacts, "Contacts"),
+            (self.non_contacts, "Non-contacts"),
+            (self.groups, "Groups"),
+            (self.channels, "Channels"),
+            (self.bots, "Bots"),
+        ] {
+            if on {
+                parts.push(name.to_owned());
+            }
+        }
+        if parts.is_empty() {
+            "No chats".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
+/// What the info panel shows about a chat or user (from the "full" peer
+/// objects). Private text: `Debug` prints only what is present.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct PeerInfo {
+    /// Bio (users) or description (groups, channels).
+    pub about: Option<String>,
+    pub username: Option<String>,
+    /// Only when the user's privacy settings let us see it.
+    pub phone: Option<String>,
+    /// Members of a group or subscribers of a channel, when Telegram says.
+    pub members: Option<u32>,
+}
+
+impl fmt::Debug for PeerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerInfo")
+            .field("has_about", &self.about.is_some())
+            .field("has_username", &self.username.is_some())
+            .field("has_phone", &self.phone.is_some())
+            .field("members", &self.members)
+            .finish()
+    }
+}
+
+/// The shared-content tabs of the info panel; each is one
+/// `messages.search` filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SharedKind {
+    /// Photos and videos (`inputMessagesFilterPhotoVideo`).
+    Media,
+    /// Documents (`inputMessagesFilterDocument`).
+    Files,
+    /// Messages with links (`inputMessagesFilterUrl`).
+    Links,
+    /// Audio files (`inputMessagesFilterMusic`).
+    Music,
+    /// Voice messages (`inputMessagesFilterVoice`).
+    Voice,
+    /// Animations (`inputMessagesFilterGif`).
+    Gifs,
+}
+
+impl SharedKind {
+    pub const ALL: [SharedKind; 6] = [
+        Self::Media,
+        Self::Files,
+        Self::Links,
+        Self::Music,
+        Self::Voice,
+        Self::Gifs,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Media => "Media",
+            Self::Files => "Files",
+            Self::Links => "Links",
+            Self::Music => "Music",
+            Self::Voice => "Voice",
+            Self::Gifs => "GIFs",
+        }
+    }
+
+    /// Tabs that show thumbnails.
+    pub fn has_thumbs(self) -> bool {
+        matches!(self, Self::Media | Self::Gifs)
+    }
+}
+
+/// One entry of a shared-content tab.
+#[derive(Clone, PartialEq)]
+pub struct SharedItem {
+    pub id: MessageId,
+    pub date: i64,
+    pub body: SharedBody,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum SharedBody {
+    Photo {
+        width: u32,
+        height: u32,
+    },
+    Video {
+        width: u32,
+        height: u32,
+        seconds: u32,
+    },
+    Gif {
+        width: u32,
+        height: u32,
+    },
+    File {
+        name: String,
+        size: u64,
+        mime: String,
+    },
+    Link {
+        url: String,
+        title: Option<String>,
+        description: Option<String>,
+        site: Option<String>,
+    },
+    Audio {
+        title: Option<String>,
+        performer: Option<String>,
+        name: Option<String>,
+        seconds: u32,
+    },
+    Voice {
+        seconds: u32,
+    },
+}
+
+impl fmt::Debug for SharedBody {
+    // File names, links and titles are private: only the kind is printed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Photo { .. } => "Photo",
+            Self::Video { .. } => "Video",
+            Self::Gif { .. } => "Gif",
+            Self::File { .. } => "File",
+            Self::Link { .. } => "Link",
+            Self::Audio { .. } => "Audio",
+            Self::Voice { .. } => "Voice",
+        })
+    }
+}
+
+impl fmt::Debug for SharedItem {
+    // File names, links and titles are private.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedItem")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedItem {
+    /// Does this item show a thumbnail?
+    pub fn has_thumb(&self) -> bool {
+        matches!(
+            self.body,
+            SharedBody::Photo { .. } | SharedBody::Video { .. } | SharedBody::Gif { .. }
+        )
+    }
+}
+
+/// One page of a shared-content tab, newest first.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SharedPage {
+    pub items: Vec<SharedItem>,
+    /// Offset for the next (older) page: the id of the oldest message the
+    /// server returned. `None` = no more pages.
+    pub next: Option<MessageId>,
 }
 
 /// A message found by the server-side (global) search, with enough chat

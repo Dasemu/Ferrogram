@@ -313,3 +313,15 @@ colours chosen by `id % 7`.
 * `prefs.rs`: `settings.ini` (close_to_tray, start_minimized, mute).
   `autostart.rs`: `~/.config/autostart/dev.ferro.ferrogram.desktop` with
   `--minimized`; the file is the setting. Mock mode writes neither.
+
+### 11.5 Folders, clipboard and info panel (round 3)
+
+* `app/folders.rs`: `FolderState` (list, selection, open menus) and
+  `FolderEditor` (working copy, validation) as pure reducers; `model::Folder`
+  holds the rules and `matches()`. UI in `ui/folders.rs` (manager and editor
+  dialogs) and `ui/sidebar.rs` (tab strip, chat row menu).
+* `clipboard.rs`: the only module that touches `arboard`; pure helpers
+  (PNG encoding with caps, `strip_pasted`) are unit-tested.
+* `app/info.rs` + `ui/info.rs`: right-hand panel (340 px), per-tab paging
+  (`SharedTab`), bounded thumbnail queue and cache.
+* Layers: every dialog goes through `widgets::modal` (opaque backdrop).

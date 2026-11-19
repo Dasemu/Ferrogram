@@ -90,6 +90,34 @@ pub fn script(config: &Config) -> Task<Message> {
             (400, ui(Ui::SelectChat(ALICE))),
             (900, ui(Ui::OpenSettings)),
         ],
+        ScreenshotTarget::Folders => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (900, ui(Ui::SelectFolder(Some(2)))),
+        ],
+        ScreenshotTarget::FolderManager => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (900, ui(Ui::OpenFolders)),
+            (950, ui(Ui::FolderDeleteAsk(4))),
+        ],
+        ScreenshotTarget::FolderEditor => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (900, ui(Ui::FolderEdit(2))),
+        ],
+        ScreenshotTarget::FolderPicker => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (900, ui(Ui::FolderEdit(2))),
+            (950, ui(Ui::FolderPick(Some(crate::app::folders::Picker::Include)))),
+        ],
+        ScreenshotTarget::ChatMenu => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (900, ui(Ui::ChatMenu(Some(RUST_GROUP)))),
+        ],
+        ScreenshotTarget::Info(kind) => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (700, ui(Ui::ToggleInfo)),
+            (1000, ui(Ui::InfoTab(kind))),
+            (3000, ui(Ui::Tick)),
+        ],
         ScreenshotTarget::Media => vec![
             (400, ui(Ui::SelectChat(RUST_GROUP))),
             (500, ui(Ui::SelectChat(ALICE))),
