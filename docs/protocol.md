@@ -28,12 +28,16 @@ app ──▶ net::TelegramApi (trait, async_trait)
 `send_text`, `send_file`, `edit_message`, `delete_messages`, `react`,
 `mark_read`, `search`, `download_photo`, `events`.
 
+Round 2 added: `more_dialogs` (continue the dialog iterator), `search_global`
+(`messages.searchGlobal`), `download_avatar`, `set_typing`, `save_draft`.
+
 `events()` returns the live stream of `net::Event`. It is backed by
 `net::EventHub`: a new subscription takes over from the previous one (whose
 stream ends), and events emitted while nobody listens are kept in a small
 bounded backlog
 (`NewMessage`, `MessageEdited`, `MessagesDeleted`, `Reactions`,
-`ReadOutbox`, `ReadInbox`, `Connection`, `SessionRevoked`). The app
+`ReadOutbox`, `ReadInbox`, `Typing`, `UserStatus`, `Draft`, `Connection`,
+`SessionRevoked`). The app
 subscribes to it with `Subscription::run_with`.
 
 ## Identifiers
@@ -58,10 +62,55 @@ is applied to every non-channel chat, as Telegram specifies.
 | `updateDelete(Channel)Messages` | `Event::MessagesDeleted` |
 | `updateMessageReactions` | `Event::Reactions` |
 | `updateRead(History|Channel)Outbox/Inbox` | `Event::ReadOutbox` / `ReadInbox` |
+| `updateUserTyping`, `updateChatUserTyping`, `updateChannelUserTyping` | `Event::Typing { chat, user, action }` (`None` = cancel; forum topics and anonymous senders ignored) |
+| `updateUserStatus`, `user.status` | `Event::UserStatus` / `Chat.presence` (a stale `online.expires` becomes "last seen") |
+| `updateDraftMessage`, `dialog.draft` | `Event::Draft` / `Chat.draft` (empty text = no draft) |
 | RPC errors | `rpc_error()` → `AuthError::{InvalidPhone, InvalidCode, InvalidPassword, FloodWait, SessionRevoked}` |
 
 Fixtures in `tests/tl_conversion.rs` are serialised to MTProto bytes and
 parsed back before conversion, so the deserialiser is exercised too.
+
+## Round 2 features
+
+* **Avatars.** `Chat.photo_id` comes from the dialog's peer (store migration
+  3). `download_avatar` builds an `InputPeerPhotoFileLocation` (small, not
+  big) and streams it with a 512 KB cap. Bytes go to
+  `$XDG_CACHE_HOME/ferrogram/avatars/<chat>_<photo>.img` (owner-only, at most
+  1500 files / 48 MB, a new photo id replaces the old file, wiped on logout)
+  and are decoded off the UI thread into a circular RGBA image kept in a
+  10 MB LRU. The disk cache is read before the network and works offline.
+  Photos of users who are not a dialog partner (group senders) fall back to
+  initials. Mock mode never writes to disk.
+* **Typing / presence.** `TypingTracker` (6 s TTL, 256 entries) feeds the
+  header and the chat-list preview. Our own action: `TypingThrottle` sends
+  `messages.setTyping` at most every 5 s while the composer has text, and a
+  cancel when it is emptied or the chat changes; never in edits, Saved
+  Messages or channels; failures are only logged.
+* **Files.** `Ui::OpenFile` → `media::is_save_only` (executables, scripts,
+  launchers; last extension, trailing dots/spaces ignored) → otherwise
+  `download_media` into `$XDG_CACHE_HOME/ferrogram/open/<chat>_<id>/<safe
+  name>` (0600, sanitised name, 512 MB cap) → `open::that_detached` (no
+  shell). `desktop::open_file` re-checks the extension.
+* **Chat list paging.** `dialogs(100)` restarts, `more_dialogs(100)` continues
+  the same `DialogIter`; the sidebar scroll triggers it 300 px before the end.
+  The cache is pruned of vanished chats only when the first page was the
+  whole list.
+* **Global search.** 450 ms after the last keystroke `search_global` runs;
+  hits are de-duplicated against the cache results. Opening a hit loads
+  `history(before = id + 25)`, scrolls by an index estimate and highlights
+  the message. That window is *detached*: live messages are not appended
+  (no invisible gaps); the down-arrow button (or sending) reloads the newest
+  page. Paging forward from a detached window is not supported.
+* **Drafts.** The composer is synced 1 s after the last change, and on leaving
+  the chat, through `messages.saveDraft` (store migration 4 keeps them
+  locally). Edits are never drafts (the draft is stashed while editing).
+
+## Not implemented (round 2)
+
+Archived chats and folders (`DialogIter` cannot set `folder_id`; needs a raw
+`messages.getDialogs` with our own peer conversion and peer caching), voice
+playback (needs an Ogg/Opus decoder and an audio sink), video thumbnails,
+sticker rendering and forwarding.
 
 ## Login
 
