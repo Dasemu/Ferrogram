@@ -171,6 +171,33 @@ impl Write for RotatingFile {
     }
 }
 
+const DEFAULT_FILTER: &str =
+    "info,grammers=warn,wgpu=warn,naga=warn,cosmic_text=warn,iced_winit=warn,winit=warn";
+
+/// grammers' debug/trace output dumps raw TL (message bodies, phone numbers,
+/// auth material) that our redaction cannot see. Even if the user sets
+/// `RUST_LOG=trace`, those targets stay at `warn` unless explicitly opted in
+/// with `FERROGRAM_PROTOCOL_DEBUG=1`.
+pub fn clamp_protocol_logs(filter: EnvFilter, allow: bool) -> EnvFilter {
+    if allow {
+        return filter;
+    }
+    let mut f = filter;
+    for target in [
+        "grammers_client",
+        "grammers_mtsender",
+        "grammers_mtproto",
+        "grammers_session",
+        "grammers_crypto",
+        "grammers_tl_types",
+    ] {
+        if let Ok(d) = format!("{target}=warn").parse() {
+            f = f.add_directive(d);
+        }
+    }
+    f
+}
+
 /// Initialise the global subscriber. Safe to call once.
 pub fn init(log_path: Option<&Path>) {
     let file = log_path
@@ -181,11 +208,10 @@ pub fn init(log_path: Option<&Path>) {
         sink: None,
         stderr: true,
     };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(
-            "info,grammers=warn,wgpu=warn,naga=warn,cosmic_text=warn,iced_winit=warn,winit=warn",
-        )
-    });
+    let filter = clamp_protocol_logs(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER)),
+        std::env::var("FERROGRAM_PROTOCOL_DEBUG").is_ok_and(|v| v == "1"),
+    );
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(writer)
@@ -204,6 +230,14 @@ mod tests {
         assert_eq!(scrub("chat 12345 msg 42"), "chat 12345 msg 42");
         assert_eq!(scrub("ünïcode 1234567"), "ünïcode [num•••67]");
         assert_eq!(scrub("2026-11-18T23:20:30Z"), "2026-11-18T23:20:30Z");
+    }
+
+    #[test]
+    fn user_rust_log_cannot_enable_protocol_traces() {
+        let f = clamp_protocol_logs(EnvFilter::new("trace"), false).to_string();
+        assert!(f.contains("grammers_mtsender=warn"), "{f}");
+        let f = clamp_protocol_logs(EnvFilter::new("trace"), true).to_string();
+        assert!(!f.contains("grammers_mtsender=warn"));
     }
 
     #[test]
