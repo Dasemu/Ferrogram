@@ -33,9 +33,13 @@ See `docs/architecture.md` (shared Ferro* skeleton + §11 app specifics) and
 - Raw TL structs change per layer: keep them confined to `net/types.rs` and tests.
 
 ## Deployment
-`release.yml` (tag `v*` / manual) builds Linux x86_64 with repo secrets
-`TELEGRAM_API_ID`/`TELEGRAM_API_HASH` embedded via `build.rs`, and uploads a tarball
-(binary, README, licences, `packaging/` desktop entry + icon) to the GitHub Release.
+Releases are automatic: `.github/workflows/release.yml` chains off the "Version" workflow
+via `workflow_run` (GITHUB_TOKEN bot pushes don't trigger `push` workflows), builds on
+ubuntu-22.04, and creates GitHub Release `v<Cargo version>` with `ferrogram-v<ver>-linux-x86_64.tar.gz`
++ `.sha256` (skips if the release exists; manual re-run: workflow_dispatch). Users run
+`install.sh` (`curl ... | sh`; `-s -- --uninstall`); test it with `FERRO_RELEASE_API=file://...`.
+Builds embed `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` repo secrets via `build.rs` (fails if unset);
+a `v*` tag push also releases.
 
 ## Gotchas
 - Keep iced default features (x11/wayland backends); `default-features=false` breaks softbuffer.

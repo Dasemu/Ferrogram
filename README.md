@@ -9,6 +9,38 @@ modelled on Telegram Desktop's dark theme.
 > names and trademarks belong to their owners; no Telegram logos, icons or
 > fonts are shipped (the UI uses Inter and Lucide icons).
 
+## Install / update
+
+Linux x86_64, no root needed. One command installs and updates (it downloads
+the latest [release](https://github.com/Dasemu/Ferrogram/releases/latest), checks
+its SHA-256 and puts the binary, menu entry and icon under `~/.local`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dasemu/Ferrogram/main/install.sh | sh
+```
+
+Uninstall (removes only what the installer added, never your account data):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dasemu/Ferrogram/main/install.sh | sh -s -- --uninstall
+```
+
+Manual alternative: download `ferrogram-vX.Y.Z-linux-x86_64.tar.gz` and its
+`.sha256` from the Releases page, then:
+
+```sh
+sha256sum -c ferrogram-*-linux-x86_64.tar.gz.sha256
+tar xzf ferrogram-*-linux-x86_64.tar.gz
+./ferrogram-*-linux-x86_64/ferrogram
+```
+
+The tarball also has `packaging/dev.ferro.ferrogram.desktop` and `.svg` if you want
+a menu entry. Releases are built on Ubuntu 22.04 (glibc 2.35).
+
+Then log in like in the official app (phone number, code, two-step password
+if set). Release builds ship with Ferrogram's own Telegram API credentials;
+`ferrogram --version` shows whether a build has them.
+
 ![Chat list and open chat (mock data)](docs/screenshots/chats.png)
 
 ## Features
@@ -47,28 +79,6 @@ rendering, forwarding, archived chats and folders.
 * Offline start: with a saved session and no network, the cached chats stay
   visible and the session restore is retried with backoff. You are never
   sent back to the phone screen just because you are offline.
-
-## Install
-
-Download `ferrogram-vX.Y.Z-linux-x86_64.tar.gz` from the
-[Releases](https://github.com/Dasemu/Ferrogram/releases) page, then:
-
-```sh
-tar xzf ferrogram-*-linux-x86_64.tar.gz
-cd ferrogram-*-linux-x86_64
-./ferrogram --install-desktop-entry   # adds Ferrogram to the KDE/GNOME app menu
-./ferrogram
-```
-
-Then log in like in the official app: phone number → code → two-step
-password if you have one. Release builds ship with Ferrogram's own Telegram
-API credentials, so there is nothing to configure.
-`./ferrogram --version` shows whether a build has them.
-
-`--install-desktop-entry` writes `dev.ferro.ferrogram.desktop` to
-`~/.local/share/applications/` and the icon to
-`~/.local/share/icons/hicolor/scalable/apps/`. The entry's `Exec` points at
-the binary you ran it from.
 
 ## Build
 
@@ -127,15 +137,16 @@ real values. Local `.env*` files are git-ignored.
 3. In GitHub, open the repository's **Settings → Secrets and variables →
    Actions** and add the repository secrets `TELEGRAM_API_ID` and
    `TELEGRAM_API_HASH`.
-4. Push a `v*` tag (`git tag v0.2.0 && git push origin v0.2.0`), or run the
-   **Release** workflow manually (*Actions → Release → Run workflow*, which
-   creates a draft release).
+4. Releases are automatic: every merge to `main` bumps the version and the
+   **Release** workflow publishes it. To re-run it, use *Actions → Release →
+   Run workflow* (it skips when `v<version>` already exists); pushing a `v*`
+   tag matching `Cargo.toml` also works.
 
 `.github/workflows/release.yml` fails immediately if either secret is missing.
 It checks that `--version` reports built-in credentials, and uploads
-`ferrogram-<tag>-linux-x86_64.tar.gz` and its `.sha256` file to the GitHub
-Release. The tarball holds the binary, the README, the licences, the desktop
-entry and the icon. CI (`ci.yml`) never needs the secrets.
+`ferrogram-v<version>-linux-x86_64.tar.gz` and its `.sha256` file to the GitHub
+Release. The tarball holds the binary, the README, the licences and
+`packaging/` (desktop entry and icon). CI (`ci.yml`) never needs the secrets.
 
 ## Run
 
