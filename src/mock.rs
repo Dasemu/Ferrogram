@@ -17,7 +17,8 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::auth::SignInOutcome;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
-    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Media, Message, MessageId, Reaction, User,
+    CHANNEL_OFFSET, Chat, ChatId, ChatKind, GlobalHit, Media, Message, MessageId, Presence,
+    Reaction, TypingAction, User,
 };
 use crate::net::{Event, EventHub, TelegramApi, UploadKind};
 
@@ -413,6 +414,25 @@ fn chats_and_history() -> (Vec<Chat>, BTreeMap<ChatId, Vec<Message>>) {
             "Next book: The Left Hand of Darkness",
         )],
     );
+    // A few chats have profile photos, like a real account; the rest keep
+    // their initials. Alice is online, the bot is a bot.
+    for c in &mut chats {
+        if [ALICE, RUST_GROUP, DEV_CHANNEL, -303].contains(&c.id) {
+            c.photo_id = Some(7_000 + c.id.rem_euclid(1000));
+        }
+        if c.id == -304 {
+            c.draft = Some(crate::model::Draft {
+                text: "I'll bring the cookies".into(),
+                reply_to: None,
+                date: MOCK_NOW - 600,
+            });
+        }
+        if c.id == ALICE {
+            c.presence = Presence::Online {
+                until: MOCK_NOW + 5 * MIN,
+            };
+        }
+    }
     if let Some(v) = hist.get_mut(&-303)
         && let Some(m) = v.last_mut()
     {
@@ -445,6 +465,9 @@ pub struct FakeOptions {
     /// Echo Bot answers and peers "read" our messages after a delay.
     pub live_simulation: bool,
     pub latency: Duration,
+    /// Extra filler contacts (older than every scripted chat), to exercise
+    /// chat-list paging.
+    pub extra_chats: usize,
 }
 
 impl Default for FakeOptions {
@@ -453,6 +476,7 @@ impl Default for FakeOptions {
             logged_in: false,
             live_simulation: true,
             latency: Duration::from_millis(0),
+            extra_chats: 0,
         }
     }
 }
@@ -465,6 +489,8 @@ struct State {
     history: BTreeMap<ChatId, Vec<Message>>,
     calls: Vec<String>,
     next_id: MessageId,
+    /// How many dialogs the paging cursor has handed out.
+    dialog_cursor: usize,
 }
 
 pub struct FakeTelegram {
@@ -475,7 +501,22 @@ pub struct FakeTelegram {
 
 impl FakeTelegram {
     pub fn new(opts: FakeOptions) -> Arc<Self> {
-        let (chats, history) = chats_and_history();
+        let (mut chats, mut history) = chats_and_history();
+        for i in 0..opts.extra_chats {
+            let id = 1_000 + i as i64;
+            let mut c = Chat::new(id, ChatKind::User, format!("Contact {i:03}"));
+            let m = msg(
+                id,
+                1,
+                false,
+                MOCK_NOW - 30 * DAY - i as i64 * MIN,
+                "Older conversation",
+            );
+            c.last_date = m.date;
+            c.last_message = Some(m.clone());
+            history.insert(id, vec![m]);
+            chats.push(c);
+        }
         Arc::new(Self {
             state: Mutex::new(State {
                 authorized: opts.logged_in,
@@ -485,6 +526,7 @@ impl FakeTelegram {
                 history,
                 calls: Vec::new(),
                 next_id: 10_000,
+                dialog_cursor: 0,
             }),
             opts,
             events: Arc::new(EventHub::new()),
@@ -528,6 +570,23 @@ impl FakeTelegram {
         }
     }
 
+    /// The next `limit` dialogs in list order (pinned, then newest first).
+    fn dialog_slice(&self, limit: usize) -> Result<Vec<Chat>> {
+        let mut s = self.st()?;
+        let mut chats = s.chats.clone();
+        for c in &mut chats {
+            if let Some(last) = s.history.get(&c.id).and_then(|h| h.last()) {
+                c.last_date = last.date;
+                c.last_message = Some(last.clone());
+            }
+        }
+        crate::app::state::sort_chats(&mut chats);
+        let from = s.dialog_cursor.min(chats.len());
+        let page: Vec<Chat> = chats.into_iter().skip(from).take(limit).collect();
+        s.dialog_cursor = from + page.len();
+        Ok(page)
+    }
+
     fn append_outgoing(&self, mut m: Message) -> Result<Message> {
         let mut s = self.st()?;
         s.next_id += 1;
@@ -554,7 +613,12 @@ impl FakeTelegram {
             if chat == ECHO_BOT
                 && let Ok(echo_id) = echo_id
             {
-                tokio::time::sleep(Duration::from_millis(600)).await;
+                tx.emit(Event::Typing {
+                    chat: ECHO_BOT,
+                    user: ECHO_BOT,
+                    action: Some(TypingAction::Typing),
+                });
+                tokio::time::sleep(Duration::from_millis(1200)).await;
                 let now = chrono::Utc::now().timestamp();
                 let reply = if text.is_empty() {
                     "Nice file!".to_owned()
@@ -631,16 +695,14 @@ impl TelegramApi for FakeTelegram {
     async fn dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
         self.call("dialogs").await?;
         self.require_auth()?;
-        let s = self.st()?;
-        let mut chats = s.chats.clone();
-        for c in &mut chats {
-            if let Some(last) = s.history.get(&c.id).and_then(|h| h.last()) {
-                c.last_date = last.date;
-                c.last_message = Some(last.clone());
-            }
-        }
-        chats.truncate(limit);
-        Ok(chats)
+        self.st()?.dialog_cursor = 0;
+        self.dialog_slice(limit)
+    }
+
+    async fn more_dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
+        self.call("more_dialogs").await?;
+        self.require_auth()?;
+        self.dialog_slice(limit)
     }
 
     async fn history(
@@ -793,6 +855,62 @@ impl TelegramApi for FakeTelegram {
         Ok(mock_photo_png(i64::from(id), 640, 427))
     }
 
+    async fn search_global(&self, query: String, limit: usize) -> Result<Vec<GlobalHit>> {
+        self.call("search_global").await?;
+        self.require_auth()?;
+        let q = query.to_lowercase();
+        let s = self.st()?;
+        let mut hits: Vec<GlobalHit> = Vec::new();
+        for c in &s.chats {
+            for m in s.history.get(&c.id).into_iter().flatten() {
+                if !m.service && m.text.to_lowercase().contains(&q) {
+                    hits.push(GlobalHit {
+                        message: m.clone(),
+                        chat_title: c.title.clone(),
+                        chat_kind: c.kind,
+                        photo_id: c.photo_id,
+                    });
+                }
+            }
+        }
+        hits.sort_by_key(|h| std::cmp::Reverse(h.message.date));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    async fn download_avatar(&self, _chat: ChatId, photo_id: i64) -> Result<Vec<u8>> {
+        self.call("download_avatar").await?;
+        mock_avatar_png(photo_id, 160)
+    }
+
+    async fn save_draft(
+        &self,
+        chat: ChatId,
+        text: String,
+        reply_to: Option<MessageId>,
+    ) -> Result<()> {
+        self.call("save_draft").await?;
+        self.require_auth()?;
+        let draft = (!text.is_empty()).then(|| crate::model::Draft {
+            text,
+            reply_to,
+            date: chrono::Utc::now().timestamp(),
+        });
+        if let Some(c) = self.st()?.chats.iter_mut().find(|c| c.id == chat) {
+            c.draft = draft;
+        }
+        Ok(())
+    }
+
+    async fn set_typing(&self, _chat: ChatId, active: bool) -> Result<()> {
+        self.call(if active {
+            "set_typing:on"
+        } else {
+            "set_typing:off"
+        })
+        .await
+    }
+
     async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()> {
         self.call("download_media").await?;
         let media = self
@@ -843,6 +961,29 @@ pub fn mock_photo_png(seed: i64, w: u32, h: u32) -> Vec<u8> {
         }
     }
     encode_png(w, h, &rgba).unwrap_or_default()
+}
+
+/// A flat-coloured avatar with a lighter diagonal band, standing in for a
+/// downloaded profile photo (no image assets are shipped).
+pub fn mock_avatar_png(seed: i64, size: u32) -> Result<Vec<u8>> {
+    const PALETTE: [(u8, u8, u8); 5] = [
+        (0xE1, 0x70, 0x76),
+        (0x65, 0xAA, 0xDD),
+        (0xA6, 0x95, 0xE7),
+        (0x7B, 0xC8, 0x62),
+        (0xEE, 0xA2, 0x74),
+    ];
+    let (r, g, b) = PALETTE[seed.rem_euclid(5) as usize];
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let band = (x + y) % 64 < 16;
+            let k = if band { 1.25 } else { 1.0 };
+            let f = |c: u8| (f32::from(c) * k).min(255.0) as u8;
+            rgba.extend_from_slice(&[f(r), f(g), f(b), 255]);
+        }
+    }
+    encode_png(size, size, &rgba)
 }
 
 /// Encode RGBA8 as PNG.

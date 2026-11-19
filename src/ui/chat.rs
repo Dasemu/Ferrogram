@@ -9,7 +9,7 @@ use iced::{Alignment, Color, ContentFit, Element, Length, Padding};
 use super::format;
 use super::icons::{Icon, TAIL_IN, TAIL_OUT};
 use super::theme::{self, FONT_SEMIBOLD, NAME_COLORS};
-use super::widgets::{EMOJI_FONT, avatar, emoji_text, icon};
+use super::widgets::{EMOJI_FONT, avatar_photo, emoji_text, icon};
 use crate::app::state::ComposeMode;
 use crate::app::{App, CHAT_SEARCH_ID, COMPOSER_ID, HISTORY_ID, Message, Ui};
 use crate::model::{Chat, ChatKind, Media, Message as ChatMessage, SendState, avatar_color_index};
@@ -45,7 +45,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let history = history(app, chat, conv.messages(), conv.loading_older);
     let mut layers = stack![history].width(Length::Fill).height(Length::Fill);
-    if !app.at_bottom {
+    if !app.at_bottom || conv.detached {
         layers = layers.push(
             container(
                 button(icon(Icon::ArrowDown, 22.0, p.text_secondary))
@@ -90,13 +90,23 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
     let t = &app.theme;
     let (p, m) = (t.palette, t.metrics);
     let title = chat.map_or("", |c| c.title.as_str());
-    let status = match chat.map(|c| c.kind) {
-        Some(ChatKind::Bot) => "bot".to_owned(),
-        Some(ChatKind::Group) => "group".to_owned(),
-        Some(ChatKind::Channel) => "channel".to_owned(),
-        Some(ChatKind::SavedMessages) => String::new(),
-        _ => "last seen recently".to_owned(),
+    let typing = chat.and_then(|c| app.typing_status(c.id));
+    let (mut status, mut live) = match chat.map(|c| c.kind) {
+        Some(ChatKind::Bot) => ("bot".to_owned(), false),
+        Some(ChatKind::Group) => ("group".to_owned(), false),
+        Some(ChatKind::Channel) => ("channel".to_owned(), false),
+        Some(ChatKind::SavedMessages) => (String::new(), false),
+        Some(_) => format::presence_text(
+            chat.map_or(crate::model::Presence::Unknown, |c| c.presence),
+            app.now,
+            app.tz_offset,
+        ),
+        None => (String::new(), false),
     };
+    if let Some(t) = typing {
+        status = t;
+        live = true;
+    }
     let ib = |i: Icon, msg: Option<Message>| {
         button(icon(i, 21.0, p.text_secondary))
             .padding(8)
@@ -105,7 +115,8 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
     };
     container(
         row![
-            avatar(
+            avatar_photo(
+                chat.and_then(|c| app.avatar(c.id)),
                 chat.map_or(0, |c| c.id),
                 title,
                 chat.map(|c| c.kind),
@@ -116,7 +127,9 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
                     .size(m.font_l - 0.5)
                     .font(FONT_SEMIBOLD)
                     .color(p.text_primary),
-                text(status).size(m.font_s).color(p.text_secondary),
+                text(status)
+                    .size(m.font_s)
+                    .color(if live { p.link } else { p.text_secondary }),
             ]
             .spacing(2),
             Space::new().width(Length::Fill),
@@ -488,7 +501,8 @@ fn message_row<'a>(
     } else {
         if is_group {
             let av: Element<'a, Message> = if tail {
-                avatar(
+                avatar_photo(
+                    msg.sender_id.and_then(|id| app.avatar(id)),
                     msg.sender_id.unwrap_or(0),
                     msg.sender_name.as_deref().unwrap_or("?"),
                     None,
@@ -607,7 +621,7 @@ fn media_view<'a>(app: &'a App, msg: &'a ChatMessage, media: &'a Media) -> Eleme
             let circle = button(circle)
                 .padding(0)
                 .on_press_maybe(
-                    (msg.id > 0).then_some(Message::Ui(Ui::SaveMedia(msg.chat_id, msg.id))),
+                    (msg.id > 0).then_some(Message::Ui(Ui::OpenFile(msg.chat_id, msg.id))),
                 )
                 .style(theme::link_button(p));
             row![

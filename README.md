@@ -22,12 +22,25 @@ modelled on Telegram Desktop's dark theme.
 * Replies, edits, deletes, reactions (right-click a message; double-click to
   reply). Edits and deletes are optimistic and roll back if the server
   refuses.
-* Received files and photos can be saved with **Save As…** in the context
-  menu, or by clicking a file's icon.
+* Clicking a received file downloads it to a private cache and opens it with
+  your system's default application. Executables, installers and scripts
+  (`.exe`, `.sh`, `.desktop`, `.AppImage`, …) are never opened: you are
+  asked where to save them. **Save As…** in the context menu works for any
+  file.
+* Profile photos for chats and users (cached on disk, bounded; initials are
+  the fallback).
+* "typing…", "recording voice message…" and last seen / online in the header
+  and chat list; your own typing action is sent while you compose.
+* Drafts per chat, synced with your other devices.
+* The chat list loads more chats as you scroll.
+* Global search across all chats (server side), jumping to the hit.
 * Attachments (from the file chooser or drag & drop) show a preview bar and
   are only sent after you confirm.
-* Search: chats and cached messages in the sidebar, server-side search
-  inside a chat.
+* Search: chats, cached messages and server-side results in the sidebar,
+  server-side search inside a chat.
+
+Not implemented yet: voice-message playback, video thumbnails, sticker
+rendering, forwarding, archived chats and folders.
 * Desktop notifications (D-Bus), muted chats and the focused chat excluded.
 * The session is restored from the OS keyring on start. The auth key is stored
   only as an encrypted blob whose key lives in the keyring.

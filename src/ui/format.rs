@@ -76,6 +76,39 @@ pub fn ellipsize(s: &str, max: usize) -> String {
     out
 }
 
+/// Header status for a user, as Telegram Desktop words it. The flag is true
+/// when the text is "online" (drawn in the accent colour).
+pub fn presence_text(p: crate::model::Presence, now: i64, offset: i32) -> (String, bool) {
+    use crate::model::Presence as P;
+    let seen = |was: i64| -> String {
+        let ago = now - was;
+        if ago < 0 || ago < 60 {
+            return "last seen just now".into();
+        }
+        if ago < 3600 {
+            let m = ago / 60;
+            return format!("last seen {m} minute{} ago", if m == 1 { "" } else { "s" });
+        }
+        let (Some(d), Some(n)) = (local(was, offset), local(now, offset)) else {
+            return "last seen recently".into();
+        };
+        match (n.date_naive() - d.date_naive()).num_days() {
+            0 => format!("last seen today at {}", d.format("%H:%M")),
+            1 => format!("last seen yesterday at {}", d.format("%H:%M")),
+            _ => format!("last seen {}", d.format("%d.%m.%y")),
+        }
+    };
+    match p {
+        P::Online { until } if until > now => ("online".into(), true),
+        P::Online { until } => (seen(until), false),
+        P::Offline { was_online } => (seen(was_online), false),
+        P::Unknown | P::Recently => ("last seen recently".into(), false),
+        P::LastWeek => ("last seen within a week".into(), false),
+        P::LastMonth => ("last seen within a month".into(), false),
+        P::LongAgo => ("last seen a long time ago".into(), false),
+    }
+}
+
 /// Badge text: "128", "1.2K".
 pub fn badge_count(n: u32) -> String {
     if n >= 10_000 {
@@ -114,6 +147,71 @@ mod tests {
             "October 14, 2025"
         );
         assert_ne!(day_key(MOCK_NOW, 0), day_key(MOCK_NOW - 86_400, 0));
+    }
+
+    #[test]
+    fn presence_wording() {
+        use crate::model::Presence as P;
+        let t = |p| presence_text(p, MOCK_NOW, 0);
+        assert_eq!(
+            t(P::Online {
+                until: MOCK_NOW + 60
+            }),
+            ("online".into(), true)
+        );
+        assert_eq!(
+            t(P::Offline {
+                was_online: MOCK_NOW - 20
+            })
+            .0,
+            "last seen just now"
+        );
+        assert_eq!(
+            t(P::Offline {
+                was_online: MOCK_NOW - 60
+            })
+            .0,
+            "last seen 1 minute ago"
+        );
+        assert_eq!(
+            t(P::Offline {
+                was_online: MOCK_NOW - 600
+            })
+            .0,
+            "last seen 10 minutes ago"
+        );
+        assert_eq!(
+            t(P::Offline {
+                was_online: MOCK_NOW - 3 * 3600
+            })
+            .0,
+            "last seen today at 11:32"
+        );
+        assert_eq!(
+            t(P::Offline {
+                was_online: MOCK_NOW - 24 * 3600
+            })
+            .0,
+            "last seen yesterday at 14:32"
+        );
+        assert_eq!(
+            t(P::Offline {
+                was_online: MOCK_NOW - 9 * 86_400
+            })
+            .0,
+            "last seen 09.11.26"
+        );
+        // A stale "online" decays into last seen.
+        assert_eq!(
+            t(P::Online {
+                until: MOCK_NOW - 300
+            })
+            .0,
+            "last seen 5 minutes ago"
+        );
+        assert_eq!(t(P::Unknown).0, "last seen recently");
+        assert_eq!(t(P::LastWeek).0, "last seen within a week");
+        assert_eq!(t(P::LongAgo).0, "last seen a long time ago");
     }
 
     #[test]

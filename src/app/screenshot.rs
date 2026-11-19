@@ -8,6 +8,8 @@ use iced::{Task, window};
 use super::{Done, Message, Ui};
 use crate::config::{Config, ScreenshotTarget};
 use crate::mock::{ALICE, CODE_2FA, RUST_GROUP};
+use crate::model::TypingAction;
+use crate::net::Event;
 
 fn after(ms: u64, msg: Message) -> Task<Message> {
     Task::perform(
@@ -47,6 +49,14 @@ pub fn script(config: &Config) -> Task<Message> {
         ],
         ScreenshotTarget::Chats => vec![
             (400, ui(Ui::SelectChat(ALICE))),
+            (
+                600,
+                Message::Net(Event::Typing {
+                    chat: RUST_GROUP,
+                    user: 311,
+                    action: Some(TypingAction::Typing),
+                }),
+            ),
             (900, ui(Ui::ComposerChanged(String::new()))),
         ],
         ScreenshotTarget::Search => vec![

@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::model::{Chat, ChatId, ChatKind, Message, MessageId, Reaction, SendState};
+use crate::model::{
+    Chat, ChatId, ChatKind, Draft, Message, MessageId, Reaction, SendState, TypingAction,
+};
 use crate::net::Event;
 
 /// Max messages kept in memory per open conversation (architecture §3).
@@ -33,6 +35,17 @@ impl ChatList {
 
     fn get_mut(&mut self, id: ChatId) -> Option<&mut Chat> {
         self.chats.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Add `chats` (a later page), replacing entries with the same id.
+    pub fn merge(&mut self, chats: Vec<Chat>) {
+        for c in chats {
+            match self.chats.iter_mut().find(|x| x.id == c.id) {
+                Some(x) => *x = c,
+                None => self.chats.push(c),
+            }
+        }
+        sort_chats(&mut self.chats);
     }
 
     pub fn replace(&mut self, chats: Vec<Chat>) {
@@ -134,8 +147,50 @@ impl ChatList {
                     c.unread_count = *still_unread;
                 }
             }
-            Event::Reactions { .. } | Event::Connection(_) | Event::SessionRevoked => {}
+            Event::Draft { chat, draft } => {
+                if let Some(c) = self.get_mut(*chat) {
+                    c.draft = draft.clone();
+                }
+            }
+            Event::UserStatus { user, presence } => {
+                // A private chat's id is the user's id.
+                if let Some(c) = self.get_mut(*user) {
+                    c.presence = *presence;
+                }
+            }
+            Event::Reactions { .. }
+            | Event::Typing { .. }
+            | Event::Connection(_)
+            | Event::SessionRevoked => {}
         }
+    }
+
+    /// Set (or clear) a chat's draft locally.
+    pub fn set_draft(&mut self, id: ChatId, draft: Option<Draft>) {
+        if let Some(c) = self.get_mut(id) {
+            c.draft = draft;
+        }
+    }
+
+    /// Best known display name for a user (from the last messages we hold).
+    pub fn user_name(&self, user: i64, conv: Option<&Conversation>) -> Option<String> {
+        let from_msg = |m: &Message| {
+            (m.sender_id == Some(user))
+                .then(|| m.sender_name.clone())
+                .flatten()
+        };
+        if let Some(n) = conv.and_then(|c| c.messages().iter().rev().find_map(from_msg)) {
+            return Some(n);
+        }
+        if let Some(c) = self.get(user)
+            && c.id > 0
+        {
+            return Some(c.title.clone());
+        }
+        self.chats
+            .iter()
+            .filter_map(|c| c.last_message.as_ref())
+            .find_map(from_msg)
     }
 
     /// Replace a chat's last message after a local send.
@@ -158,6 +213,191 @@ pub fn sort_chats(chats: &mut [Chat]) {
     });
 }
 
+// ------------------------------------------------------------------- drafts
+
+/// The draft the composer currently represents: its text (a text of only
+/// whitespace is no draft) and the message being replied to. Edits are not
+/// drafts.
+pub fn composer_draft(composer: &str, mode: ComposeMode, now: i64) -> Option<Draft> {
+    if matches!(mode, ComposeMode::Edit(_)) || composer.trim().is_empty() {
+        return None;
+    }
+    Some(Draft {
+        text: composer.to_owned(),
+        reply_to: match mode {
+            ComposeMode::Reply(id) if id > 0 => Some(id),
+            _ => None,
+        },
+        date: now,
+    })
+}
+
+/// Wait this long after the last keystroke before syncing a draft.
+pub const DRAFT_SYNC_DELAY_MS: u64 = 1_000;
+
+// ------------------------------------------------------------------- typing
+
+/// How long a "typing…" status stays after the last update (the official
+/// client uses about six seconds).
+pub const TYPING_TTL_MS: i64 = 6_000;
+/// Our own typing action is re-sent at most this often while composing.
+pub const TYPING_SEND_EVERY_MS: i64 = 5_000;
+const TYPING_MAX_ENTRIES: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypingEntry {
+    chat: ChatId,
+    user: i64,
+    action: TypingAction,
+    until_ms: i64,
+}
+
+/// Who is typing where, with expiry. Pure: `now_ms` is passed in.
+#[derive(Debug, Default, Clone)]
+pub struct TypingTracker {
+    entries: Vec<TypingEntry>,
+}
+
+impl TypingTracker {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Record (`Some`) or clear (`None`) `user`'s action in `chat`.
+    pub fn apply(&mut self, chat: ChatId, user: i64, action: Option<TypingAction>, now_ms: i64) {
+        self.entries.retain(|e| !(e.chat == chat && e.user == user));
+        if let Some(action) = action {
+            if self.entries.len() >= TYPING_MAX_ENTRIES {
+                self.entries.remove(0);
+            }
+            self.entries.push(TypingEntry {
+                chat,
+                user,
+                action,
+                until_ms: now_ms + TYPING_TTL_MS,
+            });
+        }
+    }
+
+    /// A message from `user` ends their typing status. Returns whether
+    /// something changed.
+    pub fn message_from(&mut self, chat: ChatId, user: Option<i64>) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !(e.chat == chat && Some(e.user) == user));
+        before != self.entries.len()
+    }
+
+    /// Drop expired entries. Returns whether something changed.
+    pub fn expire(&mut self, now_ms: i64) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.until_ms > now_ms);
+        before != self.entries.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Active actions in `chat`, oldest first.
+    pub fn in_chat(&self, chat: ChatId) -> Vec<(i64, TypingAction)> {
+        self.entries
+            .iter()
+            .filter(|e| e.chat == chat)
+            .map(|e| (e.user, e.action))
+            .collect()
+    }
+
+    pub fn is_typing(&self, chat: ChatId) -> bool {
+        self.entries.iter().any(|e| e.chat == chat)
+    }
+}
+
+/// "typing…" in private chats; "Ana is typing…", "Ana and Leo are
+/// typing…", "Ana and 2 others are typing…" in groups.
+pub fn typing_text(
+    actions: &[(i64, TypingAction)],
+    private: bool,
+    name: impl Fn(i64) -> Option<String>,
+) -> Option<String> {
+    let (_, first) = *actions.first()?;
+    if private {
+        return Some(first.private_text().to_owned());
+    }
+    let short = |u: i64| {
+        name(u).map_or_else(
+            || "Someone".to_owned(),
+            |n| n.split_whitespace().next().unwrap_or(&n).to_owned(),
+        )
+    };
+    let all_typing = actions.iter().all(|(_, a)| *a == TypingAction::Typing);
+    Some(match actions {
+        [(u, a)] => format!("{} is {}…", short(*u), a.group_verb()),
+        _ if !all_typing => format!("{} people are active…", actions.len()),
+        [(a, _), (b, _)] => format!("{} and {} are typing…", short(*a), short(*b)),
+        [(a, _), rest @ ..] => {
+            format!("{} and {} others are typing…", short(*a), rest.len())
+        }
+        [] => return None,
+    })
+}
+
+/// What to do with our own typing action after the composer changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypingStep {
+    Nothing,
+    Send,
+    /// Cancel the typing action in this chat.
+    Cancel(ChatId),
+}
+
+/// Throttle for the typing action we send while the user composes: one
+/// update every [`TYPING_SEND_EVERY_MS`], a cancel when the text is emptied.
+#[derive(Debug, Default, Clone)]
+pub struct TypingThrottle {
+    last_sent_ms: Option<i64>,
+    /// Chat our last "typing" went to (needed to cancel it on a chat switch).
+    pub chat: Option<ChatId>,
+}
+
+impl TypingThrottle {
+    /// The composer content changed. `allowed` is false for edits, Saved
+    /// Messages, channels and offline use.
+    pub fn on_input(
+        &mut self,
+        chat: ChatId,
+        now_ms: i64,
+        has_text: bool,
+        allowed: bool,
+    ) -> TypingStep {
+        if !(has_text && allowed) {
+            return self.reset().map_or(TypingStep::Nothing, TypingStep::Cancel);
+        }
+        match self.last_sent_ms {
+            Some(t) if now_ms - t < TYPING_SEND_EVERY_MS && self.chat == Some(chat) => {
+                TypingStep::Nothing
+            }
+            _ => {
+                self.last_sent_ms = Some(now_ms);
+                self.chat = Some(chat);
+                TypingStep::Send
+            }
+        }
+    }
+
+    /// Forget the state (message sent or chat switched). Returns the chat
+    /// that still had an open typing action, if any.
+    pub fn reset(&mut self) -> Option<ChatId> {
+        self.last_sent_ms = None;
+        self.chat.take()
+    }
+}
+
+/// Whether `chat` should receive our typing actions at all.
+pub fn can_send_typing(chat: Option<&Chat>) -> bool {
+    chat.is_some_and(|c| !matches!(c.kind, ChatKind::SavedMessages | ChatKind::Channel))
+}
+
 // --------------------------------------------------------------- conversation
 
 /// The open chat's in-memory message window.
@@ -170,6 +410,12 @@ pub struct Conversation {
     pub loading_older: bool,
     /// The network said there is nothing older.
     pub reached_start: bool,
+    /// Opened at an older message (a search hit): the window is not the
+    /// newest history, so live messages are not appended to it and the
+    /// "jump to latest" button reloads the newest page.
+    pub detached: bool,
+    /// Message to scroll to once its page has arrived.
+    pub jump_to: Option<MessageId>,
     next_temp_id: MessageId,
 }
 
@@ -180,8 +426,23 @@ impl Conversation {
             messages: Vec::new(),
             loading_older: false,
             reached_start: false,
+            detached: false,
+            jump_to: None,
             next_temp_id: -1,
         }
+    }
+
+    /// A window opened around `target` instead of the newest messages.
+    pub fn new_at(chat_id: ChatId, target: MessageId) -> Self {
+        Self {
+            detached: true,
+            jump_to: Some(target),
+            ..Self::new(chat_id)
+        }
+    }
+
+    pub fn index_of(&self, id: MessageId) -> Option<usize> {
+        self.messages.iter().position(|m| m.id == id)
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -267,7 +528,11 @@ impl Conversation {
     pub fn apply_event(&mut self, ev: &Event) {
         match ev {
             Event::NewMessage(m) if m.chat_id == self.chat_id => {
-                self.merge(vec![m.clone()]);
+                // A detached window would get a gap; the chat list still
+                // shows the message and "jump to latest" reloads.
+                if !self.detached {
+                    self.merge(vec![m.clone()]);
+                }
             }
             Event::MessageEdited(m) if m.chat_id == self.chat_id => {
                 if let Some(x) = self.messages.iter_mut().find(|x| x.id == m.id) {
@@ -510,7 +775,30 @@ pub fn photo_is_acceptable(b: &[u8]) -> bool {
     }
 }
 
+/// Avatars must be a recognisable JPEG/PNG of a sane size (profile photos
+/// are 160 px JPEGs): unlike message photos, unknown formats are refused,
+/// so a corrupt cache file is re-downloaded instead of drawn blank.
+pub fn avatar_is_acceptable(b: &[u8]) -> bool {
+    if b.is_empty() || b.len() > crate::store::avatars::MAX_AVATAR_BYTES {
+        return false;
+    }
+    image_dimensions(b).is_some_and(|(w, h)| w > 0 && h > 0 && w <= 2048 && h <= 2048)
+}
+
 // --------------------------------------------------------------- scrolling
+
+/// How many messages newer than the target a jump window includes.
+pub const JUMP_NEWER: i32 = (PAGE / 2) as i32;
+
+/// Scroll position (0 = newest/bottom, 1 = oldest/top, matching the
+/// bottom-anchored history) that brings message `index` of `len` into view.
+/// Bubble heights vary, so this is an estimate: the highlight marks the hit.
+pub fn jump_offset(index: usize, len: usize) -> f32 {
+    if len <= 1 {
+        return 0.0;
+    }
+    ((len - 1 - index.min(len - 1)) as f32 / (len - 1) as f32).clamp(0.0, 1.0)
+}
 
 /// With a bottom-anchored scrollable, how far (px) the viewport is from the
 /// oldest (top) content.
@@ -544,6 +832,18 @@ mod tests {
         l.apply_event(&Event::NewMessage(M::text(1, 7, true, 32, "y")), None);
         assert_eq!(l.get(1).unwrap().unread_count, 1);
         assert_eq!(l.total_unread(), 1);
+    }
+
+    #[test]
+    fn merge_appends_a_page_and_updates_existing() {
+        let mut l = ChatList::new(vec![chat(1, 100), chat(2, 90)]);
+        let mut renamed = chat(2, 90);
+        renamed.title = "renamed".into();
+        l.merge(vec![renamed, chat(3, 10), chat(4, 5)]);
+        assert_eq!(l.all().len(), 4);
+        assert_eq!(l.get(2).unwrap().title, "renamed");
+        let ids: Vec<_> = l.all().iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -750,6 +1050,251 @@ mod tests {
         jpg.extend_from_slice(&[0; 12]);
         assert_eq!(image_dimensions(&jpg), Some((640, 480)));
         assert!(!photo_is_acceptable(&vec![0u8; MAX_PHOTO_BYTES + 1]));
+    }
+
+    #[test]
+    fn typing_tracker_expires_and_clears() {
+        let mut t = TypingTracker::default();
+        t.apply(1, 10, Some(TypingAction::Typing), 1_000);
+        t.apply(1, 11, Some(TypingAction::RecordingVoice), 2_000);
+        assert_eq!(t.in_chat(1).len(), 2);
+        assert!(t.is_typing(1) && !t.is_typing(2));
+        // Re-applying refreshes instead of duplicating.
+        t.apply(1, 10, Some(TypingAction::Typing), 3_000);
+        assert_eq!(t.in_chat(1).len(), 2);
+        // User 11 (applied at 2 s) expires first, user 10 (refreshed at 3 s) later.
+        assert!(!t.expire(2_000 + TYPING_TTL_MS - 1));
+        assert!(t.expire(2_000 + TYPING_TTL_MS));
+        assert_eq!(t.in_chat(1).len(), 1);
+        assert!(t.expire(3_000 + TYPING_TTL_MS));
+        assert!(t.is_empty());
+        // Cancel and "message arrived" both end the status.
+        t.apply(1, 10, Some(TypingAction::Typing), 0);
+        t.apply(1, 10, None, 1);
+        assert!(t.is_empty());
+        t.apply(2, 20, Some(TypingAction::Typing), 0);
+        assert!(!t.message_from(2, Some(99)));
+        assert!(t.message_from(2, Some(20)));
+        assert!(!t.message_from(2, None));
+    }
+
+    #[test]
+    fn typing_tracker_is_bounded() {
+        let mut t = TypingTracker::default();
+        for u in 0..1000 {
+            t.apply(1, u, Some(TypingAction::Typing), 0);
+        }
+        assert_eq!(t.entries.len(), TYPING_MAX_ENTRIES);
+        // The newest survive.
+        assert!(t.in_chat(1).iter().any(|(u, _)| *u == 999));
+    }
+
+    #[test]
+    fn typing_wording() {
+        use TypingAction::*;
+        let name = |u: i64| match u {
+            1 => Some("Ana Torres".to_owned()),
+            2 => Some("Leo".to_owned()),
+            _ => None,
+        };
+        assert_eq!(typing_text(&[], true, name), None);
+        assert_eq!(typing_text(&[(1, Typing)], true, name).unwrap(), "typing…");
+        assert_eq!(
+            typing_text(&[(1, RecordingVoice)], true, name).unwrap(),
+            "recording voice message…"
+        );
+        assert_eq!(
+            typing_text(&[(1, Typing)], false, name).unwrap(),
+            "Ana is typing…"
+        );
+        assert_eq!(
+            typing_text(&[(1, UploadingPhoto)], false, name).unwrap(),
+            "Ana is sending photo…"
+        );
+        assert_eq!(
+            typing_text(&[(1, Typing), (2, Typing)], false, name).unwrap(),
+            "Ana and Leo are typing…"
+        );
+        assert_eq!(
+            typing_text(&[(1, Typing), (2, Typing), (3, Typing)], false, name).unwrap(),
+            "Ana and 2 others are typing…"
+        );
+        assert_eq!(
+            typing_text(&[(9, Typing)], false, name).unwrap(),
+            "Someone is typing…"
+        );
+        assert_eq!(
+            typing_text(&[(1, Typing), (2, RecordingVoice)], false, name).unwrap(),
+            "2 people are active…"
+        );
+    }
+
+    #[test]
+    fn own_typing_is_throttled_like_the_official_client() {
+        let mut th = TypingThrottle::default();
+        // First keystroke sends, the following ones within 5 s do not.
+        assert_eq!(th.on_input(7, 0, true, true), TypingStep::Send);
+        assert_eq!(th.on_input(7, 1_000, true, true), TypingStep::Nothing);
+        assert_eq!(th.on_input(7, 4_999, true, true), TypingStep::Nothing);
+        assert_eq!(th.on_input(7, 5_000, true, true), TypingStep::Send);
+        // Emptying the box cancels once.
+        assert_eq!(th.on_input(7, 5_100, false, true), TypingStep::Cancel(7));
+        assert_eq!(th.on_input(7, 5_200, false, true), TypingStep::Nothing);
+        // Typing again sends immediately.
+        assert_eq!(th.on_input(7, 5_300, true, true), TypingStep::Send);
+        // Not allowed (edit mode, channel, offline) cancels instead.
+        assert_eq!(th.on_input(7, 5_400, true, false), TypingStep::Cancel(7));
+        // A different chat is a fresh start even inside the window.
+        assert_eq!(th.on_input(7, 6_000, true, true), TypingStep::Send);
+        assert_eq!(th.on_input(8, 6_100, true, true), TypingStep::Send);
+        assert_eq!(th.reset(), Some(8));
+        assert_eq!(th.reset(), None);
+    }
+
+    #[test]
+    fn typing_only_in_chats_where_it_makes_sense() {
+        let mk = |k| Chat::new(1, k, "x");
+        assert!(can_send_typing(Some(&mk(ChatKind::User))));
+        assert!(can_send_typing(Some(&mk(ChatKind::Group))));
+        assert!(can_send_typing(Some(&mk(ChatKind::Bot))));
+        assert!(!can_send_typing(Some(&mk(ChatKind::Channel))));
+        assert!(!can_send_typing(Some(&mk(ChatKind::SavedMessages))));
+        assert!(!can_send_typing(None));
+    }
+
+    #[test]
+    fn user_status_updates_private_chat_presence() {
+        let mut l = ChatList::new(vec![chat(5, 1), chat(-9, 2)]);
+        let p = crate::model::Presence::Online { until: 100 };
+        l.apply_event(
+            &Event::UserStatus {
+                user: 5,
+                presence: p,
+            },
+            None,
+        );
+        assert_eq!(l.get(5).unwrap().presence, p);
+        assert_eq!(l.get(-9).unwrap().presence, crate::model::Presence::Unknown);
+    }
+
+    #[test]
+    fn user_names_come_from_messages_or_private_chats() {
+        let mut named = chat(50, 1);
+        named.title = "Pat Doe".into();
+        let mut grp = chat(-9, 5);
+        let mut m = M::text(-9, 1, false, 5, "hi");
+        m.sender_id = Some(77);
+        m.sender_name = Some("Lee Roy".into());
+        grp.last_message = Some(m);
+        let l = ChatList::new(vec![named, grp]);
+        assert_eq!(l.user_name(50, None).as_deref(), Some("Pat Doe"));
+        assert_eq!(l.user_name(77, None).as_deref(), Some("Lee Roy"));
+        assert_eq!(l.user_name(5, None), None);
+    }
+
+    #[test]
+    fn avatar_limits() {
+        let png = crate::mock::mock_avatar_png(1, 160).unwrap();
+        assert!(avatar_is_acceptable(&png));
+        assert!(!avatar_is_acceptable(b""));
+        assert!(!avatar_is_acceptable(b"junk"));
+        assert!(!avatar_is_acceptable(&vec![0u8; 600 * 1024]));
+        let big = crate::mock::mock_avatar_png(1, 2100).unwrap();
+        assert!(!avatar_is_acceptable(&big));
+    }
+
+    #[test]
+    fn jump_offset_places_targets_between_bottom_and_top() {
+        assert_eq!(jump_offset(0, 1), 0.0);
+        assert_eq!(jump_offset(0, 0), 0.0);
+        assert_eq!(jump_offset(49, 50), 0.0, "newest message = bottom");
+        assert_eq!(jump_offset(0, 50), 1.0, "oldest message = top");
+        let mid = jump_offset(25, 50);
+        assert!(mid > 0.4 && mid < 0.6);
+        assert!(jump_offset(10_000, 5) >= 0.0, "out of range never panics");
+    }
+
+    #[test]
+    fn detached_window_does_not_take_live_messages() {
+        let mut c = Conversation::new_at(1, 20);
+        assert!(c.detached && c.jump_to == Some(20));
+        c.merge(vec![M::text(1, 20, false, 1, "hit")]);
+        c.apply_event(&Event::NewMessage(M::text(1, 99, false, 2, "live")));
+        assert!(c.get(99).is_none(), "no gap-forming appends");
+        // Edits and deletes still apply.
+        let mut e = M::text(1, 20, false, 1, "hit!");
+        e.edited = true;
+        c.apply_event(&Event::MessageEdited(e));
+        assert_eq!(c.get(20).unwrap().text, "hit!");
+        c.apply_event(&Event::MessagesDeleted {
+            chat: Some(1),
+            ids: vec![20],
+        });
+        assert!(c.index_of(20).is_none());
+        let mut live = Conversation::new(1);
+        live.apply_event(&Event::NewMessage(M::text(1, 5, false, 1, "x")));
+        assert!(live.get(5).is_some());
+    }
+
+    #[test]
+    fn composer_draft_rules() {
+        let d = composer_draft("hello  ", ComposeMode::Normal, 5).unwrap();
+        assert_eq!((d.text.as_str(), d.reply_to, d.date), ("hello  ", None, 5));
+        assert_eq!(
+            composer_draft("hi", ComposeMode::Reply(12), 1)
+                .unwrap()
+                .reply_to,
+            Some(12)
+        );
+        // Pending (negative id) targets are not saved as reply targets.
+        assert_eq!(
+            composer_draft("hi", ComposeMode::Reply(-1), 1)
+                .unwrap()
+                .reply_to,
+            None
+        );
+        assert!(composer_draft("   \n", ComposeMode::Normal, 1).is_none());
+        assert!(composer_draft("", ComposeMode::Normal, 1).is_none());
+        assert!(composer_draft("edited text", ComposeMode::Edit(3), 1).is_none());
+        let a = composer_draft("x", ComposeMode::Normal, 1).unwrap();
+        let b = composer_draft("x", ComposeMode::Normal, 99).unwrap();
+        assert!(a.same_content(&b));
+        assert!(!a.same_content(&composer_draft("x", ComposeMode::Reply(2), 1).unwrap()));
+        assert!(!format!("{a:?}").contains("\"x\""));
+    }
+
+    #[test]
+    fn draft_events_update_the_chat_list() {
+        let mut l = ChatList::new(vec![chat(1, 1)]);
+        let d = Draft {
+            text: "wip".into(),
+            reply_to: None,
+            date: 3,
+        };
+        l.apply_event(
+            &Event::Draft {
+                chat: 1,
+                draft: Some(d.clone()),
+            },
+            None,
+        );
+        assert_eq!(l.get(1).unwrap().draft, Some(d));
+        l.apply_event(
+            &Event::Draft {
+                chat: 1,
+                draft: None,
+            },
+            None,
+        );
+        assert!(l.get(1).unwrap().draft.is_none());
+        // Unknown chats are ignored.
+        l.apply_event(
+            &Event::Draft {
+                chat: 9,
+                draft: None,
+            },
+            None,
+        );
     }
 
     #[test]
