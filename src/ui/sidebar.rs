@@ -131,6 +131,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
+                button(text("Settings").size(m.font_m))
+                    .width(Length::Fill)
+                    .padding([8, 10])
+                    .on_press(Message::Ui(Ui::OpenSettings))
+                    .style(theme::menu_item(p, false)),
                 button(text("Log out").size(m.font_m))
                     .width(Length::Fill)
                     .padding([8, 10])
