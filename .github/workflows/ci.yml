@@ -19,7 +19,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev \
-            libxkbcommon-dev libwayland-dev libx11-dev libfontconfig1-dev libssl-dev dbus
+            libxkbcommon-dev libwayland-dev libx11-dev libfontconfig1-dev libssl-dev dbus gnome-keyring
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -34,3 +34,11 @@ jobs:
         env:
           FERRO_REQUIRE_BUS: "1"
         run: dbus-run-session -- cargo test --all-targets
+
+      # Real Secret Service: guards the zbus executor feature (tokio vs async-io)
+      # that keyring's blocking connection depends on.
+      - name: cargo test real_keyring (gnome-keyring on a private bus)
+        env:
+          FERRO_REAL_KEYRING: "1"
+        run: |
+          dbus-run-session -- sh -c 'echo | gnome-keyring-daemon --unlock --components=secrets >/dev/null && cargo test --test real_keyring -- --ignored'
