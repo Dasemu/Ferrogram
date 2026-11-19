@@ -1,20 +1,23 @@
 name: Version
 
-# Versioning rules (the version lives in Cargo.toml / Cargo.lock):
-#   * push to development                       -> bump PATCH
-#   * merged PR development -> main (any merge   -> bump MINOR, reset PATCH,
-#     method: merge, squash or rebase)              then sync the new version
-#                                                   back to development
-#   * any other push to main                    -> bump PATCH
+# The version lives in Cargo.toml (helpers: .github/scripts/version.sh).
+#   push to development                 -> PATCH + 1
+#   merged development -> main PR       -> MINOR + 1, PATCH = 0
+#   any other push to main (hotfix)     -> PATCH + 1
+# After every bump on main, main is MERGED into development (a real merge,
+# so the release commit becomes an ancestor of development and the next
+# development -> main PR has no Cargo.toml / Cargo.lock conflict). The
+# development version becomes max(main, development).
 #
-# Loop guard: the bot's own pushes are skipped by actor (GITHUB_TOKEN pushes
-# do not trigger workflows anyway). We deliberately do NOT skip on a
-# "chore(release)" head commit: a fast-forward/rebase merge of development
-# into main can land with the bot's commit as head and must still bump MINOR.
+# Loop protection: the job never runs for pushes made by github-actions[bot]
+# (its pushes use GITHUB_TOKEN, which does not start workflows anyway).
+# Authorship is NOT used: a rebase merge keeps the bot as author of the old
+# release commits and must still get its MINOR bump.
 #
-# Branch protection: if main/development are protected, allow
-# "github-actions[bot]" (or the app/token used here) to bypass the rules,
-# otherwise the bump push is rejected.
+# Protected branches: if main/development require pull requests or status
+# checks, add the GitHub Actions bot to the ruleset bypass list, or the bump
+# and sync pushes are rejected.
+
 on:
   push:
     branches: [main, development]
@@ -24,93 +27,75 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: version-${{ github.ref }}
+  group: version-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   bump:
-    if: ${{ github.actor != 'github-actions[bot]' }}
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       SHA: ${{ github.sha }}
-      REF: ${{ github.ref_name }}
+      BRANCH: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Decide bump kind
         id: kind
         run: |
           kind=patch
-          if [ "$REF" = "main" ]; then
-            # Robust for merge, squash and rebase merges: ask GitHub which PR
-            # introduced this commit.
-            n=$(gh api "repos/$REPO/commits/$SHA/pulls" \
-                  --jq '[.[] | select(.merged_at != null and .base.ref == "main" and .head.ref == "development")] | length')
-            if [ "${n:-0}" -gt 0 ]; then kind=minor; fi
+          if [ "$BRANCH" = "main" ]; then
+            head_ref=""
+            for attempt in 1 2 3; do
+              if head_ref=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+                  --jq '[.[] | select(.merged_at != null and .base.ref == "main")][0].head.ref // ""'); then
+                break
+              fi
+              echo "PR lookup failed (attempt $attempt)"; head_ref=""; sleep $((attempt * 5))
+            done
+            if [ "$head_ref" = "development" ]; then
+              kind=minor
+            fi
           fi
           echo "kind=$kind" >> "$GITHUB_OUTPUT"
           echo "bump kind: $kind"
-      - name: Bump, commit and push
-        env:
-          KIND: ${{ steps.kind.outputs.kind }}
+
+      - name: Configure git
         run: |
-          set -euo pipefail
-          set_version() {
-            local new="$1"
-            sed -i -E "0,/^version = \".*\"/s//version = \"$new\"/" Cargo.toml
-            if [ -f Cargo.lock ]; then
-              awk -v new="$new" 'BEGIN{p=0} /^name = "ferrogram"$/{p=1} p && /^version = /{sub(/".*"/, "\"" new "\""); p=0} {print}' \
-                Cargo.lock > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump, commit and push (with rebase retries)
+        id: bump
+        run: |
+          for attempt in 1 2 3 4 5; do
+            new=$(.github/scripts/version.sh bump "${{ steps.kind.outputs.kind }}")
+            if git push origin "HEAD:$BRANCH"; then
+              echo "new=$new" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
-          }
-          next_version() {
-            local cur major minor patch
-            cur=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-            IFS=. read -r major minor patch <<< "$cur"
-            if [ "$KIND" = "minor" ]; then echo "$major.$((minor + 1)).0"; else echo "$major.$minor.$((patch + 1))"; fi
-          }
-          push_with_retry() {
-            local branch="$1"
-            for i in 1 2 3 4 5; do
-              if git push origin "HEAD:$branch"; then return 0; fi
-              echo "push rejected (attempt $i), rebasing on origin/$branch"
-              sleep $((i * 3))
-              git pull --rebase origin "$branch"
-            done
-            return 1
-          }
-          git pull --rebase origin "$REF"
-          new=$(next_version)
-          set_version "$new"
-          git add Cargo.toml Cargo.lock 2>/dev/null || git add Cargo.toml
-          git commit -m "chore(release): v$new [skip ci]"
-          push_with_retry "$REF"
-          echo "NEW=$new" >> "$GITHUB_ENV"
-      - name: Sync MINOR bump back to development
-        if: ${{ steps.kind.outputs.kind == 'minor' }}
+            echo "push rejected (attempt $attempt), rebasing"
+            git reset -q --hard HEAD~1
+            git pull -q --rebase origin "$BRANCH"
+            sleep $((attempt * 3))
+          done
+          exit 1
+
+      - name: Merge main back into development
+        if: github.ref_name == 'main'
         run: |
-          set -euo pipefail
-          git fetch origin development
-          git checkout -B development origin/development
-          sed -i -E "0,/^version = \".*\"/s//version = \"$NEW\"/" Cargo.toml
-          if [ -f Cargo.lock ]; then
-            awk -v new="$NEW" 'BEGIN{p=0} /^name = "ferrogram"$/{p=1} p && /^version = /{sub(/".*"/, "\"" new "\""); p=0} {print}' \
-              Cargo.lock > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock
-          fi
-          if git diff --quiet; then echo "development already at v$NEW"; exit 0; fi
-          git add Cargo.toml Cargo.lock 2>/dev/null || git add Cargo.toml
-          git commit -m "chore(release): sync v$NEW from main [skip ci]"
-          for i in 1 2 3 4 5; do
-            if git push origin HEAD:development; then exit 0; fi
-            sleep $((i * 3))
-            git pull --rebase origin development
+          for attempt in 1 2 3 4 5; do
+            target=$(.github/scripts/version.sh sync-to-development)
+            if git push origin HEAD:development; then
+              echo "development now at $target"
+              exit 0
+            fi
+            echo "development moved (attempt $attempt), retrying"
+            sleep $((attempt * 3))
           done
           exit 1

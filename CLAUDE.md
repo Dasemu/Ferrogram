@@ -28,7 +28,8 @@ See `docs/architecture.md` (shared Ferro* skeleton + §11 app specifics) and
 
 ## Workflow quirks
 - Work on feature branches, PR into `development`; never push `main`/`development`.
-- `version.yml` bumps `Cargo.toml` on pushes to `development`/`main`; don't bump by hand.
+- `version.yml` (helper `.github/scripts/version.sh`) bumps `Cargo.toml`; don't bump by hand.
+  After a bump on `main` it MERGES main into `development` (real merge, no sync commit).
 - Raw TL structs change per layer: keep them confined to `net/types.rs` and tests.
 
 ## Deployment
