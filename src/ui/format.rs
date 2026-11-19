@@ -112,6 +112,29 @@ pub fn presence_text(p: crate::model::Presence, now: i64, offset: i32) -> (Strin
 }
 
 /// Badge text: "128", "1.2K".
+/// 12840 -> "12,840".
+pub fn badge_count_full(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// "0:07", "3:25", "1:02:03".
+pub fn duration(seconds: u32) -> String {
+    let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 pub fn badge_count(n: u32) -> String {
     if n >= 10_000 {
         format!("{}K", n / 1000)
@@ -124,6 +147,13 @@ pub fn badge_count(n: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duration_formats() {
+        assert_eq!(duration(7), "0:07");
+        assert_eq!(duration(205), "3:25");
+        assert_eq!(duration(3723), "1:02:03");
+    }
+
     use super::*;
     use crate::mock::MOCK_NOW;
 

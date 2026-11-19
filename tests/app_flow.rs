@@ -1378,3 +1378,732 @@ async fn drafts_from_other_devices_do_not_clobber_typing() {
     }));
     assert!(app.chats.get(ALICE).unwrap().draft.is_none());
 }
+
+fn wait_until_gone(path: &std::path::Path) -> bool {
+    for _ in 0..100 {
+        if !path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[test]
+fn pasted_image_gets_the_attach_preview_and_caption_flow() {
+    use ferrogram::clipboard;
+    use ferrogram::net::UploadKind;
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = signed_in_app();
+    app.config.cache_dir = dir.path().to_path_buf();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let png = mock::mock_photo_png(3, 32, 32);
+    let path = clipboard::save_pasted(&app.config.paste_dir(), &png).unwrap();
+
+    // Clipboard task finished: file is written, then stat'ed like a picked file.
+    let _ = app.update(Message::Done(Done::PasteSaved(Ok(path.clone()))));
+    let _ = app.update(Message::Done(Done::FileStat {
+        path: path.clone(),
+        result: Ok((png.len() as u64, false)),
+    }));
+    let f = app.pending_file.clone().expect("preview shown");
+    assert!(f.temp, "pasted images are temporary files");
+    assert_eq!(
+        f.kind,
+        UploadKind::Photo,
+        "sent as a photo, like the picker"
+    );
+
+    // Caption flow: the composer text becomes the caption.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("look at this".into())));
+    let _ = app.update(Message::Ui(Ui::SendPendingFile));
+    assert!(app.pending_file.is_none());
+    assert!(app.composer.is_empty());
+    let last = app
+        .conversation
+        .as_ref()
+        .unwrap()
+        .messages()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(last.text, "look at this");
+    assert_eq!(last.state, SendState::Sending);
+
+    // Cancelling the preview deletes the temp file.
+    let path2 = clipboard::save_pasted(&app.config.paste_dir(), &png).unwrap();
+    let _ = app.update(Message::Done(Done::FileStat {
+        path: path2.clone(),
+        result: Ok((png.len() as u64, false)),
+    }));
+    assert!(app.pending_file.is_some());
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(app.pending_file.is_none());
+    assert!(wait_until_gone(&path2), "temp image removed on cancel");
+}
+
+#[test]
+fn pasting_a_copied_file_removes_the_path_text_the_field_inserted() {
+    use ferrogram::clipboard::Clip;
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    // The composer already took the text form of the clipboard.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(
+        "hi file:///tmp/cat.jpg".into(),
+    )));
+    let _ = app.update(Message::Ui(Ui::TextPasted("file:///tmp/cat.jpg".into())));
+    let _ = app.update(Message::Done(Done::Pasted(Clip::Files(vec![
+        "/tmp/cat.jpg".into(),
+        "/tmp/dog.jpg".into(),
+    ]))));
+    assert_eq!(app.composer, "hi ");
+    assert!(
+        app.toast.as_deref().unwrap().contains("first"),
+        "extra files are reported"
+    );
+}
+
+#[test]
+fn pasting_plain_text_or_without_a_chat_changes_nothing() {
+    use ferrogram::clipboard::Clip;
+    let mut app = signed_in_app();
+    // No chat open: nothing to attach to.
+    let _ = app.update(Message::Done(Done::Pasted(Clip::Image(vec![1, 2, 3]))));
+    assert!(app.pending_file.is_none());
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("keep".into())));
+    let _ = app.update(Message::Ui(Ui::TextPasted("keep".into())));
+    let _ = app.update(Message::Done(Done::Pasted(Clip::Nothing)));
+    assert_eq!(app.composer, "keep", "text paste stays with the text field");
+    assert!(app.pending_file.is_none());
+}
+
+#[test]
+fn stale_text_paste_is_not_stripped_by_a_later_image_paste() {
+    use ferrogram::clipboard::Clip;
+    let mut app = signed_in_app();
+    app.config.cache_dir = tempfile::tempdir().unwrap().keep();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("abc".into())));
+    app.last_paste = Some(("abc".into(), 0)); // pasted long ago
+    let _ = app.update(Message::Done(Done::Pasted(Clip::Image(
+        mock::mock_photo_png(1, 8, 8),
+    ))));
+    assert_eq!(app.composer, "abc");
+}
+
+#[test]
+fn copy_image_closes_the_menu() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::MessageMenu(Some(143))));
+    assert_eq!(app.menu_for, Some(143));
+    let _ = app.update(Message::Ui(Ui::CopyImage(ALICE, 143)));
+    assert_eq!(app.menu_for, None);
+    let _ = app.update(Message::Done(Done::ImageCopied(Ok(()))));
+    assert_eq!(app.toast.as_deref(), Some("Image copied."));
+}
+
+// ------------------------------------------------------------------ folders
+
+use ferrogram::app::folders::{EditorFlag, Picker};
+use ferrogram::model::Folder;
+
+fn app_with_folders() -> App {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Done(Done::Folders(Ok(mock::mock_folders()))));
+    app
+}
+
+fn visible_ids(app: &App) -> Vec<i64> {
+    app.visible_chats().iter().map(|c| c.id).collect()
+}
+
+#[test]
+fn folder_tabs_filter_the_chat_list() {
+    let mut app = app_with_folders();
+    assert_eq!(app.folders.ids(), vec![2, 3, 4]);
+    let all = visible_ids(&app);
+    assert!(all.len() > 10, "All chats shows everything");
+
+    // Work: groups + Echo Bot, without muted chats.
+    let _ = app.update(Message::Ui(Ui::SelectFolder(Some(2))));
+    let work = visible_ids(&app);
+    assert!(work.contains(&ECHO_BOT) && work.contains(&mock::RUST_GROUP));
+    assert!(
+        !work.contains(&mock::DEV_CHANNEL),
+        "channels are not in Work"
+    );
+    assert!(!work.contains(&ALICE));
+    // Muted groups are excluded by the flag ("Weekend Hiking" is muted).
+    assert!(
+        app.chats
+            .all()
+            .iter()
+            .any(|c| c.muted && c.kind == ferrogram::model::ChatKind::Group)
+    );
+    assert!(
+        work.iter()
+            .all(|id| !app.chats.get(*id).unwrap().muted || *id == ECHO_BOT)
+    );
+
+    // People: contacts and non-contacts, but not the Echo Bot (never list).
+    let _ = app.update(Message::Ui(Ui::SelectFolder(Some(3))));
+    let people = visible_ids(&app);
+    assert!(people.contains(&ALICE));
+    assert!(!people.contains(&ECHO_BOT));
+    assert!(people.iter().all(|id| *id > 0));
+
+    // Back to everything; unknown folder ids fall back to All chats.
+    let _ = app.update(Message::Ui(Ui::SelectFolder(None)));
+    assert_eq!(visible_ids(&app), all);
+    let _ = app.update(Message::Ui(Ui::SelectFolder(Some(99))));
+    assert_eq!(app.folders.selected, None);
+}
+
+#[test]
+fn folder_updates_from_other_devices_are_applied() {
+    let mut app = app_with_folders();
+    let _ = app.update(Message::Ui(Ui::SelectFolder(Some(4))));
+    let mut f = Folder::new(6, "Fresh");
+    f.bots = true;
+    let _ = app.update(Message::Net(Event::FolderChanged {
+        id: 6,
+        folder: Some(f),
+    }));
+    assert_eq!(app.folders.ids(), vec![2, 3, 4, 6]);
+    let _ = app.update(Message::Net(Event::FoldersOrder(vec![0, 6, 2, 3, 4])));
+    assert_eq!(app.folders.ids(), vec![6, 2, 3, 4]);
+    // The open folder is deleted elsewhere: back to All chats.
+    let _ = app.update(Message::Net(Event::FolderChanged {
+        id: 4,
+        folder: None,
+    }));
+    assert_eq!(app.folders.selected, None);
+    assert_eq!(app.folders.ids(), vec![6, 2, 3]);
+    // A stale marker asks for a refetch but changes nothing by itself.
+    let _ = app.update(Message::Net(Event::FoldersStale));
+    assert_eq!(app.folders.ids(), vec![6, 2, 3]);
+}
+
+#[test]
+fn add_to_folder_is_optimistic_and_rolls_back_on_refusal() {
+    let mut app = app_with_folders();
+    let _ = app.update(Message::Ui(Ui::ChatMenu(Some(ALICE))));
+    assert_eq!(app.folders.chat_menu, Some(ALICE));
+    let before = app.folders.list.clone();
+    // Alice is a contact, not in Work: toggling includes her.
+    let _ = app.update(Message::Ui(Ui::ChatInFolder(ALICE, 2)));
+    assert_eq!(app.folders.chat_menu, None, "menu closes");
+    assert!(app.folders.get(2).unwrap().include.contains(&ALICE));
+    // The server said no: the list goes back and the user is told.
+    let _ = app.update(Message::Done(Done::FolderOp {
+        before: before.clone(),
+        result: Err(ferrogram::error::Error::Protocol(
+            "400 DIALOG_FILTERS_TOO_MUCH".into(),
+        )),
+    }));
+    assert_eq!(app.folders.list, before);
+    assert!(
+        app.toast
+            .as_deref()
+            .unwrap()
+            .contains("maximum number of folders")
+    );
+    // Toggling again from the menu of a shown chat removes it.
+    let _ = app.update(Message::Ui(Ui::ChatInFolder(ECHO_BOT, 2)));
+    assert!(!app.folders.get(2).unwrap().include.contains(&ECHO_BOT));
+}
+
+#[test]
+fn deleting_and_reordering_folders() {
+    let mut app = app_with_folders();
+    let _ = app.update(Message::Ui(Ui::OpenFolders));
+    assert!(app.folders.manager_open);
+    let _ = app.update(Message::Ui(Ui::FolderMove(4, -1)));
+    assert_eq!(app.folders.ids(), vec![2, 4, 3]);
+    let _ = app.update(Message::Ui(Ui::FolderMove(2, -1)));
+    assert_eq!(app.folders.ids(), vec![2, 4, 3], "first folder stays");
+    // Delete asks first.
+    let _ = app.update(Message::Ui(Ui::FolderDeleteAsk(4)));
+    assert_eq!(app.folders.confirm_delete, Some(4));
+    assert_eq!(app.folders.ids(), vec![2, 4, 3]);
+    let _ = app.update(Message::Ui(Ui::FolderDeleteCancel));
+    assert_eq!(app.folders.confirm_delete, None);
+    let _ = app.update(Message::Ui(Ui::FolderDeleteConfirm(4)));
+    assert_eq!(app.folders.ids(), vec![2, 3]);
+    // A refused delete brings the folder back.
+    let before = vec![Folder::new(2, "a"), Folder::new(4, "b")];
+    let _ = app.update(Message::Done(Done::FolderOp {
+        before: before.clone(),
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    assert_eq!(app.folders.list, before);
+    // Esc closes the manager.
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(!app.folders.manager_open);
+}
+
+#[test]
+fn folder_editor_create_validate_save() {
+    let mut app = app_with_folders();
+    let _ = app.update(Message::Ui(Ui::FolderNew(Some(ALICE))));
+    let ed = app.folder_editor.as_ref().unwrap();
+    assert!(ed.is_new);
+    assert_eq!(ed.folder.id, 5, "lowest free id");
+    assert!(ed.contains(Picker::Include, ALICE), "from the chat menu");
+
+    // A name is required.
+    let _ = app.update(Message::Ui(Ui::FolderSave));
+    assert!(
+        app.folder_editor
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("name")
+    );
+    assert!(!app.folder_editor.as_ref().unwrap().saving);
+
+    let _ = app.update(Message::Ui(Ui::FolderTitle("Friends and family".into())));
+    assert_eq!(
+        app.folder_editor
+            .as_ref()
+            .unwrap()
+            .folder
+            .title
+            .chars()
+            .count(),
+        12
+    );
+    let _ = app.update(Message::Ui(Ui::FolderFlag(EditorFlag::Groups)));
+    let _ = app.update(Message::Ui(Ui::FolderPick(Some(Picker::Exclude))));
+    let _ = app.update(Message::Ui(Ui::FolderChatToggle(
+        Picker::Exclude,
+        mock::RUST_GROUP,
+    )));
+    let _ = app.update(Message::Ui(Ui::FolderPick(None)));
+    // Esc inside the picker closes only the picker.
+    let _ = app.update(Message::Ui(Ui::FolderPick(Some(Picker::Include))));
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(app.folder_editor.as_ref().unwrap().picker.is_none());
+    assert!(app.folder_editor.is_some());
+
+    let _ = app.update(Message::Ui(Ui::FolderSave));
+    assert!(
+        app.folder_editor.as_ref().unwrap().saving,
+        "waits for the server"
+    );
+    let saved = app.folder_editor.as_ref().unwrap().to_save();
+    assert!(saved.exclude.contains(&mock::RUST_GROUP));
+    // The server refuses (too many folders): the editor stays open with the reason.
+    let _ = app.update(Message::Done(Done::FolderSaved {
+        folder: saved.clone(),
+        result: Err(ferrogram::error::Error::Protocol(
+            "400 DIALOG_FILTERS_TOO_MUCH".into(),
+        )),
+    }));
+    let ed = app.folder_editor.as_ref().unwrap();
+    assert!(!ed.saving);
+    assert!(
+        ed.error
+            .as_deref()
+            .unwrap()
+            .contains("maximum number of folders")
+    );
+    assert_eq!(app.folders.ids(), vec![2, 3, 4]);
+    // Retry succeeds: the folder is in the list and the editor closed.
+    let _ = app.update(Message::Ui(Ui::FolderSave));
+    let _ = app.update(Message::Done(Done::FolderSaved {
+        folder: saved.clone(),
+        result: Ok(()),
+    }));
+    assert!(app.folder_editor.is_none());
+    assert_eq!(app.folders.ids(), vec![2, 3, 4, 5]);
+    assert_eq!(app.folders.get(5).unwrap().title, "Friends and");
+
+    // Editing an existing folder starts from its current values.
+    let _ = app.update(Message::Ui(Ui::FolderEdit(5)));
+    let ed = app.folder_editor.as_ref().unwrap();
+    assert!(!ed.is_new);
+    assert!(ed.flag(EditorFlag::Groups));
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(app.folder_editor.is_none());
+}
+
+#[test]
+fn shared_folders_are_not_edited_here() {
+    let mut app = signed_in_app();
+    let mut shared = Folder::new(7, "Shared");
+    shared.shared = true;
+    shared.include = vec![mock::DEV_CHANNEL];
+    let _ = app.update(Message::Done(Done::Folders(Ok(vec![shared]))));
+    let _ = app.update(Message::Ui(Ui::FolderEdit(7)));
+    assert!(app.folder_editor.is_none());
+    assert!(app.toast.as_deref().unwrap().contains("official app"));
+    let before = app.folders.list.clone();
+    let _ = app.update(Message::Ui(Ui::ChatInFolder(ALICE, 7)));
+    assert_eq!(app.folders.list, before);
+}
+
+#[tokio::test]
+async fn fake_backend_folder_roundtrip_with_events() {
+    use ferrogram::error::Error;
+    let fake = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        live_simulation: false,
+        ..Default::default()
+    });
+    let mut events = fake.events();
+    let list = fake.dialog_filters().await.unwrap();
+    assert_eq!(list.iter().map(|f| f.id).collect::<Vec<_>>(), vec![2, 3, 4]);
+
+    let mut f = Folder::new(5, "Trips");
+    f.include = vec![ALICE];
+    fake.save_dialog_filter(f.clone()).await.unwrap();
+    assert!(matches!(
+        events.next().await,
+        Some(Event::FolderChanged { id: 5, folder: Some(ref g) }) if g.title == "Trips"
+    ));
+    assert_eq!(fake.dialog_filters().await.unwrap().len(), 4);
+
+    // The server validates like Telegram does.
+    let empty = Folder::new(6, "Empty");
+    assert!(matches!(
+        fake.save_dialog_filter(empty).await,
+        Err(Error::Protocol(e)) if e.contains("FILTER_INCLUDE_EMPTY")
+    ));
+    assert!(matches!(
+        fake.save_dialog_filter(Folder::new(6, " ")).await,
+        Err(Error::Protocol(e)) if e.contains("FILTER_TITLE_EMPTY")
+    ));
+
+    fake.reorder_dialog_filters(vec![5, 4, 3, 2]).await.unwrap();
+    assert!(matches!(events.next().await, Some(Event::FoldersOrder(o)) if o == vec![5, 4, 3, 2]));
+    let ids: Vec<_> = fake
+        .dialog_filters()
+        .await
+        .unwrap()
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(ids, vec![5, 4, 3, 2]);
+
+    fake.delete_dialog_filter(3).await.unwrap();
+    assert!(matches!(
+        events.next().await,
+        Some(Event::FolderChanged {
+            id: 3,
+            folder: None
+        })
+    ));
+    assert_eq!(fake.dialog_filters().await.unwrap().len(), 3);
+
+    // The folder limit.
+    for i in 0..10 {
+        let mut g = Folder::new(20 + i, format!("F{i}"));
+        g.bots = true;
+        if fake.save_dialog_filter(g).await.is_err() {
+            break;
+        }
+    }
+    let mut over = Folder::new(99, "Over");
+    over.bots = true;
+    assert!(matches!(
+        fake.save_dialog_filter(over).await,
+        Err(Error::Protocol(e)) if e.contains("DIALOG_FILTERS_TOO_MUCH")
+    ));
+}
+
+// -------------------------------------------------------------- info panel
+
+use ferrogram::app::info::PAGE as INFO_PAGE;
+use ferrogram::model::SharedKind;
+
+fn app_with_info(chat: i64) -> App {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(chat)));
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    app
+}
+
+fn shared_page(chat: i64, kind: SharedKind, offset: i32) -> ferrogram::model::SharedPage {
+    let all = mock::mock_shared(chat, kind);
+    let older: Vec<_> = all
+        .into_iter()
+        .filter(|i| offset <= 0 || i.id < offset)
+        .collect();
+    let items: Vec<_> = older.iter().take(INFO_PAGE).cloned().collect();
+    let next = (older.len() > INFO_PAGE)
+        .then(|| items.last().map(|i| i.id))
+        .flatten();
+    ferrogram::model::SharedPage { items, next }
+}
+
+#[test]
+fn info_panel_opens_for_the_open_chat_and_closes_with_esc() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    assert!(app.info.is_none(), "needs an open chat");
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    let p = app.info.as_ref().unwrap();
+    assert_eq!((p.chat, p.tab), (ALICE, SharedKind::Media));
+    assert!(
+        p.current().unwrap().loading(),
+        "first page requested at once"
+    );
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(app.info.is_none());
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    assert!(app.info.is_some());
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    assert!(app.info.is_none(), "header click toggles");
+}
+
+#[test]
+fn profile_info_arrives_or_fails_quietly() {
+    let mut app = app_with_info(ALICE);
+    let _ = app.update(Message::Done(Done::PeerInfo {
+        chat: ALICE,
+        result: Ok(mock::mock_peer_info(ALICE)),
+    }));
+    let info = app.info.as_ref().unwrap().info.clone().unwrap();
+    assert_eq!(info.username.as_deref(), Some("alice_j"));
+    assert!(info.phone.is_some());
+    // An answer for another chat is dropped.
+    let _ = app.update(Message::Done(Done::PeerInfo {
+        chat: mock::RUST_GROUP,
+        result: Ok(mock::mock_peer_info(mock::RUST_GROUP)),
+    }));
+    assert_eq!(
+        app.info.as_ref().unwrap().info.as_ref().unwrap().members,
+        None
+    );
+    // A failure keeps the panel and shows no toast.
+    let mut app = app_with_info(ALICE);
+    let _ = app.update(Message::Done(Done::PeerInfo {
+        chat: ALICE,
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    assert!(app.info.as_ref().unwrap().info_failed);
+    assert!(app.toast.is_none());
+}
+
+#[test]
+fn shared_tabs_page_lazily_and_queue_bounded_thumbnails() {
+    let mut app = app_with_info(ALICE);
+    let first = shared_page(ALICE, SharedKind::Media, 0);
+    assert_eq!(first.items.len(), INFO_PAGE);
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Media,
+        offset: 0,
+        result: Ok(first.clone()),
+    }));
+    let tab = app.info.as_ref().unwrap().tab(SharedKind::Media);
+    assert_eq!(tab.items.len(), INFO_PAGE);
+    assert!(tab.next.is_some() && !tab.loading());
+    // Thumbnails: only a few at a time, the rest wait in the queue.
+    assert_eq!(app.thumb_q.pending(), INFO_PAGE);
+
+    // Near the end of the panel the next page is requested (same path as scrolling).
+    let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Media)));
+    assert!(app.info.as_ref().unwrap().tab(SharedKind::Media).loading());
+    // Asking again while it is in flight does not duplicate the request.
+    let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Media)));
+    let offset = first.next.unwrap();
+    let second = shared_page(ALICE, SharedKind::Media, offset);
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Media,
+        offset,
+        result: Ok(second),
+    }));
+    let tab = app.info.as_ref().unwrap().tab(SharedKind::Media);
+    assert_eq!(tab.items.len(), 64);
+    assert!(tab.ended());
+
+    // Another tab loads independently; an empty tab says so.
+    let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Voice)));
+    assert!(app.info.as_ref().unwrap().tab(SharedKind::Voice).loading());
+    let page = shared_page(ALICE, SharedKind::Voice, 0);
+    assert_eq!(page.items.len(), 7);
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Voice,
+        offset: 0,
+        result: Ok(page),
+    }));
+    assert!(app.info.as_ref().unwrap().tab(SharedKind::Voice).ended());
+}
+
+#[test]
+fn failed_pages_show_retry_and_stale_pages_are_ignored() {
+    let mut app = app_with_info(ALICE);
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Media,
+        offset: 0,
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    let t = app.info.as_ref().unwrap().tab(SharedKind::Media);
+    assert!(t.failed && !t.loading());
+    assert!(app.toast.is_none());
+    // Selecting the tab again retries.
+    let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Media)));
+    assert!(app.info.as_ref().unwrap().tab(SharedKind::Media).loading());
+    // A page for a chat that is no longer shown is dropped.
+    let _ = app.update(Message::Ui(Ui::SelectChat(mock::RUST_GROUP)));
+    assert_eq!(
+        app.info.as_ref().unwrap().chat,
+        mock::RUST_GROUP,
+        "panel follows the chat"
+    );
+    assert!(app.info.as_ref().unwrap().current().unwrap().loading());
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Media,
+        offset: 0,
+        result: Ok(shared_page(ALICE, SharedKind::Media, 0)),
+    }));
+    assert!(
+        app.info
+            .as_ref()
+            .unwrap()
+            .tab(SharedKind::Media)
+            .items
+            .is_empty()
+    );
+    assert_eq!(app.thumb_q.pending(), 0);
+}
+
+#[test]
+fn thumbnail_cache_is_bounded_and_rejects_bad_images() {
+    let mut app = app_with_info(ALICE);
+    let png = mock::mock_photo_png(1, 160, 120);
+    let _ = app.update(Message::Done(Done::Thumb {
+        key: (ALICE, 5),
+        result: Ok(png.clone()),
+    }));
+    assert!(app.thumbs.peek(&(ALICE, 5)).is_some());
+    // Garbage and another chat's thumbnail are not cached.
+    let _ = app.update(Message::Done(Done::Thumb {
+        key: (ALICE, 6),
+        result: Ok(vec![0u8; 3 * 1024 * 1024]),
+    }));
+    assert!(app.thumbs.peek(&(ALICE, 6)).is_none());
+    let _ = app.update(Message::Done(Done::Thumb {
+        key: (mock::RUST_GROUP, 7),
+        result: Ok(png.clone()),
+    }));
+    assert!(app.thumbs.peek(&(mock::RUST_GROUP, 7)).is_none());
+    // Many thumbnails never exceed the budget.
+    for i in 0..3000 {
+        let _ = app.update(Message::Done(Done::Thumb {
+            key: (ALICE, 1000 + i),
+            result: Ok(png.clone()),
+        }));
+    }
+    assert!(app.thumbs.bytes() <= ferrogram::app::info::THUMB_BUDGET + png.len());
+    // Closing the panel frees them.
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    assert!(app.thumbs.is_empty());
+}
+
+#[test]
+fn notifications_switch_is_optimistic_and_rolls_back() {
+    let mut app = app_with_info(ALICE);
+    assert!(!app.chats.get(ALICE).unwrap().muted);
+    let _ = app.update(Message::Ui(Ui::SetNotifications(false)));
+    assert!(app.chats.get(ALICE).unwrap().muted);
+    let _ = app.update(Message::Done(Done::MuteDone {
+        chat: ALICE,
+        previous: false,
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    assert!(
+        !app.chats.get(ALICE).unwrap().muted,
+        "refused: back to unmuted"
+    );
+    assert!(app.toast.is_some());
+    // Another device mutes: the switch follows.
+    let _ = app.update(Message::Net(Event::Muted {
+        chat: ALICE,
+        muted: true,
+    }));
+    assert!(app.chats.get(ALICE).unwrap().muted);
+    let _ = app.update(Message::Ui(Ui::SetNotifications(true)));
+    assert!(!app.chats.get(ALICE).unwrap().muted);
+}
+
+#[test]
+fn photos_open_the_viewer_and_link_failures_are_reported() {
+    let mut app = app_with_info(ALICE);
+    let _ = app.update(Message::Ui(Ui::OpenMedia(ALICE, 2_700)));
+    assert_eq!(app.viewer, Some((ALICE, 2_700)));
+    assert!(
+        app.photo_loading.contains(&(ALICE, 2_700)),
+        "viewer fetches the photo"
+    );
+    let _ = app.update(Message::Done(Done::LinkOpened(Err(
+        ferrogram::error::Error::Protocol("not a web link".into()),
+    ))));
+    assert!(app.toast.as_deref().unwrap().contains("link"));
+}
+
+#[tokio::test]
+async fn fake_backend_serves_shared_media_info_and_mute() {
+    let fake = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        live_simulation: false,
+        ..Default::default()
+    });
+    let mut events = fake.events();
+    let p1 = fake
+        .shared_media(ALICE, SharedKind::Media, 0, 40)
+        .await
+        .unwrap();
+    assert_eq!(p1.items.len(), 40);
+    let p2 = fake
+        .shared_media(ALICE, SharedKind::Media, p1.next.unwrap(), 40)
+        .await
+        .unwrap();
+    assert_eq!(p2.items.len(), 24);
+    assert_eq!(p2.next, None);
+    assert!(
+        p1.items
+            .iter()
+            .all(|i| p2.items.iter().all(|j| j.id != i.id))
+    );
+    assert!(
+        p1.items.windows(2).all(|w| w[0].id > w[1].id),
+        "newest first"
+    );
+    let none = fake
+        .shared_media(mock::ECHO_BOT, SharedKind::Files, 0, 40)
+        .await
+        .unwrap();
+    assert!(none.items.is_empty() && none.next.is_none());
+
+    let info = fake.peer_info(mock::RUST_GROUP).await.unwrap();
+    assert_eq!(info.members, Some(4_721));
+    assert!(
+        fake.download_thumb(ALICE, p1.items[0].id)
+            .await
+            .unwrap()
+            .len()
+            > 100
+    );
+
+    fake.set_muted(ALICE, true).await.unwrap();
+    assert!(matches!(
+        events.next().await,
+        Some(Event::Muted {
+            chat: ALICE,
+            muted: true
+        })
+    ));
+    assert!(fake.calls().contains(&"mute".to_owned()));
+}

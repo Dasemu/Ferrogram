@@ -3,7 +3,7 @@
 use iced::widget::{Space, button, column, container, svg, text, text_input};
 use iced::{Alignment, Element, Length};
 
-use super::icons::LOGO;
+use super::icons::logo_handle;
 use super::theme::{self, FONT_SEMIBOLD};
 use crate::app::{AUTH_INPUT_ID, App, Message, Ui};
 use crate::auth::AuthState;
@@ -88,7 +88,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let show_input = !matches!(app.auth, AuthState::Restoring);
     let mut form = column![
-        svg(svg::Handle::from_memory(LOGO)).width(110).height(110),
+        svg(logo_handle()).width(110).height(110),
         Space::new().height(22),
         text(title)
             .size(m.font_xl)
@@ -206,7 +206,7 @@ fn setup_view<'a>(app: &'a App, form: &'a crate::app::SetupForm) -> Element<'a, 
             .style(theme::input(p, p.bg_input, 8.0, true))
     };
     let form_col = column![
-        svg(svg::Handle::from_memory(LOGO)).width(110).height(110),
+        svg(logo_handle()).width(110).height(110),
         Space::new().height(22),
         text("Telegram API credentials")
             .size(m.font_xl)

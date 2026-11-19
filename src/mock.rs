@@ -17,8 +17,8 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::auth::SignInOutcome;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
-    CHANNEL_OFFSET, Chat, ChatId, ChatKind, GlobalHit, Media, Message, MessageId, Presence,
-    Reaction, TypingAction, User,
+    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Folder, GlobalHit, Media, Message, MessageId, PeerInfo,
+    Presence, Reaction, SharedBody, SharedItem, SharedKind, SharedPage, TypingAction, User,
 };
 use crate::net::{Event, EventHub, TelegramApi, UploadKind};
 
@@ -469,6 +469,8 @@ fn chats_and_history() -> (Vec<Chat>, BTreeMap<ChatId, Vec<Message>>) {
                 date: MOCK_NOW - 600,
             });
         }
+        // Everybody but Carla is in the mock account's contacts.
+        c.contact = c.kind == ChatKind::User && c.title != "Carla Gómez";
         if c.id == ALICE {
             c.presence = Presence::Online {
                 until: MOCK_NOW + 5 * MIN,
@@ -533,6 +535,7 @@ struct State {
     next_id: MessageId,
     /// How many dialogs the paging cursor has handed out.
     dialog_cursor: usize,
+    folders: Vec<Folder>,
 }
 
 pub struct FakeTelegram {
@@ -569,6 +572,7 @@ impl FakeTelegram {
                 calls: Vec::new(),
                 next_id: 10_000,
                 dialog_cursor: 0,
+                folders: mock_folders(),
             }),
             opts,
             events: Arc::new(EventHub::new()),
@@ -970,9 +974,281 @@ impl TelegramApi for FakeTelegram {
         Ok(())
     }
 
+    async fn peer_info(&self, chat: ChatId) -> Result<PeerInfo> {
+        self.call("peer_info").await?;
+        self.require_auth()?;
+        Ok(mock_peer_info(chat))
+    }
+
+    async fn set_muted(&self, chat: ChatId, muted: bool) -> Result<()> {
+        self.call(if muted { "mute" } else { "unmute" }).await?;
+        self.require_auth()?;
+        if let Some(c) = self.st()?.chats.iter_mut().find(|c| c.id == chat) {
+            c.muted = muted;
+        }
+        self.events.emit(Event::Muted { chat, muted });
+        Ok(())
+    }
+
+    async fn shared_media(
+        &self,
+        chat: ChatId,
+        kind: SharedKind,
+        offset_id: MessageId,
+        limit: usize,
+    ) -> Result<SharedPage> {
+        self.call("shared_media").await?;
+        self.require_auth()?;
+        let all = mock_shared(chat, kind);
+        let older: Vec<SharedItem> = all
+            .into_iter()
+            .filter(|i| offset_id <= 0 || i.id < offset_id)
+            .collect();
+        let items: Vec<SharedItem> = older.iter().take(limit).cloned().collect();
+        let next = (older.len() > limit)
+            .then(|| items.last().map(|i| i.id))
+            .flatten();
+        Ok(SharedPage { items, next })
+    }
+
+    async fn download_thumb(&self, _chat: ChatId, id: MessageId) -> Result<Vec<u8>> {
+        self.call("download_thumb").await?;
+        Ok(mock_photo_png(i64::from(id), 160, 120))
+    }
+
+    async fn dialog_filters(&self) -> Result<Vec<Folder>> {
+        self.call("dialog_filters").await?;
+        self.require_auth()?;
+        Ok(self.st()?.folders.clone())
+    }
+
+    async fn save_dialog_filter(&self, folder: Folder) -> Result<()> {
+        self.call("save_dialog_filter").await?;
+        self.require_auth()?;
+        // The same checks the server makes.
+        if folder.title.trim().is_empty() {
+            return Err(Error::Protocol("400 FILTER_TITLE_EMPTY".into()));
+        }
+        if !folder.has_rules() {
+            return Err(Error::Protocol("400 FILTER_INCLUDE_EMPTY".into()));
+        }
+        let mut s = self.st()?;
+        match s.folders.iter_mut().find(|f| f.id == folder.id) {
+            Some(slot) => *slot = folder.clone(),
+            None => {
+                if s.folders.len() >= MOCK_MAX_FOLDERS {
+                    return Err(Error::Protocol("400 DIALOG_FILTERS_TOO_MUCH".into()));
+                }
+                s.folders.push(folder.clone());
+            }
+        }
+        drop(s);
+        self.events.emit(Event::FolderChanged {
+            id: folder.id,
+            folder: Some(folder),
+        });
+        Ok(())
+    }
+
+    async fn delete_dialog_filter(&self, id: i32) -> Result<()> {
+        self.call("delete_dialog_filter").await?;
+        self.require_auth()?;
+        self.st()?.folders.retain(|f| f.id != id);
+        self.events.emit(Event::FolderChanged { id, folder: None });
+        Ok(())
+    }
+
+    async fn reorder_dialog_filters(&self, order: Vec<i32>) -> Result<()> {
+        self.call("reorder_dialog_filters").await?;
+        self.require_auth()?;
+        let mut s = self.st()?;
+        let mut rest = std::mem::take(&mut s.folders);
+        let mut out = Vec::new();
+        for id in &order {
+            if let Some(i) = rest.iter().position(|f| f.id == *id) {
+                out.push(rest.remove(i));
+            }
+        }
+        out.extend(rest);
+        s.folders = out;
+        drop(s);
+        self.events.emit(Event::FoldersOrder(order));
+        Ok(())
+    }
+
     fn events(&self) -> BoxStream<'static, Event> {
         self.events.subscribe()
     }
+}
+
+/// Info panel data of the mock account's chats.
+pub fn mock_peer_info(chat: ChatId) -> PeerInfo {
+    match chat {
+        ALICE => PeerInfo {
+            about: Some("Hiking, coffee and a little bit of Rust.".into()),
+            username: Some("alice_j".into()),
+            phone: Some("+34 600 111 222".into()),
+            members: None,
+        },
+        RUST_GROUP => PeerInfo {
+            about: Some("Rust enthusiasts in Madrid. Be kind, share code, bring snacks.".into()),
+            username: None,
+            phone: None,
+            members: Some(4_721),
+        },
+        DEV_CHANNEL => PeerInfo {
+            about: Some("Release notes and news about Ferrogram.".into()),
+            username: Some("ferrogram_dev".into()),
+            phone: None,
+            members: Some(12_840),
+        },
+        c if c > 0 => PeerInfo {
+            about: None,
+            username: None,
+            phone: None,
+            members: None,
+        },
+        _ => PeerInfo {
+            about: Some("A group chat.".into()),
+            username: None,
+            phone: None,
+            members: Some(12),
+        },
+    }
+}
+
+/// How many shared items each tab has in the mock account (Alice's chat is
+/// big enough to need two pages of media).
+fn mock_shared_count(chat: ChatId, kind: SharedKind) -> usize {
+    let big = chat == ALICE;
+    let small = chat == RUST_GROUP || chat == DEV_CHANNEL;
+    match (kind, big, small) {
+        (SharedKind::Media, true, _) => 64,
+        (SharedKind::Files, true, _) => 17,
+        (SharedKind::Links, true, _) => 14,
+        (SharedKind::Music, true, _) => 9,
+        (SharedKind::Voice, true, _) => 7,
+        (SharedKind::Gifs, true, _) => 11,
+        (SharedKind::Media, _, true) => 12,
+        (SharedKind::Files, _, true) => 6,
+        (SharedKind::Links, _, true) => 9,
+        (SharedKind::Gifs, _, true) => 3,
+        _ => 0,
+    }
+}
+
+/// Deterministic shared items of a chat tab, newest first.
+pub fn mock_shared(chat: ChatId, kind: SharedKind) -> Vec<SharedItem> {
+    const FILES: [(&str, u64, &str); 5] = [
+        ("trail-map.pdf", 2_411_000, "application/pdf"),
+        ("itinerary.docx", 48_200, "application/msword"),
+        ("photos-backup.zip", 18_300_000, "application/zip"),
+        ("budget.xlsx", 91_500, "application/vnd.ms-excel"),
+        ("notes.txt", 1_240, "text/plain"),
+    ];
+    const SITES: [(&str, &str, &str); 4] = [
+        (
+            "https://doc.rust-lang.org/book/",
+            "The Rust Programming Language",
+            "doc.rust-lang.org",
+        ),
+        (
+            "https://www.komoot.com/tour/123456",
+            "Sierra de Guadarrama loop",
+            "komoot.com",
+        ),
+        (
+            "https://en.wikipedia.org/wiki/Hiking",
+            "Hiking - Wikipedia",
+            "wikipedia.org",
+        ),
+        (
+            "https://github.com/Dasemu/Ferrogram",
+            "Dasemu/Ferrogram",
+            "github.com",
+        ),
+    ];
+    const SONGS: [(&str, &str); 3] = [
+        ("Mountain Air", "The Trailheads"),
+        ("Coffee at Dawn", "Alba Marin"),
+        ("Long Way Home", "Quiet Rivers"),
+    ];
+    let base = 3_000 - 211 * (kind as i32);
+    (0..mock_shared_count(chat, kind))
+        .map(|i| {
+            let id = base - 13 * i as i32;
+            let date = MOCK_NOW - 3_600 * (i as i64 * 7 + 3);
+            let body = match kind {
+                SharedKind::Media if i % 5 == 3 => SharedBody::Video {
+                    width: 1280,
+                    height: 720,
+                    seconds: 12 + 31 * (i as u32 % 7),
+                },
+                SharedKind::Media => SharedBody::Photo {
+                    width: 800,
+                    height: 600,
+                },
+                SharedKind::Gifs => SharedBody::Gif {
+                    width: 480,
+                    height: 270,
+                },
+                SharedKind::Files => {
+                    let (n, size, mime) = FILES[i % FILES.len()];
+                    SharedBody::File {
+                        name: if i < FILES.len() {
+                            n.to_owned()
+                        } else {
+                            format!("{i}-{n}")
+                        },
+                        size,
+                        mime: mime.into(),
+                    }
+                }
+                SharedKind::Links => {
+                    let (url, title, site) = SITES[i % SITES.len()];
+                    SharedBody::Link {
+                        url: url.into(),
+                        title: Some(title.into()),
+                        description: (i % 2 == 0)
+                            .then(|| "Everything you need to get started, in one place.".into()),
+                        site: Some(site.into()),
+                    }
+                }
+                SharedKind::Music => {
+                    let (t, a) = SONGS[i % SONGS.len()];
+                    SharedBody::Audio {
+                        title: Some(t.into()),
+                        performer: Some(a.into()),
+                        name: None,
+                        seconds: 150 + 17 * i as u32,
+                    }
+                }
+                SharedKind::Voice => SharedBody::Voice {
+                    seconds: 4 + 9 * (i as u32 % 5),
+                },
+            };
+            SharedItem { id, date, body }
+        })
+        .collect()
+}
+
+/// The server's folder limit in mock mode.
+pub const MOCK_MAX_FOLDERS: usize = 10;
+
+/// Folders of the mock account (shown in mock mode and screenshots).
+pub fn mock_folders() -> Vec<Folder> {
+    let mut work = Folder::new(2, "Work");
+    work.groups = true;
+    work.include = vec![ECHO_BOT];
+    work.exclude_muted = true;
+    let mut people = Folder::new(3, "People");
+    people.contacts = true;
+    people.non_contacts = true;
+    people.exclude = vec![ECHO_BOT];
+    let mut news = Folder::new(4, "News");
+    news.channels = true;
+    news.exclude_read = true;
+    vec![work, people, news]
 }
 
 /// A procedurally generated landscape-ish PNG (sky gradient, mountains),

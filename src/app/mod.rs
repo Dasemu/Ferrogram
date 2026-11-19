@@ -2,6 +2,8 @@
 //! side effect is a `Task` that calls `net`, `store` or `auth`.
 
 pub mod background;
+pub mod folders;
+pub mod info;
 pub mod message;
 pub mod screenshot;
 pub mod state;
@@ -29,7 +31,8 @@ use crate::config::{Config, ScreenshotTarget};
 use crate::error::{AuthError, Error, Redacted};
 use crate::mock::{FakeOptions, FakeTelegram, MOCK_NOW};
 use crate::model::{
-    ChatId, ConnState, GlobalHit, Media, Message as ChatMessage, MessageId, SendState, User,
+    Chat, ChatId, ConnState, GlobalHit, Media, Message as ChatMessage, MessageId, SendState,
+    SharedKind, User,
 };
 use crate::net::{ApiHandle, Event, UploadKind, backoff};
 use crate::prefs::{MuteState, Prefs};
@@ -43,6 +46,7 @@ pub const HISTORY_ID: &str = "history";
 pub const COMPOSER_ID: &str = "composer";
 pub const AUTH_INPUT_ID: &str = "auth-input";
 pub const CHAT_SEARCH_ID: &str = "chat-search";
+pub const FOLDER_TITLE_ID: &str = "folder-title";
 /// Image cache budget (architecture §3).
 pub const IMAGE_BUDGET: usize = 48 * 1024 * 1024;
 /// Photos fetched per open conversation (newest first).
@@ -57,6 +61,8 @@ pub const AVATAR_PREFETCH: usize = 80;
 pub const DIALOGS_PAGE: usize = 100;
 /// Start loading the next page this many px before the list's end.
 pub const DIALOGS_LOAD_THRESHOLD: f32 = 300.0;
+/// Load the next shared-content page this far (px) before the panel's end.
+pub const INFO_LOAD_THRESHOLD: f32 = 400.0;
 /// Avatar downloads in flight at once.
 pub const AVATAR_CONCURRENCY: usize = 6;
 
@@ -99,6 +105,8 @@ pub struct PendingFile {
     pub name: String,
     pub size: u64,
     pub kind: UploadKind,
+    /// A pasted image we wrote ourselves: deleted once sent or cancelled.
+    pub temp: bool,
 }
 
 pub struct App {
@@ -126,6 +134,8 @@ pub struct App {
     pub composer: String,
     pub compose_mode: ComposeMode,
     pub pending_file: Option<PendingFile>,
+    /// Text the composer just got from a paste, with the time (ms).
+    pub last_paste: Option<(String, i64)>,
     pub emoji_open: bool,
     pub menu_for: Option<MessageId>,
     pub chat_search: Option<ChatSearch>,
@@ -170,6 +180,15 @@ pub struct App {
     /// What the tray last showed; only changes are sent to the panel.
     pub tray_sent: Option<TrayModel>,
     pub settings_open: bool,
+    /// Chat folders: list, selection and open menus.
+    pub folders: folders::FolderState,
+    /// The folder editor dialog, when open.
+    pub folder_editor: Option<folders::FolderEditor>,
+    /// The right-hand info panel of the open chat, when shown.
+    pub info: Option<info::InfoPanel>,
+    /// Previews of the shared photos/videos/GIFs (bounded, encoded bytes).
+    pub thumbs: Lru<(ChatId, MessageId), image::Handle>,
+    pub thumb_q: info::ThumbQueue,
     /// "Launch at login" as last read from / written to disk.
     pub autostart: bool,
 }
@@ -239,6 +258,8 @@ impl App {
 
         // First frame comes from the cache, never from the network.
         let cached = store.load_chats().unwrap_or_default();
+        let mut cached_folders = folders::FolderState::default();
+        cached_folders.set_list(store.load_folders().unwrap_or_default());
         let mut app = Self {
             iced_theme: theme.iced(),
             theme,
@@ -260,6 +281,7 @@ impl App {
             composer: String::new(),
             compose_mode: ComposeMode::Normal,
             pending_file: None,
+            last_paste: None,
             emoji_open: false,
             menu_for: None,
             chat_search: None,
@@ -297,6 +319,11 @@ impl App {
             tray: None,
             tray_sent: None,
             settings_open: false,
+            folders: cached_folders,
+            folder_editor: None,
+            info: None,
+            thumbs: Lru::new(info::THUMB_BUDGET),
+            thumb_q: info::ThumbQueue::default(),
             autostart,
             config,
         };
@@ -349,6 +376,13 @@ impl App {
             app.start_tray(minimized)
         };
 
+        // Pasted images left behind by a crash (they are deleted on send/cancel).
+        if !app.config.mock {
+            let dir = app.config.paste_dir();
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(dir);
+            });
+        }
         // Cached avatars from disk are on screen with the first frame.
         let avatars = app.fetch_avatars();
         (app, Task::batch([open, tray, task, script, avatars]))
@@ -600,6 +634,15 @@ impl App {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 ..
             }) => Some(Message::Ui(Ui::Escape)),
+            // Ctrl+V (any layout: the physical key). Delivered even when the
+            // composer captured it for the text paste.
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyV),
+                modifiers,
+                ..
+            }) if modifiers.command() && !modifiers.shift() && !modifiers.alt() => {
+                Some(Message::Ui(Ui::Paste))
+            }
             _ => None,
         })];
         // Tray menu, second launch and notification clicks.
@@ -681,7 +724,7 @@ impl App {
     }
 
     fn on_signed_in(&mut self, user: Option<User>) -> Task<Message> {
-        let mut tasks = vec![self.fetch_dialogs()];
+        let mut tasks = vec![self.fetch_dialogs(), self.fetch_folders()];
         if let Some(u) = &user {
             let id = u.id.to_string();
             tasks.push(self.store_bg(move |s| s.set_kv("self_id", &id)));
@@ -693,6 +736,165 @@ impl App {
             tasks.push(operation::focus(Id::new(COMPOSER_ID)));
         }
         Task::batch(tasks)
+    }
+
+    // ------------------------------------------------------ info panel
+
+    /// Show the info panel for the open chat (or re-target it).
+    fn open_info(&mut self) -> Task<Message> {
+        let Some(chat) = self.selected else {
+            return Task::none();
+        };
+        self.info = Some(info::InfoPanel::new(chat));
+        self.reset_thumbs();
+        Task::batch([
+            self.fetch_peer_info(chat),
+            self.load_shared(SharedKind::Media),
+        ])
+    }
+
+    /// Hide the panel and drop its thumbnails. `true` when it was open.
+    fn close_info(&mut self) -> bool {
+        if self.info.take().is_none() {
+            return false;
+        }
+        self.reset_thumbs();
+        true
+    }
+
+    fn reset_thumbs(&mut self) {
+        self.thumbs = Lru::new(info::THUMB_BUDGET);
+        self.thumb_q.clear();
+    }
+
+    fn fetch_peer_info(&self, chat: ChatId) -> Task<Message> {
+        let Some(api) = self.api.clone() else {
+            return Task::none();
+        };
+        Task::perform(async move { api.peer_info(chat).await }, move |result| {
+            Message::Done(Done::PeerInfo { chat, result })
+        })
+    }
+
+    /// Request the next page of a tab, if one is due.
+    fn load_shared(&mut self, kind: SharedKind) -> Task<Message> {
+        let Some(panel) = &mut self.info else {
+            return Task::none();
+        };
+        let chat = panel.chat;
+        let Some(offset) = panel.tab_ref(kind).map_or(Some(0), info::SharedTab::want) else {
+            return Task::none();
+        };
+        let Some(api) = self.api.clone() else {
+            return Task::none();
+        };
+        panel.tab_mut(kind).start(offset);
+        Task::perform(
+            async move { api.shared_media(chat, kind, offset, info::PAGE).await },
+            move |result| {
+                Message::Done(Done::SharedPage {
+                    chat,
+                    kind,
+                    offset,
+                    result,
+                })
+            },
+        )
+    }
+
+    /// Start the queued thumbnail downloads that fit the concurrency limit.
+    fn pump_thumbs(&mut self) -> Task<Message> {
+        // Nothing is drawn while the window is closed in the tray.
+        if self.window_id.is_none() {
+            return Task::none();
+        }
+        let Some(api) = self.api.clone() else {
+            return Task::none();
+        };
+        let tasks: Vec<_> = self
+            .thumb_q
+            .take_ready()
+            .into_iter()
+            .map(|key| {
+                let api = api.clone();
+                Task::perform(
+                    async move { api.download_thumb(key.0, key.1).await },
+                    move |result| Message::Done(Done::Thumb { key, result }),
+                )
+            })
+            .collect();
+        Task::batch(tasks)
+    }
+
+    /// Load a photo for the viewer when it is not cached.
+    fn ensure_photo(&mut self, key: (ChatId, MessageId)) -> Task<Message> {
+        if key.1 <= 0 || self.photos.peek(&key).is_some() || !self.photo_loading.insert(key) {
+            return Task::none();
+        }
+        let Some(api) = self.api.clone() else {
+            self.photo_loading.remove(&key);
+            return Task::none();
+        };
+        Task::perform(
+            async move { api.download_photo(key.0, key.1).await },
+            move |result| Message::Done(Done::Photo { key, result }),
+        )
+    }
+
+    // ------------------------------------------------------- folders
+
+    fn fetch_folders(&self) -> Task<Message> {
+        let Some(api) = self.api.clone() else {
+            return Task::none();
+        };
+        Task::perform(async move { api.dialog_filters().await }, |r| {
+            Message::Done(Done::Folders(r))
+        })
+    }
+
+    /// Cache the folder list for the next first frame.
+    fn persist_folders(&self) -> Task<Message> {
+        let list = self.folders.list.clone();
+        self.store_bg(move |s| s.save_folders(&list))
+    }
+
+    /// Apply a folder change at once and tell the server; the list is put
+    /// back if the server refuses.
+    fn save_folder_optimistic(&mut self, folder: crate::model::Folder) -> Task<Message> {
+        let before = self.folders.list.clone();
+        self.folders.upsert(folder.clone());
+        let persist = self.persist_folders();
+        let Some(api) = self.api.clone() else {
+            return persist;
+        };
+        Task::batch([
+            persist,
+            Task::perform(
+                async move { api.save_dialog_filter(folder).await },
+                move |result| Message::Done(Done::FolderOp { before, result }),
+            ),
+        ])
+    }
+
+    /// Folders are evaluated on the chats we have loaded: while a folder
+    /// shows only a few and the account has more dialogs, page them in.
+    fn fill_folder(&mut self) -> Task<Message> {
+        const WANT: usize = 15;
+        let Some(f) = self.folders.current() else {
+            return Task::none();
+        };
+        if folders::FolderState::chats_in(f, self.chats.all()).len() >= WANT {
+            return Task::none();
+        }
+        self.load_more_dialogs()
+    }
+
+    /// Chats shown in the list: the selected folder's, or all.
+    pub fn visible_chats(&self) -> Vec<&Chat> {
+        match self.folders.current() {
+            Some(f) => folders::FolderState::chats_in(f, self.chats.all()),
+            None => self.chats.all().iter().collect(),
+        }
     }
 
     fn fetch_dialogs(&self) -> Task<Message> {
@@ -864,7 +1066,7 @@ impl App {
         self.selected = Some(chat);
         self.conversation = Some(conversation);
         self.compose_mode = ComposeMode::Normal;
-        self.pending_file = None;
+        self.drop_pending();
         self.menu_for = None;
         self.chat_search = None;
         self.highlight = None;
@@ -874,7 +1076,14 @@ impl App {
             self.chats.mark_read(chat);
         }
         self.restore_draft(chat);
+        // An open info panel follows the chat.
+        let info = if self.info.as_ref().is_some_and(|p| p.chat != chat) {
+            self.open_info()
+        } else {
+            Task::none()
+        };
         Task::batch([
+            info,
             stop_typing,
             save_draft,
             self.fetch_avatars(),
@@ -1390,9 +1599,282 @@ impl App {
                 None => Task::none(),
             },
             Ui::CancelPendingFile => {
-                self.pending_file = None;
+                self.drop_pending();
                 Task::none()
             }
+            Ui::ToggleInfo => {
+                if self.close_info() {
+                    Task::none()
+                } else {
+                    self.open_info()
+                }
+            }
+            Ui::InfoTab(kind) => {
+                let Some(panel) = &mut self.info else {
+                    return Task::none();
+                };
+                panel.select(kind);
+                self.load_shared(kind)
+            }
+            Ui::InfoScrolled(vp) => {
+                let bottom = vp.absolute_offset().y + vp.bounds().height;
+                if vp.content_bounds().height - bottom < INFO_LOAD_THRESHOLD
+                    && let Some(kind) = self.info.as_ref().map(|p| p.tab)
+                {
+                    self.load_shared(kind)
+                } else {
+                    Task::none()
+                }
+            }
+            Ui::SetNotifications(on) => {
+                let Some(chat) = self.info.as_ref().map(|p| p.chat) else {
+                    return Task::none();
+                };
+                let previous = self.chats.get(chat).is_some_and(|c| c.muted);
+                let muted = !on;
+                if previous == muted {
+                    return Task::none();
+                }
+                self.chats.set_muted(chat, muted);
+                let persist = self.store_bg(move |s| s.set_muted(chat, muted));
+                let Some(api) = self.api.clone() else {
+                    return persist;
+                };
+                Task::batch([
+                    persist,
+                    Task::perform(
+                        async move { api.set_muted(chat, muted).await },
+                        move |result| {
+                            Message::Done(Done::MuteDone {
+                                chat,
+                                previous,
+                                result,
+                            })
+                        },
+                    ),
+                ])
+            }
+            Ui::OpenLink(url) => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || crate::desktop::open_url(&url))
+                        .await
+                        .map_err(|_| Error::Cancelled)?
+                },
+                |r| Message::Done(Done::LinkOpened(r)),
+            ),
+            Ui::SelectFolder(id) => {
+                self.folders.selected = id.filter(|i| self.folders.get(*i).is_some());
+                self.folders.tab_menu = None;
+                self.folders.chat_menu = None;
+                self.fill_folder()
+            }
+            Ui::FolderTabMenu(id) => {
+                self.folders.chat_menu = None;
+                self.folders.tab_menu = if self.folders.tab_menu == id {
+                    None
+                } else {
+                    id
+                };
+                Task::none()
+            }
+            Ui::ChatMenu(id) => {
+                self.folders.tab_menu = None;
+                self.folders.chat_menu = if self.folders.chat_menu == id {
+                    None
+                } else {
+                    id
+                };
+                Task::none()
+            }
+            Ui::ChatInFolder(chat, fid) => {
+                self.folders.chat_menu = None;
+                let (Some(c), Some(mut f)) = (
+                    self.chats.get(chat).cloned(),
+                    self.folders.get(fid).cloned(),
+                ) else {
+                    return Task::none();
+                };
+                if f.shared {
+                    return self.toast("Shared folders are edited in the official app.".into());
+                }
+                f.toggle_chat(&c);
+                if f.explicit_len() > crate::model::FOLDER_CHATS_MAX {
+                    return self
+                        .toast(Error::Protocol("FILTER_INCLUDE_TOO_MUCH".into()).user_message());
+                }
+                self.save_folder_optimistic(f)
+            }
+            Ui::OpenFolders => {
+                self.main_menu = false;
+                self.folders.manager_open = true;
+                self.folders.confirm_delete = None;
+                Task::none()
+            }
+            Ui::CloseFolders => {
+                self.folders.manager_open = false;
+                self.folders.confirm_delete = None;
+                Task::none()
+            }
+            Ui::FolderMove(id, delta) => {
+                let before = self.folders.list.clone();
+                let Some(order) = self.folders.step(id, delta) else {
+                    return Task::none();
+                };
+                let persist = self.persist_folders();
+                let Some(api) = self.api.clone() else {
+                    return persist;
+                };
+                Task::batch([
+                    persist,
+                    Task::perform(
+                        async move { api.reorder_dialog_filters(order).await },
+                        move |result| Message::Done(Done::FolderOp { before, result }),
+                    ),
+                ])
+            }
+            Ui::FolderDeleteAsk(id) => {
+                // Confirmed inside the folder manager (also from a tab menu).
+                self.folders.tab_menu = None;
+                self.folders.manager_open = true;
+                self.folders.confirm_delete = Some(id);
+                Task::none()
+            }
+            Ui::FolderDeleteCancel => {
+                self.folders.confirm_delete = None;
+                Task::none()
+            }
+            Ui::FolderDeleteConfirm(id) => {
+                self.folders.confirm_delete = None;
+                self.folders.tab_menu = None;
+                let before = self.folders.list.clone();
+                if self.folders.remove(id).is_none() {
+                    return Task::none();
+                }
+                let persist = self.persist_folders();
+                let Some(api) = self.api.clone() else {
+                    return persist;
+                };
+                Task::batch([
+                    persist,
+                    Task::perform(
+                        async move { api.delete_dialog_filter(id).await },
+                        move |result| Message::Done(Done::FolderOp { before, result }),
+                    ),
+                ])
+            }
+            Ui::FolderNew(chat) => {
+                self.folders.chat_menu = None;
+                self.folders.tab_menu = None;
+                let mut ed = folders::FolderEditor::create(self.folders.next_id());
+                if let Some(c) = chat {
+                    ed.toggle_chat(folders::Picker::Include, c);
+                }
+                self.folder_editor = Some(ed);
+                operation::focus(Id::new(FOLDER_TITLE_ID))
+            }
+            Ui::FolderEdit(id) => {
+                self.folders.tab_menu = None;
+                let Some(f) = self.folders.get(id).cloned() else {
+                    return Task::none();
+                };
+                if f.shared {
+                    return self.toast("Shared folders are edited in the official app.".into());
+                }
+                self.folder_editor = Some(folders::FolderEditor::edit(f));
+                operation::focus(Id::new(FOLDER_TITLE_ID))
+            }
+            Ui::FolderTitle(t) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.set_title(&t);
+                }
+                Task::none()
+            }
+            Ui::FolderFlag(flag) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.toggle(flag);
+                }
+                Task::none()
+            }
+            Ui::FolderPick(which) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.picker = which;
+                    ed.query.clear();
+                }
+                Task::none()
+            }
+            Ui::FolderPickQuery(q) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.query = q;
+                }
+                Task::none()
+            }
+            Ui::FolderChatToggle(which, chat) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.toggle_chat(which, chat);
+                }
+                Task::none()
+            }
+            Ui::FolderChatRemove(which, chat) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.remove_chat(which, chat);
+                }
+                Task::none()
+            }
+            Ui::FolderEditorClose => {
+                self.folder_editor = None;
+                Task::none()
+            }
+            Ui::FolderSave => {
+                let Some(ed) = &mut self.folder_editor else {
+                    return Task::none();
+                };
+                if ed.saving {
+                    return Task::none();
+                }
+                if let Err(e) = ed.validate() {
+                    ed.error = Some(e.message());
+                    return Task::none();
+                }
+                let folder = ed.to_save();
+                let Some(api) = self.api.clone() else {
+                    ed.error = Some(Error::Net("not connected".into()).user_message());
+                    return Task::none();
+                };
+                ed.saving = true;
+                ed.error = None;
+                let sent = folder.clone();
+                Task::perform(
+                    async move { api.save_dialog_filter(sent).await },
+                    move |result| {
+                        Message::Done(Done::FolderSaved {
+                            folder: folder.clone(),
+                            result,
+                        })
+                    },
+                )
+            }
+            Ui::Paste => {
+                if self.selected.is_none()
+                    || !self.auth.is_signed_in()
+                    || self.settings_open
+                    || self.viewer.is_some()
+                {
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(crate::clipboard::read_blocking)
+                            .await
+                            .unwrap_or(crate::clipboard::Clip::Nothing)
+                    },
+                    |c| Message::Done(Done::Pasted(c)),
+                )
+            }
+            Ui::TextPasted(s) => {
+                self.last_paste = Some((s, Self::now_ms()));
+                Task::none()
+            }
+            Ui::CopyImage(chat, id) => self.copy_image(chat, id),
             Ui::ToggleEmoji => {
                 self.emoji_open = !self.emoji_open;
                 Task::none()
@@ -1573,7 +2055,8 @@ impl App {
             }
             Ui::OpenMedia(chat, id) => {
                 self.viewer = Some((chat, id));
-                Task::none()
+                // From the info panel the photo may not be loaded yet.
+                self.ensure_photo((chat, id))
             }
             Ui::CloseMedia => {
                 self.viewer = None;
@@ -1670,12 +2153,23 @@ impl App {
                 if self.setup.as_ref().is_some_and(|f| f.advanced) {
                     return self.update_ui(Ui::CancelSetup);
                 }
-                let closed = std::mem::take(&mut self.settings_open)
+                if let Some(ed) = &mut self.folder_editor {
+                    // Innermost first: the chat picker, then the editor.
+                    if ed.picker.take().is_none() {
+                        self.folder_editor = None;
+                    }
+                    return Task::none();
+                }
+                let closed = std::mem::take(&mut self.folders.manager_open)
+                    || self.folders.chat_menu.take().is_some()
+                    || self.folders.tab_menu.take().is_some()
+                    || std::mem::take(&mut self.settings_open)
                     || std::mem::take(&mut self.main_menu)
                     || self.viewer.take().is_some()
                     || self.menu_for.take().is_some()
-                    || self.pending_file.take().is_some()
-                    || std::mem::take(&mut self.emoji_open);
+                    || self.drop_pending()
+                    || std::mem::take(&mut self.emoji_open)
+                    || self.close_info();
                 if closed {
                     Task::none()
                 } else if self.compose_mode != ComposeMode::Normal {
@@ -1775,6 +2269,100 @@ impl App {
         ])
     }
 
+    /// Forget the pending file; a pasted temp image is deleted. `true` when
+    /// there was one.
+    fn drop_pending(&mut self) -> bool {
+        let Some(f) = self.pending_file.take() else {
+            return false;
+        };
+        if f.temp {
+            // A tiny unlink on a plain thread: no runtime needed in `update`.
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_file(f.path);
+            });
+        }
+        true
+    }
+
+    /// The composer pasted text for the same Ctrl+V (a copied file's path):
+    /// take it out again, the file is what the user meant.
+    fn undo_text_paste(&mut self) {
+        if let Some((pasted, at)) = self.last_paste.take()
+            && Self::now_ms() - at < 3_000
+        {
+            self.composer = crate::clipboard::strip_pasted(&self.composer, &pasted);
+        }
+    }
+
+    fn on_pasted(&mut self, clip: crate::clipboard::Clip) -> Task<Message> {
+        use crate::clipboard::Clip;
+        if self.selected.is_none() || !self.auth.is_signed_in() {
+            return Task::none();
+        }
+        match clip {
+            Clip::Nothing => Task::none(),
+            Clip::Files(files) => {
+                self.undo_text_paste();
+                let n = files.len();
+                let Some(first) = files.into_iter().next() else {
+                    return Task::none();
+                };
+                let attach = self.update_ui(Ui::FilePicked(Some(first)));
+                if n > 1 {
+                    let t =
+                        self.toast("Only one file is sent at a time: attached the first.".into());
+                    Task::batch([attach, t])
+                } else {
+                    attach
+                }
+            }
+            Clip::Image(png) => {
+                self.undo_text_paste();
+                let dir = self.config.paste_dir();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            crate::clipboard::save_pasted(&dir, &png)
+                        })
+                        .await
+                        .map_err(|_| Error::Cancelled)?
+                        .map_err(Error::from)
+                    },
+                    |r| Message::Done(Done::PasteSaved(r)),
+                )
+            }
+        }
+    }
+
+    /// "Copy image": the cached photo bytes, or a fresh download, decoded
+    /// (with the usual caps) and put on the system clipboard.
+    fn copy_image(&mut self, chat: ChatId, id: MessageId) -> Task<Message> {
+        self.menu_for = None;
+        let cached = match self.photos.peek(&(chat, id)) {
+            Some(image::Handle::Bytes(_, b)) => Some(b.to_vec()),
+            _ => None,
+        };
+        let api = self.api.clone();
+        Task::perform(
+            async move {
+                let bytes = match (cached, api) {
+                    (Some(b), _) => b,
+                    (None, Some(api)) => api.download_photo(chat, id).await?,
+                    (None, None) => return Err(Error::Net("not connected".into())),
+                };
+                tokio::task::spawn_blocking(move || {
+                    let px = crate::clipboard::decode_photo(&bytes)
+                        .ok_or_else(|| Error::Protocol("image not copyable".into()))?;
+                    crate::clipboard::write_image_blocking(px)
+                        .map_err(|_| Error::Io("clipboard unavailable".into()))
+                })
+                .await
+                .map_err(|_| Error::Cancelled)?
+            },
+            |r| Message::Done(Done::ImageCopied(r)),
+        )
+    }
+
     fn send_file(&mut self, file: PendingFile) -> Task<Message> {
         let Some(chat) = self.selected else {
             return Task::none();
@@ -1800,12 +2388,25 @@ impl App {
         let Some(api) = self.api.clone() else {
             return Task::none();
         };
-        let PendingFile { path, kind, .. } = file;
+        let PendingFile {
+            path,
+            kind,
+            temp: is_paste,
+            ..
+        } = file;
         let clear_draft = self.store_bg(move |s| s.set_draft(chat, None));
         Task::batch([
             clear_draft,
             Task::perform(
-                async move { api.send_file(chat, path, kind, caption, reply_to).await },
+                async move {
+                    let r = api
+                        .send_file(chat, path.clone(), kind, caption, reply_to)
+                        .await;
+                    if is_paste {
+                        let _ = tokio::fs::remove_file(&path).await;
+                    }
+                    r
+                },
                 move |result| Message::Done(Done::Sent { chat, temp, result }),
             ),
         ])
@@ -1882,6 +2483,15 @@ impl App {
                 return Task::none();
             }
             Event::SessionRevoked => return self.session_revoked(),
+            Event::FolderChanged { id, folder } => {
+                self.folders.apply_changed(*id, folder.clone());
+                return Task::batch([self.persist_folders(), self.fill_folder()]);
+            }
+            Event::FoldersOrder(order) => {
+                self.folders.apply_order(order);
+                return self.persist_folders();
+            }
+            Event::FoldersStale => return self.fetch_folders(),
             Event::NewMessage(m) => {
                 self.typing.message_from(m.chat_id, m.sender_id);
                 self.remember_names(std::iter::once(m));
@@ -1958,6 +2568,10 @@ impl App {
                     self.typing.apply(*chat, *user, *action, Self::now_ms());
                 }
             }
+            Event::Muted { chat, muted } => {
+                let (chat, muted) = (*chat, *muted);
+                tasks.push(self.store_bg(move |s| s.set_muted(chat, muted)));
+            }
             Event::ReadInbox { .. } | Event::UserStatus { .. } => {}
         }
         self.chats.apply_event(&ev, open);
@@ -2012,7 +2626,7 @@ impl App {
         self.conversation = None;
         self.composer.clear();
         self.compose_mode = ComposeMode::Normal;
-        self.pending_file = None;
+        self.drop_pending();
         self.chat_search = None;
         self.sidebar_messages.clear();
         self.sidebar_global.clear();
@@ -2026,6 +2640,10 @@ impl App {
         self.typing_throttle.reset();
         self.dialogs_exhausted = false;
         self.dialogs_loading = false;
+        self.folders = folders::FolderState::default();
+        self.folder_editor = None;
+        self.info = None;
+        self.reset_thumbs();
     }
 
     fn on_done(&mut self, done: Done) -> Task<Message> {
@@ -2178,7 +2796,7 @@ impl App {
                         s.upsert_chats(&to_store)
                     }
                 });
-                Task::batch([persist, self.fetch_avatars()])
+                Task::batch([persist, self.fetch_avatars(), self.fill_folder()])
             }
             Done::Dialogs(Err(e)) => self.on_error(e),
             Done::MoreDialogs(Ok(chats)) => {
@@ -2190,6 +2808,7 @@ impl App {
                 Task::batch([
                     self.store_bg(move |s| s.upsert_chats(&to_store)),
                     self.fetch_avatars(),
+                    self.fill_folder(),
                 ])
             }
             Done::MoreDialogs(Err(e)) => {
@@ -2369,7 +2988,9 @@ impl App {
             Done::FileStat { path, result } => match result {
                 Ok((_, true)) => self.toast("Folders can't be sent. Drop a file instead.".into()),
                 Ok((size, false)) => {
+                    self.drop_pending();
                     self.pending_file = Some(PendingFile {
+                        temp: path.starts_with(self.config.paste_dir()),
                         name: path
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -2396,6 +3017,126 @@ impl App {
                 )
             }
             Done::SavePicked { path: None, .. } => Task::none(),
+            Done::Pasted(clip) => self.on_pasted(clip),
+            Done::PasteSaved(Ok(path)) => self.update_ui(Ui::FilePicked(Some(path))),
+            Done::PasteSaved(Err(e)) => self.on_error(e),
+            Done::ImageCopied(Ok(())) => self.toast("Image copied.".into()),
+            Done::ImageCopied(Err(e)) => self.on_error(e),
+            Done::PeerInfo { chat, result } => {
+                let Some(panel) = self.info.as_mut().filter(|p| p.chat == chat) else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(info) => panel.info = Some(info),
+                    Err(e) => {
+                        // The panel still shows the name and the tabs.
+                        warn!(error = %e, "could not load chat info");
+                        panel.info_failed = true;
+                    }
+                }
+                Task::none()
+            }
+            Done::SharedPage {
+                chat,
+                kind,
+                offset,
+                result,
+            } => {
+                let Some(panel) = self.info.as_mut().filter(|p| p.chat == chat) else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(page) => {
+                        let new = panel.tab_mut(kind).apply(offset, page);
+                        let thumbs = &self.thumbs;
+                        self.thumb_q
+                            .enqueue(new.into_iter().map(|id| (chat, id)), |k| {
+                                thumbs.peek(k).is_some()
+                            });
+                        self.pump_thumbs()
+                    }
+                    Err(e) => {
+                        if e.is_session_revoked() {
+                            return self.session_revoked();
+                        }
+                        warn!(error = %e, "could not load shared content");
+                        panel.tab_mut(kind).fail(offset);
+                        Task::none()
+                    }
+                }
+            }
+            Done::Thumb { key, result } => {
+                let ok = match result {
+                    Ok(bytes) if state::photo_is_acceptable(&bytes) => {
+                        let current = self.info.as_ref().is_some_and(|p| p.chat == key.0);
+                        if current {
+                            let cost = bytes.len().max(1024);
+                            self.thumbs
+                                .insert(key, image::Handle::from_bytes(bytes), cost);
+                        }
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(e) => {
+                        warn!(error = %e, "thumbnail unavailable");
+                        false
+                    }
+                };
+                self.thumb_q.finish(key, ok);
+                self.pump_thumbs()
+            }
+            Done::MuteDone {
+                chat,
+                previous,
+                result,
+            } => match result {
+                Ok(()) => Task::none(),
+                Err(e) => {
+                    self.chats.set_muted(chat, previous);
+                    let persist = self.store_bg(move |s| s.set_muted(chat, previous));
+                    Task::batch([persist, self.on_error(e)])
+                }
+            },
+            Done::LinkOpened(Ok(())) => Task::none(),
+            Done::LinkOpened(Err(e)) => {
+                warn!(error = %e, "could not open link");
+                self.toast("Could not open the link.".into())
+            }
+            Done::Folders(Ok(list)) => {
+                self.folders.set_list(list);
+                Task::batch([self.persist_folders(), self.fill_folder()])
+            }
+            Done::Folders(Err(e)) => {
+                // Folders are optional chrome: log, never toast.
+                warn!(error = %e, "could not load chat folders");
+                Task::none()
+            }
+            Done::FolderSaved { folder, result } => match result {
+                Ok(()) => {
+                    self.folders.upsert(folder);
+                    self.folder_editor = None;
+                    Task::batch([self.persist_folders(), self.fill_folder()])
+                }
+                Err(e) => {
+                    if e.is_session_revoked() {
+                        return self.session_revoked();
+                    }
+                    warn!(error = %e, "could not save folder");
+                    if let Some(ed) = &mut self.folder_editor {
+                        ed.saving = false;
+                        ed.error = Some(e.user_message());
+                    }
+                    Task::none()
+                }
+            },
+            Done::FolderOp { before, result } => match result {
+                Ok(()) => Task::none(),
+                Err(e) => {
+                    self.folders.set_list(before);
+                    let persist = self.persist_folders();
+                    Task::batch([persist, self.on_error(e)])
+                }
+            },
             Done::MediaSaved(Ok(())) => self.toast("File saved.".into()),
             Done::MediaSaved(Err(e)) => self.on_error(e),
             Done::Photo { key, result } => {

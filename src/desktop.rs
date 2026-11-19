@@ -241,9 +241,88 @@ pub fn open_file(path: &std::path::Path) -> crate::error::Result<()> {
     open::that_detached(path).map_err(|e| crate::error::Error::Io(format!("open: {}", e.kind())))
 }
 
+/// The address to open for a link from a message, or `None` when it is not
+/// a plain web link. Only http(s) (a bare "example.com" gets https://) is
+/// opened: never `file:`, `javascript:` or other handlers, never anything
+/// with whitespace or control characters.
+pub fn safe_web_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.len() > 2048
+        || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let rest = raw.split_once("://")?.1;
+        return (!rest.is_empty() && !rest.starts_with('/')).then(|| raw.to_owned());
+    }
+    // A scheme-less host ("example.com/path"): anything with another scheme
+    // (`name:`) before the first slash is refused.
+    let head = raw.split('/').next().unwrap_or_default();
+    if head.contains(':')
+        && !head
+            .rsplit_once(':')
+            .is_some_and(|(_, p)| p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    (head.contains('.') && !raw.starts_with(['.', '/', '-'])).then(|| format!("https://{raw}"))
+}
+
+/// Open a web link in the default browser (`open` crate: one argument, no
+/// shell).
+pub fn open_url(raw: &str) -> crate::error::Result<()> {
+    let url =
+        safe_web_url(raw).ok_or_else(|| crate::error::Error::Protocol("not a web link".into()))?;
+    open::that_detached(url).map_err(|e| crate::error::Error::Io(format!("open: {}", e.kind())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_web_links_are_opened() {
+        assert_eq!(
+            safe_web_url("https://example.com/a?b=1").as_deref(),
+            Some("https://example.com/a?b=1")
+        );
+        assert_eq!(
+            safe_web_url("HTTP://Example.com").as_deref(),
+            Some("HTTP://Example.com")
+        );
+        assert_eq!(
+            safe_web_url(" example.com/path ").as_deref(),
+            Some("https://example.com/path")
+        );
+        assert_eq!(
+            safe_web_url("localhost:8080/x"),
+            None,
+            "no dot, not a public host"
+        );
+        assert_eq!(
+            safe_web_url("example.com:8080/x").as_deref(),
+            Some("https://example.com:8080/x")
+        );
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "tg://resolve?domain=x",
+            "mailto:a@b.c",
+            "ssh://host",
+            "https://",
+            "https:///x",
+            "https://a.com/ b",
+            "https://a.com/\u{7}",
+            "",
+            "/etc/passwd",
+            "-flag.com",
+        ] {
+            assert_eq!(safe_web_url(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn desktop_entry_install() {

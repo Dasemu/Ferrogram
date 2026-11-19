@@ -58,12 +58,42 @@ pub enum Error {
     Cancelled,
 }
 
+/// Friendly text for RPC errors users can act on (the code is the Telegram
+/// error name, e.g. "400 DIALOG_FILTERS_TOO_MUCH"); everything else is generic.
+fn protocol_message(e: &str) -> String {
+    let known = [
+        (
+            "DIALOG_FILTERS_TOO_MUCH",
+            "You have reached the maximum number of folders.",
+        ),
+        (
+            "FILTER_INCLUDE_EMPTY",
+            "Add at least one chat or chat type to the folder.",
+        ),
+        ("FILTER_TITLE_EMPTY", "Give the folder a name."),
+        (
+            "CHATLISTS_TOO_MUCH",
+            "You have reached the maximum number of shared folders.",
+        ),
+        (
+            "USER_RESTRICTED",
+            "Telegram does not allow this for your account.",
+        ),
+        ("CHAT_ADMIN_REQUIRED", "You need to be an admin to do that."),
+        ("MSG_ID_INVALID", "That message is no longer available."),
+    ];
+    known.iter().find(|(name, _)| e.contains(name)).map_or_else(
+        || "Telegram returned an unexpected response.".to_owned(),
+        |(_, text)| (*text).to_owned(),
+    )
+}
+
 impl Error {
     /// A short message that is safe to show in the UI (no secrets, no ids).
     pub fn user_message(&self) -> String {
         match self {
             Self::Net(_) => "Connection problem. Retrying…".into(),
-            Self::Protocol(_) => "Telegram returned an unexpected response.".into(),
+            Self::Protocol(e) => protocol_message(e),
             Self::Auth(a) => match a {
                 AuthError::InvalidPhone => "Invalid phone number. Please try again.".into(),
                 AuthError::InvalidCode => "Invalid code. Please try again.".into(),
@@ -213,6 +243,17 @@ mod tests {
     fn redacted_hides_content() {
         let s = format!("{}", Redacted("secret body"));
         assert_eq!(s, "[redacted len=11]");
+    }
+
+    #[test]
+    fn folder_errors_get_friendly_texts() {
+        let e = Error::Protocol("400 DIALOG_FILTERS_TOO_MUCH".into());
+        assert!(e.user_message().contains("maximum number of folders"));
+        let e = Error::Protocol("400 SOMETHING_NEW".into());
+        assert_eq!(
+            e.user_message(),
+            "Telegram returned an unexpected response."
+        );
     }
 
     #[test]

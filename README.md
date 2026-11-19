@@ -71,8 +71,12 @@ if set). Release builds ship with Ferrogram's own Telegram API credentials;
 * Search: chats, cached messages and server-side results in the sidebar,
   server-side search inside a chat.
 
+Chat folders (create, edit, delete, reorder, "Add to folder"), Ctrl+V of images
+and files, "Copy image", and the chat info panel with shared Media, Files,
+Links, Music, Voice and GIFs are implemented (see `docs/protocol.md`, round 3).
+
 Not implemented yet: voice-message playback, video thumbnails, sticker
-rendering, forwarding, archived chats and folders.
+rendering, forwarding, archived chats, shared (chat list) folders editing.
 * Desktop notifications (D-Bus), muted chats and the focused chat excluded.
 * The session is restored from the OS keyring on start. The auth key is stored
   only as an encrypted blob whose key lives in the keyring.

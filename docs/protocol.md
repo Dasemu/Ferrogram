@@ -105,9 +105,47 @@ parsed back before conversion, so the deserialiser is exercised too.
   the chat, through `messages.saveDraft` (store migration 4 keeps them
   locally). Edits are never drafts (the draft is stashed while editing).
 
+## Round 3 features
+
+* **Chat folders.** `messages.getDialogFilters`, `messages.updateDialogFilter`
+  (create/replace; no filter = delete) and `messages.updateDialogFiltersOrder`
+  through raw `invoke`; the TL structs stay in `net/types.rs`
+  (`folder_from_tl` / `folder_to_tl`). The access hashes of the peers a folder
+  names are kept (`folder_peers`) so a folder can be saved again for chats
+  outside the loaded list; saving fails loudly (never drops a chat) when a
+  peer cannot be resolved. `updateDialogFilter`, `updateDialogFilterOrder`
+  and `updateDialogFilters` become `Event::FolderChanged / FoldersOrder /
+  FoldersStale`. Membership is evaluated locally with Telegram Desktop's
+  rules (`Folder::matches`: never list, explicit chats, then type flags
+  narrowed by exclude muted/read/archived). `chat.contact` comes from the
+  user object (migration 5); folders are cached as JSON in `kv`. Shared
+  (`dialogFilterChatlist`) folders are listed and can be deleted/reordered
+  but not edited. Archived chats are not loaded, so "exclude archived" is a
+  no-op for now. A folder shows only loaded dialogs; while it shows few and
+  the list is not exhausted, further dialog pages are loaded.
+* **Clipboard.** `clipboard.rs` (`arboard`, features `image-data` and
+  `wayland-data-control`): Ctrl+V (physical V key, delivered even when the
+  composer captured it) reads copied files or an image; images are written
+  as PNG to a private temp file (`$XDG_CACHE_HOME/ferrogram/paste`), then
+  take the normal send-preview path; files that file managers also offer as
+  text are removed from the composer again. "Copy image" decodes the cached
+  or downloaded photo (header checks, pixel cap) and sets it through one
+  long-lived handle (X11 must keep serving it).
+* **Info panel.** `users.getFullUser`, `messages.getFullChat`,
+  `channels.getFullChannel` give bio/description, username, phone (only when
+  Telegram returns it) and member count; the Notifications switch uses
+  `account.updateNotifySettings` (mute forever = `i32::MAX`) and follows
+  `updateNotifySettings`. Shared tabs use `messages.search` with
+  `inputMessagesFilterPhotoVideo / Document / Url / Music / Voice / Gif`,
+  40 per page, `offset_id` = oldest id of the previous page, at most 600
+  items per tab. Previews (320 px "m" size) are downloaded 4 at a time from
+  a bounded queue into a 12 MB LRU that is dropped when the panel closes or
+  the chat changes. Photos open the viewer, other items jump to their
+  message, links open in the browser (`desktop::open_url`: http(s) only).
+
 ## Not implemented (round 2)
 
-Archived chats and folders (`DialogIter` cannot set `folder_id`; needs a raw
+Archived chats (`DialogIter` cannot set `folder_id`; needs a raw
 `messages.getDialogs` with our own peer conversion and peer caching), voice
 playback (needs an Ogg/Opus decoder and an audio sink), video thumbnails,
 sticker rendering and forwarding.

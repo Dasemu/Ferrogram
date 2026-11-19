@@ -23,6 +23,18 @@ pub enum ScreenshotTarget {
     Media,
     ApiSetup,
     Settings,
+    /// Folder tabs with a folder selected.
+    Folders,
+    /// The "Chat folders" manager dialog.
+    FolderManager,
+    /// The folder editor (name, chats, types, exclusions).
+    FolderEditor,
+    /// The chat picker of the folder editor.
+    FolderPicker,
+    /// A chat row's context menu with "Add to folder".
+    ChatMenu,
+    /// The info panel (profile) with one shared-content tab selected.
+    Info(crate::model::SharedKind),
 }
 
 impl ScreenshotTarget {
@@ -38,6 +50,17 @@ impl ScreenshotTarget {
             "media" => Self::Media,
             "api-setup" => Self::ApiSetup,
             "settings" => Self::Settings,
+            "folders" => Self::Folders,
+            "folder-manager" => Self::FolderManager,
+            "folder-editor" => Self::FolderEditor,
+            "folder-picker" => Self::FolderPicker,
+            "chat-menu" => Self::ChatMenu,
+            "info" | "info-media" => Self::Info(crate::model::SharedKind::Media),
+            "info-files" => Self::Info(crate::model::SharedKind::Files),
+            "info-links" => Self::Info(crate::model::SharedKind::Links),
+            "info-music" => Self::Info(crate::model::SharedKind::Music),
+            "info-voice" => Self::Info(crate::model::SharedKind::Voice),
+            "info-gifs" => Self::Info(crate::model::SharedKind::Gifs),
             _ => return None,
         })
     }
@@ -116,6 +139,12 @@ impl Config {
     /// Where files are placed before the system handler opens them.
     pub fn open_dir(&self) -> PathBuf {
         self.cache_dir.join("open")
+    }
+
+    /// Images pasted from the clipboard wait here until sent or cancelled
+    /// (private files; leftovers are removed at startup).
+    pub fn paste_dir(&self) -> PathBuf {
+        self.cache_dir.join("paste")
     }
 
     pub fn cache_db_path(&self) -> PathBuf {

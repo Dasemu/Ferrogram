@@ -1,6 +1,8 @@
 //! Left column: menu, search field, chat list (and search results).
 
-use iced::widget::{Column, Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{
+    Column, Space, button, column, container, mouse_area, row, scrollable, text, text_input,
+};
 use iced::{Alignment, Element, Length};
 
 use super::format;
@@ -57,8 +59,22 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let mut list = Column::new();
     if app.sidebar_query.trim().is_empty() {
-        for c in app.chats.all() {
-            list = list.push(chat_row(app, c));
+        let visible = app.visible_chats();
+        let none = visible.is_empty();
+        for c in visible {
+            list = list.push(chat_entry(app, c));
+        }
+        if app.folders.current().is_some() && none && !app.dialogs_loading {
+            list = list.push(
+                container(
+                    text("No chats in this folder")
+                        .size(m.font_s)
+                        .color(p.text_muted),
+                )
+                .width(Length::Fill)
+                .align_x(Alignment::Center)
+                .padding([16, 16]),
+            );
         }
     } else {
         let chats = app.chats.filter(&app.sidebar_query);
@@ -128,6 +144,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
+                button(text("Chat folders").size(m.font_m))
+                    .width(Length::Fill)
+                    .padding([8, 10])
+                    .on_press(Message::Ui(Ui::OpenFolders))
+                    .style(theme::menu_item(p, false)),
                 button(text("Settings").size(m.font_m))
                     .width(Length::Fill)
                     .padding([8, 10])
@@ -149,9 +170,15 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Space::new().height(0).into()
     };
 
+    let strip = if app.sidebar_query.trim().is_empty() {
+        folder_strip(app)
+    } else {
+        Space::new().height(0).into()
+    };
     container(column![
         top,
         menu,
+        strip,
         banner,
         scrollable(list)
             .on_scroll(|vp| Message::Ui(Ui::SidebarScrolled(vp)))
@@ -161,6 +188,163 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .width(m.sidebar_width)
     .height(Length::Fill)
     .style(theme::fill(p.bg_sidebar))
+    .into()
+}
+
+/// Folder tabs under the search box (only when the account has folders):
+/// "All chats" plus one per folder, with the unread count of its unmuted
+/// chats. Right click opens the tab's menu.
+fn folder_strip(app: &App) -> Element<'_, Message> {
+    let t = &app.theme;
+    let (p, m) = (t.palette, t.metrics);
+    if app.folders.list.is_empty() {
+        return Space::new().height(0).into();
+    }
+    let tab = |id: Option<i32>, title: String, unread: u32| -> Element<'_, Message> {
+        let selected = app.folders.selected == id;
+        let mut label = row![emoji_plain(
+            format::ellipsize(&title, 14),
+            m.font_m,
+            if selected { p.link } else { p.text_secondary }
+        )]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if unread > 0 {
+            label = label.push(badge(t, format::badge_count(unread), false));
+        }
+        let b = button(label)
+            .padding([6, 8])
+            .on_press(Message::Ui(Ui::SelectFolder(id)))
+            .style(theme::folder_tab(p, selected));
+        let underline =
+            container(Space::new().height(2).width(Length::Fill)).style(theme::fill(if selected {
+                p.link
+            } else {
+                iced::Color::TRANSPARENT
+            }));
+        let col = column![b, underline].width(Length::Shrink);
+        match id {
+            Some(fid) => mouse_area(col)
+                .on_right_press(Message::Ui(Ui::FolderTabMenu(Some(fid))))
+                .into(),
+            None => col.into(),
+        }
+    };
+    let all_unread: u32 = app
+        .chats
+        .all()
+        .iter()
+        .filter(|c| !c.muted)
+        .map(|c| c.unread_count)
+        .sum();
+    let mut tabs = row![tab(None, "All chats".into(), all_unread)]
+        .spacing(2)
+        .align_y(Alignment::Center);
+    for f in &app.folders.list {
+        let unread = crate::app::folders::FolderState::unread_in(f, app.chats.all());
+        tabs = tabs.push(tab(Some(f.id), f.title.clone(), unread));
+    }
+    let strip = scrollable(container(tabs).padding(iced::Padding {
+        bottom: 5.0,
+        ..iced::Padding::ZERO
+    }))
+    .direction(scrollable::Direction::Horizontal(
+        scrollable::Scrollbar::new()
+            .width(3)
+            .scroller_width(3)
+            .margin(1),
+    ))
+    .width(Length::Fill);
+    let mut col = column![container(strip).padding([0, 6])];
+    if let Some(id) = app.folders.tab_menu
+        && let Some(f) = app.folders.get(id)
+    {
+        let item = |label: &'static str, msg: Ui, danger: bool| {
+            button(text(label).size(m.font_m))
+                .width(Length::Fill)
+                .padding([8, 12])
+                .on_press(Message::Ui(msg))
+                .style(theme::menu_item(p, danger))
+        };
+        col = col.push(
+            container(
+                column![
+                    item("Edit folder", Ui::FolderEdit(f.id), false),
+                    item("Delete folder…", Ui::FolderDeleteAsk(f.id), true),
+                ]
+                .spacing(0),
+            )
+            .padding(4)
+            .width(Length::Fill)
+            .style(theme::elevated(p)),
+        );
+    }
+    col.into()
+}
+
+/// A chat row with its right-click menu ("Add to folder") under it.
+fn chat_entry<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
+    let row_el = mouse_area(chat_row(app, c)).on_right_press(Message::Ui(Ui::ChatMenu(Some(c.id))));
+    if app.folders.chat_menu != Some(c.id) {
+        return row_el.into();
+    }
+    let t = &app.theme;
+    let (p, m) = (t.palette, t.metrics);
+    let mut items = column![
+        container(
+            text("Add to folder")
+                .size(m.font_s)
+                .font(FONT_SEMIBOLD)
+                .color(p.text_secondary)
+        )
+        .padding([6, 12])
+    ]
+    .spacing(0);
+    for f in &app.folders.list {
+        if f.shared {
+            continue;
+        }
+        let inside = f.matches(c);
+        items = items.push(
+            button(
+                row![
+                    container(if inside {
+                        icon(Icon::Check, 17.0, p.link)
+                    } else {
+                        Space::new().width(17).into()
+                    })
+                    .width(17),
+                    emoji_plain(format::ellipsize(&f.title, 24), m.font_m, p.text_primary),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([8, 12])
+            .on_press(Message::Ui(Ui::ChatInFolder(c.id, f.id)))
+            .style(theme::menu_item(p, false)),
+        );
+    }
+    items = items.push(
+        button(
+            row![
+                Space::new().width(17),
+                text("New folder…").size(m.font_m).color(p.link)
+            ]
+            .spacing(12),
+        )
+        .width(Length::Fill)
+        .padding([8, 12])
+        .on_press(Message::Ui(Ui::FolderNew(Some(c.id))))
+        .style(theme::menu_item(p, false)),
+    );
+    column![
+        row_el,
+        container(items)
+            .padding(4)
+            .width(Length::Fill)
+            .style(theme::elevated(p))
+    ]
     .into()
 }
 

@@ -1,8 +1,10 @@
 //! Views: pure functions `&App -> Element<Message>`.
 
 pub mod chat;
+pub mod folders;
 pub mod format;
 pub mod icons;
+pub mod info;
 pub mod login;
 pub mod settings;
 pub mod sidebar;
@@ -21,9 +23,13 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let p = app.theme.palette;
     let divider = container(iced::widget::Space::new().width(1).height(Length::Fill))
         .style(theme::fill(p.border));
-    let mut layers = stack![row![sidebar::view(app), divider, chat::view(app)]]
-        .width(Length::Fill)
-        .height(Length::Fill);
+    let mut main = row![sidebar::view(app), divider, chat::view(app)];
+    if let Some(panel) = info::view(app) {
+        let divider2 = container(iced::widget::Space::new().width(1).height(Length::Fill))
+            .style(theme::fill(p.border));
+        main = main.push(divider2).push(panel);
+    }
+    let mut layers = stack![main].width(Length::Fill).height(Length::Fill);
     if let Some(toast) = &app.toast {
         layers = layers.push(
             container(
@@ -41,6 +47,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     if app.settings_open {
         layers = layers.push(settings::view(app));
+    }
+    if app.folders.manager_open {
+        layers = layers.push(folders::manager(app));
+    }
+    if let Some(editor) = folders::editor(app) {
+        layers = layers.push(editor);
     }
     layers.into()
 }

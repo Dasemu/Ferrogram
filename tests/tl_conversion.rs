@@ -3,10 +3,12 @@
 //! parser path (`Deserializable`) is exercised as well.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ferrogram::model::{CHANNEL_OFFSET, Media};
+use ferrogram::model::{CHANNEL_OFFSET, Folder, Media, SharedBody, SharedKind};
 use ferrogram::net::Event;
 use ferrogram::net::types::{
-    dialog_info, event_from_update, largest_size, message_from_tl, peer_to_chat_id, rpc_error,
+    dialog_info, event_from_update, event_from_update_as, folder_from_tl, folder_to_tl,
+    folders_from_tl, largest_size, message_from_tl, peer_to_chat_id, rpc_error, shared_filter,
+    shared_item_from_tl, shared_page_from_tl, utf16_slice,
 };
 use grammers_client::tl;
 use grammers_client::tl::{Deserializable, Serializable};
@@ -706,4 +708,507 @@ fn drafts_convert_from_updates_and_dialogs() {
         draft: draft_message("topic", None),
     });
     assert_eq!(event_from_update(&wire(topic)), None);
+}
+
+// ------------------------------------------------------------------ folders
+
+fn ip_user(id: i64) -> tl::enums::InputPeer {
+    tl::enums::InputPeer::User(tl::types::InputPeerUser {
+        user_id: id,
+        access_hash: id * 7,
+    })
+}
+
+fn ip_chat(id: i64) -> tl::enums::InputPeer {
+    tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: id })
+}
+
+fn ip_channel(id: i64) -> tl::enums::InputPeer {
+    tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+        channel_id: id,
+        access_hash: id * 3,
+    })
+}
+
+fn title(t: &str) -> tl::enums::TextWithEntities {
+    tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+        text: t.into(),
+        entities: Vec::new(),
+    })
+}
+
+fn raw_filter() -> tl::types::DialogFilter {
+    tl::types::DialogFilter {
+        contacts: true,
+        non_contacts: false,
+        groups: true,
+        broadcasts: false,
+        bots: true,
+        exclude_muted: true,
+        exclude_read: false,
+        exclude_archived: true,
+        title_noanimate: false,
+        id: 5,
+        title: title("Work"),
+        emoticon: Some("💼".into()),
+        color: None,
+        pinned_peers: vec![ip_user(11), tl::enums::InputPeer::PeerSelf],
+        // 11 is listed twice (pinned and included): it must not repeat.
+        include_peers: vec![ip_user(11), ip_chat(7), ip_channel(900)],
+        exclude_peers: vec![ip_user(12)],
+    }
+}
+
+#[test]
+fn dialog_filter_converts_to_a_folder() {
+    let wire = wire(tl::enums::DialogFilter::Filter(raw_filter()));
+    let (f, peers) = folder_from_tl(&wire, 42).unwrap();
+    assert_eq!((f.id, f.title.as_str()), (5, "Work"));
+    assert_eq!(f.emoticon.as_deref(), Some("💼"));
+    assert!(f.contacts && f.groups && f.bots);
+    assert!(!f.non_contacts && !f.channels);
+    assert!(f.exclude_muted && f.exclude_archived && !f.exclude_read);
+    assert_eq!(
+        f.pinned,
+        vec![11, 42],
+        "inputPeerSelf is Saved Messages (our id)"
+    );
+    assert_eq!(
+        f.include,
+        vec![-7, -CHANNEL_OFFSET - 900],
+        "Bot API ids; the pinned chat is not repeated"
+    );
+    assert_eq!(f.exclude, vec![12]);
+    assert!(!f.shared);
+    // Access hashes are kept for saving the folder again.
+    assert!(peers.iter().any(|(id, p)| *id == 11 && *p == ip_user(11)));
+    assert!(
+        peers
+            .iter()
+            .any(|(id, p)| *id == -CHANNEL_OFFSET - 900 && *p == ip_channel(900))
+    );
+}
+
+#[test]
+fn default_and_chatlist_filters() {
+    assert!(folder_from_tl(&tl::enums::DialogFilter::Default, 1).is_none());
+    let shared = tl::enums::DialogFilter::Chatlist(tl::types::DialogFilterChatlist {
+        has_my_invites: true,
+        title_noanimate: false,
+        id: 9,
+        title: title("Shared"),
+        emoticon: None,
+        color: None,
+        pinned_peers: vec![],
+        include_peers: vec![ip_channel(5)],
+    });
+    let (f, _) = folder_from_tl(&wire(shared), 1).unwrap();
+    assert!(f.shared);
+    assert_eq!(f.include, vec![-CHANNEL_OFFSET - 5]);
+    assert!(
+        !f.contacts && !f.groups,
+        "shared folders have no type rules"
+    );
+}
+
+#[test]
+fn folder_converts_back_to_tl() {
+    let (f, peers) = folder_from_tl(&tl::enums::DialogFilter::Filter(raw_filter()), 42).unwrap();
+    let known: std::collections::HashMap<_, _> = peers.into_iter().collect();
+    let resolve = |id: i64| known.get(&id).cloned();
+    let back = folder_to_tl(&f, 42, &resolve).unwrap();
+    let tl::enums::DialogFilter::Filter(d) = wire(back) else {
+        panic!("a normal folder is a dialogFilter");
+    };
+    assert_eq!(d.id, 5);
+    assert!(d.contacts && d.groups && d.bots && !d.broadcasts && !d.non_contacts);
+    assert!(d.exclude_muted && d.exclude_archived && !d.exclude_read);
+    assert_eq!(
+        d.pinned_peers,
+        vec![ip_user(11), tl::enums::InputPeer::PeerSelf]
+    );
+    assert_eq!(d.include_peers, vec![ip_chat(7), ip_channel(900)]);
+    assert_eq!(d.exclude_peers, vec![ip_user(12)]);
+    let tl::enums::TextWithEntities::Entities(t) = &d.title;
+    assert_eq!(t.text, "Work");
+}
+
+#[test]
+fn saving_a_folder_never_drops_unknown_chats_silently() {
+    let mut f = Folder::new(3, "X");
+    f.include = vec![5, 6];
+    let only5 = |id: i64| (id == 5).then(|| ip_user(5));
+    assert_eq!(folder_to_tl(&f, 1, &only5).unwrap_err(), 6);
+    // A pinned chat is written once, in `pinned_peers`.
+    let mut g = Folder::new(3, "X");
+    g.pinned = vec![5];
+    g.include = vec![5];
+    let tl::enums::DialogFilter::Filter(d) = folder_to_tl(&g, 1, &only5).unwrap() else {
+        panic!()
+    };
+    assert_eq!((d.pinned_peers.len(), d.include_peers.len()), (1, 0));
+    // A shared folder goes back as a chat list, not as a filter.
+    g.shared = true;
+    assert!(matches!(
+        folder_to_tl(&g, 1, &only5).unwrap(),
+        tl::enums::DialogFilter::Chatlist(_)
+    ));
+}
+
+#[test]
+fn folder_list_skips_the_all_chats_placeholder() {
+    let r = tl::enums::messages::DialogFilters::Filters(tl::types::messages::DialogFilters {
+        tags_enabled: false,
+        filters: vec![
+            tl::enums::DialogFilter::Default,
+            tl::enums::DialogFilter::Filter(raw_filter()),
+        ],
+    });
+    let (folders, peers) = folders_from_tl(&wire(r), 42);
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0].id, 5);
+    assert!(!peers.is_empty());
+}
+
+#[test]
+fn folder_updates_map_to_events() {
+    let changed = tl::enums::Update::DialogFilter(tl::types::UpdateDialogFilter {
+        id: 5,
+        filter: Some(tl::enums::DialogFilter::Filter(raw_filter())),
+    });
+    match event_from_update_as(&wire(changed), 42) {
+        Some(Event::FolderChanged {
+            id: 5,
+            folder: Some(f),
+        }) => {
+            assert_eq!(f.title, "Work");
+            assert!(f.pinned.contains(&42));
+        }
+        other => panic!("{other:?}"),
+    }
+    let deleted = tl::enums::Update::DialogFilter(tl::types::UpdateDialogFilter {
+        id: 5,
+        filter: None,
+    });
+    assert_eq!(
+        event_from_update(&wire(deleted)),
+        Some(Event::FolderChanged {
+            id: 5,
+            folder: None
+        })
+    );
+    let order = tl::enums::Update::DialogFilterOrder(tl::types::UpdateDialogFilterOrder {
+        order: vec![0, 7, 5],
+    });
+    assert_eq!(
+        event_from_update(&wire(order)),
+        Some(Event::FoldersOrder(vec![0, 7, 5]))
+    );
+    assert_eq!(
+        event_from_update(&tl::enums::Update::DialogFilters),
+        Some(Event::FoldersStale)
+    );
+}
+
+// ------------------------------------------------------------ shared media
+
+fn doc_media(
+    attrs: Vec<tl::enums::DocumentAttribute>,
+    mime: &str,
+    size: i64,
+) -> tl::enums::MessageMedia {
+    tl::enums::MessageMedia::Document(tl::types::MessageMediaDocument {
+        nopremium: false,
+        spoiler: false,
+        video: false,
+        round: false,
+        voice: false,
+        document: Some(tl::enums::Document::Document(tl::types::Document {
+            id: 1,
+            access_hash: 2,
+            file_reference: vec![],
+            date: 0,
+            mime_type: mime.into(),
+            size,
+            thumbs: None,
+            video_thumbs: None,
+            dc_id: 2,
+            attributes: attrs,
+        })),
+        alt_documents: None,
+        video_cover: None,
+        video_timestamp: None,
+        ttl_seconds: None,
+    })
+}
+
+fn video_attr(w: i32, h: i32, secs: f64, round: bool) -> tl::enums::DocumentAttribute {
+    tl::enums::DocumentAttribute::Video(tl::types::DocumentAttributeVideo {
+        round_message: round,
+        supports_streaming: true,
+        nosound: false,
+        duration: secs,
+        w,
+        h,
+        preload_prefix_size: None,
+        video_start_ts: None,
+        video_codec: None,
+    })
+}
+
+fn audio_attr(voice: bool, secs: i32, title: Option<&str>) -> tl::enums::DocumentAttribute {
+    tl::enums::DocumentAttribute::Audio(tl::types::DocumentAttributeAudio {
+        voice,
+        duration: secs,
+        title: title.map(str::to_owned),
+        performer: title.map(|_| "Band".to_owned()),
+        waveform: None,
+    })
+}
+
+fn msg_with(id: i32, media: Option<tl::enums::MessageMedia>) -> tl::enums::Message {
+    let mut m = raw_message(id, user(1), false, "");
+    m.media = media;
+    wire(tl::enums::Message::Message(m))
+}
+
+#[test]
+fn shared_filters_match_the_tabs() {
+    use tl::enums::MessagesFilter as F;
+    assert!(matches!(
+        shared_filter(SharedKind::Media),
+        F::InputMessagesFilterPhotoVideo
+    ));
+    assert!(matches!(
+        shared_filter(SharedKind::Files),
+        F::InputMessagesFilterDocument
+    ));
+    assert!(matches!(
+        shared_filter(SharedKind::Links),
+        F::InputMessagesFilterUrl
+    ));
+    assert!(matches!(
+        shared_filter(SharedKind::Music),
+        F::InputMessagesFilterMusic
+    ));
+    assert!(matches!(
+        shared_filter(SharedKind::Voice),
+        F::InputMessagesFilterVoice
+    ));
+    assert!(matches!(
+        shared_filter(SharedKind::Gifs),
+        F::InputMessagesFilterGif
+    ));
+}
+
+#[test]
+fn photos_videos_and_gifs_become_media_items() {
+    let photo = tl::enums::MessageMedia::Photo(tl::types::MessageMediaPhoto {
+        spoiler: false,
+        live_photo: false,
+        photo: Some(tl::enums::Photo::Photo(tl::types::Photo {
+            has_stickers: false,
+            id: 5,
+            access_hash: 1,
+            file_reference: vec![],
+            date: 0,
+            sizes: vec![tl::enums::PhotoSize::Size(tl::types::PhotoSize {
+                r#type: "x".into(),
+                w: 800,
+                h: 600,
+                size: 10,
+            })],
+            video_sizes: None,
+            dc_id: 2,
+        })),
+        ttl_seconds: None,
+        video: None,
+    });
+    let it = shared_item_from_tl(&msg_with(10, Some(photo)), SharedKind::Media).unwrap();
+    assert_eq!(it.id, 10);
+    assert_eq!(
+        it.body,
+        SharedBody::Photo {
+            width: 800,
+            height: 600
+        }
+    );
+    assert!(it.has_thumb());
+
+    let video = doc_media(vec![video_attr(1280, 720, 83.4, false)], "video/mp4", 1_000);
+    let it = shared_item_from_tl(&msg_with(11, Some(video)), SharedKind::Media).unwrap();
+    assert_eq!(
+        it.body,
+        SharedBody::Video {
+            width: 1280,
+            height: 720,
+            seconds: 83
+        }
+    );
+
+    let gif = doc_media(
+        vec![
+            tl::enums::DocumentAttribute::Animated,
+            video_attr(480, 270, 2.0, false),
+        ],
+        "video/mp4",
+        5,
+    );
+    let it = shared_item_from_tl(&msg_with(12, Some(gif)), SharedKind::Gifs).unwrap();
+    assert_eq!(
+        it.body,
+        SharedBody::Gif {
+            width: 480,
+            height: 270
+        }
+    );
+
+    // A photo does not belong to the GIF tab, nor a text-only message to Media.
+    assert!(shared_item_from_tl(&msg_with(13, None), SharedKind::Media).is_none());
+    let plain = doc_media(vec![], "application/pdf", 1);
+    assert!(shared_item_from_tl(&msg_with(14, Some(plain)), SharedKind::Gifs).is_none());
+}
+
+#[test]
+fn documents_audio_and_voice_land_in_their_tabs() {
+    let file = doc_media(
+        vec![tl::enums::DocumentAttribute::Filename(
+            tl::types::DocumentAttributeFilename {
+                file_name: "trail-map.pdf".into(),
+            },
+        )],
+        "application/pdf",
+        2_457_600,
+    );
+    let it = shared_item_from_tl(&msg_with(1, Some(file)), SharedKind::Files).unwrap();
+    assert_eq!(
+        it.body,
+        SharedBody::File {
+            name: "trail-map.pdf".into(),
+            size: 2_457_600,
+            mime: "application/pdf".into()
+        }
+    );
+
+    let song = doc_media(
+        vec![audio_attr(false, 215, Some("Mountain Air"))],
+        "audio/mpeg",
+        3,
+    );
+    let it = shared_item_from_tl(&msg_with(2, Some(song.clone())), SharedKind::Music).unwrap();
+    assert_eq!(
+        it.body,
+        SharedBody::Audio {
+            title: Some("Mountain Air".into()),
+            performer: Some("Band".into()),
+            name: None,
+            seconds: 215
+        }
+    );
+    assert!(shared_item_from_tl(&msg_with(2, Some(song)), SharedKind::Voice).is_none());
+
+    let voice = doc_media(vec![audio_attr(true, 9, None)], "audio/ogg", 3);
+    let it = shared_item_from_tl(&msg_with(3, Some(voice.clone())), SharedKind::Voice).unwrap();
+    assert_eq!(it.body, SharedBody::Voice { seconds: 9 });
+    assert!(
+        shared_item_from_tl(&msg_with(3, Some(voice)), SharedKind::Music).is_none(),
+        "voice messages are not music"
+    );
+}
+
+#[test]
+fn links_come_from_the_preview_or_the_entities() {
+    // Web page preview wins and carries title/description.
+    let mut m = raw_message(20, user(1), false, "look https://example.com/a");
+    m.media = Some(tl::enums::MessageMedia::WebPage(
+        tl::types::MessageMediaWebPage {
+            force_large_media: false,
+            force_small_media: false,
+            manual: false,
+            safe: false,
+            webpage: tl::enums::WebPage::Page(tl::types::WebPage {
+                has_large_media: false,
+                video_cover_photo: false,
+                id: 1,
+                url: "https://example.com/a".into(),
+                display_url: "example.com/a".into(),
+                hash: 0,
+                r#type: None,
+                site_name: Some("Example".into()),
+                title: Some("An example".into()),
+                description: Some(String::new()),
+                photo: None,
+                embed_url: None,
+                embed_type: None,
+                embed_width: None,
+                embed_height: None,
+                duration: None,
+                author: None,
+                document: None,
+                cached_page: None,
+                attributes: None,
+            }),
+        },
+    ));
+    let it = shared_item_from_tl(&wire(tl::enums::Message::Message(m)), SharedKind::Links).unwrap();
+    assert_eq!(
+        it.body,
+        SharedBody::Link {
+            url: "https://example.com/a".into(),
+            title: Some("An example".into()),
+            description: None,
+            site: Some("Example".into())
+        }
+    );
+
+    // No preview: a plain url entity, sliced by UTF-16 offsets (the emoji is
+    // two units), and a text-url entity.
+    let mut m = raw_message(21, user(1), false, "😀 see example.org/x now");
+    m.entities = Some(vec![tl::enums::MessageEntity::Url(
+        tl::types::MessageEntityUrl {
+            offset: 7,
+            length: 13,
+        },
+    )]);
+    let it = shared_item_from_tl(&wire(tl::enums::Message::Message(m)), SharedKind::Links).unwrap();
+    assert!(matches!(it.body, SharedBody::Link { ref url, .. } if url == "example.org/x"));
+
+    let mut m = raw_message(22, user(1), false, "click here");
+    m.entities = Some(vec![tl::enums::MessageEntity::TextUrl(
+        tl::types::MessageEntityTextUrl {
+            offset: 0,
+            length: 5,
+            url: "https://t.example/q".into(),
+        },
+    )]);
+    let it = shared_item_from_tl(&wire(tl::enums::Message::Message(m)), SharedKind::Links).unwrap();
+    assert!(matches!(it.body, SharedBody::Link { ref url, .. } if url == "https://t.example/q"));
+
+    // The filter can return a message whose link we cannot read: skipped.
+    let m = raw_message(23, user(1), false, "no link");
+    assert!(shared_item_from_tl(&tl::enums::Message::Message(m), SharedKind::Links).is_none());
+}
+
+#[test]
+fn utf16_slicing_follows_telegram_offsets() {
+    assert_eq!(utf16_slice("abc def", 4, 3).as_deref(), Some("def"));
+    assert_eq!(utf16_slice("😀 x.com", 3, 5).as_deref(), Some("x.com"));
+    assert_eq!(utf16_slice("😀x", 1, 1), None, "inside a surrogate pair");
+    assert_eq!(utf16_slice("abc", 2, 5), None, "past the end");
+    assert_eq!(utf16_slice("abc", -1, 2), None);
+    assert_eq!(utf16_slice("abc", 0, 0), None);
+}
+
+#[test]
+fn pages_know_where_the_next_one_starts() {
+    let photo_doc = |id| msg_with(id, Some(doc_media(vec![], "application/pdf", 1)));
+    // A full page: the cursor is the oldest raw id, even when some results
+    // were not convertible for the tab.
+    let msgs = vec![photo_doc(90), msg_with(80, None), photo_doc(70)];
+    let page = shared_page_from_tl(&msgs, SharedKind::Files, 3);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.next, Some(70));
+    // A short page is the end.
+    let page = shared_page_from_tl(&msgs, SharedKind::Files, 40);
+    assert_eq!(page.next, None);
 }

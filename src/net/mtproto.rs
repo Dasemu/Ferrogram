@@ -19,14 +19,15 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::session::EncryptedSession;
-use super::types::{self, dialog_info, event_from_update, message_from_tl, presence_from_tl};
+use super::types::{self, dialog_info, event_from_update_as, message_from_tl, presence_from_tl};
 use super::{Event, EventHub, TelegramApi, UploadKind, backoff};
 use crate::auth::SignInOutcome;
 use crate::auth::vault::Vault;
 use crate::config::ApiCredentials;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
-    Chat, ChatId, ChatKind, ConnState, GlobalHit, Message, MessageId, Presence, User,
+    Chat, ChatId, ChatKind, ConnState, Folder, GlobalHit, Message, MessageId, PeerInfo, Presence,
+    User,
 };
 
 type UpdatesRx = mpsc::Receiver<grammers_session::updates::UpdatesLike>;
@@ -39,6 +40,13 @@ pub struct GrammersApi {
     login_token: Mutex<Option<LoginToken>>,
     password_token: Mutex<Option<PasswordToken>>,
     peers: Mutex<HashMap<ChatId, PeerRef>>,
+    /// `InputPeer`s (with access hashes) named by the account's folders, so a
+    /// folder can be saved again even for chats outside the loaded list.
+    folder_peers: Mutex<HashMap<ChatId, grammers_client::tl::enums::InputPeer>>,
+    /// Where to download the preview of the photos/videos a shared-media
+    /// page listed (bounded FIFO), so no extra lookup per thumbnail.
+    thumbs:
+        Mutex<std::collections::VecDeque<((ChatId, MessageId), grammers_client::media::PhotoSize)>>,
     /// The dialog iterator survives between calls so "load more" continues
     /// from the offset instead of re-reading the list.
     dialogs_iter: tokio::sync::Mutex<Option<grammers_client::client::DialogIter>>,
@@ -104,6 +112,17 @@ fn peer_photo_id(peer: &Peer) -> Option<i64> {
     }
 }
 
+/// Is this user in our contacts?
+fn peer_is_contact(peer: &Peer) -> bool {
+    match peer {
+        Peer::User(u) => match &u.raw {
+            grammers_client::tl::enums::User::User(x) => x.contact,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn peer_presence(peer: &Peer, now: i64) -> Presence {
     match peer {
         Peer::User(u) => match &u.raw {
@@ -142,6 +161,8 @@ impl GrammersApi {
             login_token: Mutex::new(None),
             password_token: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
+            folder_peers: Mutex::new(HashMap::new()),
+            thumbs: Mutex::new(std::collections::VecDeque::new()),
             dialogs_iter: tokio::sync::Mutex::new(None),
             self_id: AtomicI64::new(0),
             events: EventHub::new(),
@@ -195,12 +216,50 @@ impl GrammersApi {
             chat.read_outbox_max_id = info.read_outbox;
             chat.photo_id = peer_photo_id(d.peer());
             chat.presence = peer_presence(d.peer(), now);
+            chat.contact = peer_is_contact(d.peer());
             chat.draft = info.draft;
             chat.last_message = d.last_message.as_ref().and_then(|m| self.convert(m));
             chat.last_date = chat.last_message.as_ref().map_or(0, |m| m.date);
             out.push(chat);
         }
         Ok(out)
+    }
+
+    fn remember_folder_peers(&self, peers: Vec<(ChatId, grammers_client::tl::enums::InputPeer)>) {
+        if let Ok(mut m) = self.folder_peers.lock() {
+            // Bounded: a folder holds at most a few hundred chats.
+            if m.len() > 4096 {
+                m.clear();
+            }
+            m.extend(peers);
+        }
+    }
+
+    fn resolve_input_peer(&self, chat: ChatId) -> Option<grammers_client::tl::enums::InputPeer> {
+        if let Some(p) = self.peers.lock().ok()?.get(&chat).copied() {
+            return Some(p.into());
+        }
+        self.folder_peers.lock().ok()?.get(&chat).cloned()
+    }
+
+    fn remember_thumb(&self, key: (ChatId, MessageId), size: grammers_client::media::PhotoSize) {
+        const MAX: usize = 800;
+        if let Ok(mut q) = self.thumbs.lock() {
+            if q.len() >= MAX {
+                q.pop_front();
+            }
+            q.push_back((key, size));
+        }
+    }
+
+    fn thumb_for(&self, key: (ChatId, MessageId)) -> Option<grammers_client::media::PhotoSize> {
+        self.thumbs
+            .lock()
+            .ok()?
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == key)
+            .map(|(_, s)| s.clone())
     }
 
     fn emit(&self, ev: Event) {
@@ -270,7 +329,17 @@ impl GrammersApi {
                             grammers_client::update::Update::MessageEdited(m) => {
                                 me.convert(m).map(Event::MessageEdited)
                             }
-                            other => event_from_update(other.raw()),
+                            other => {
+                                let self_id = me.self_id.load(Ordering::Acquire);
+                                if let grammers_client::tl::enums::Update::DialogFilter(u) =
+                                    other.raw()
+                                    && let Some(f) = &u.filter
+                                    && let Some((_, peers)) = types::folder_from_tl(f, self_id)
+                                {
+                                    me.remember_folder_peers(peers);
+                                }
+                                event_from_update_as(other.raw(), self_id)
+                            }
                         };
                         if let Some(ev) = event {
                             me.emit(ev);
@@ -304,6 +373,29 @@ impl GrammersApi {
         self.self_id.store(user.id, Ordering::Release);
         SignInOutcome::SignedIn(user)
     }
+}
+
+/// The preview of a photo / video / GIF to show in the grid: the 320 px "m"
+/// size, else the 800 px "x" or 100 px "s" one; only sizes that can be shown
+/// (not the stripped or vector placeholders).
+fn thumb_size(media: &grammers_client::media::Media) -> Option<grammers_client::media::PhotoSize> {
+    use grammers_client::media::{Media, PhotoSize};
+    let sizes = match media {
+        Media::Photo(p) => p.thumbs(),
+        Media::Document(d) => d.thumbs(),
+        _ => return None,
+    };
+    let usable = |s: &&PhotoSize| {
+        matches!(
+            s,
+            PhotoSize::Size(_) | PhotoSize::Progressive(_) | PhotoSize::Cached(_)
+        )
+    };
+    ["m", "x", "s"]
+        .iter()
+        .find_map(|t| sizes.iter().filter(usable).find(|s| s.photo_type() == *t))
+        .or_else(|| sizes.iter().find(usable))
+        .cloned()
 }
 
 /// `Arc` wrapper so `TelegramApi` methods can spawn work that outlives `&self`.
@@ -709,6 +801,180 @@ impl TelegramApi for Grammers {
         }
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
         Ok(())
+    }
+
+    async fn peer_info(&self, chat: ChatId) -> Result<PeerInfo> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        if chat > 0 {
+            let r = api
+                .client
+                .invoke(&tl::functions::users::GetFullUser { id: peer.into() })
+                .await
+                .map_err(map_err)?;
+            Ok(types::peer_info_from_user_full(&r, chat))
+        } else if chat > -crate::model::CHANNEL_OFFSET {
+            let r = api
+                .client
+                .invoke(&tl::functions::messages::GetFullChat { chat_id: -chat })
+                .await
+                .map_err(map_err)?;
+            Ok(types::peer_info_from_chat_full(&r, chat))
+        } else {
+            let r = api
+                .client
+                .invoke(&tl::functions::channels::GetFullChannel {
+                    channel: peer.into(),
+                })
+                .await
+                .map_err(map_err)?;
+            Ok(types::peer_info_from_chat_full(&r, chat))
+        }
+    }
+
+    async fn set_muted(&self, chat: ChatId, muted: bool) -> Result<()> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        api.client
+            .invoke(&tl::functions::account::UpdateNotifySettings {
+                peer: tl::enums::InputNotifyPeer::Peer(tl::types::InputNotifyPeer {
+                    peer: peer.into(),
+                }),
+                settings: tl::enums::InputPeerNotifySettings::Settings(
+                    tl::types::InputPeerNotifySettings {
+                        show_previews: None,
+                        silent: None,
+                        // "Forever" is the largest timestamp, like the
+                        // official clients; 0 lifts the mute.
+                        mute_until: Some(if muted { i32::MAX } else { 0 }),
+                        sound: None,
+                        stories_muted: None,
+                        stories_hide_sender: None,
+                        stories_sound: None,
+                    },
+                ),
+            })
+            .await
+            .map(drop)
+            .map_err(map_err)
+    }
+
+    async fn shared_media(
+        &self,
+        chat: ChatId,
+        kind: crate::model::SharedKind,
+        offset_id: MessageId,
+        limit: usize,
+    ) -> Result<crate::model::SharedPage> {
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        let mut iter = api
+            .client
+            .search_messages(peer)
+            .filter(types::shared_filter(kind))
+            .limit(limit);
+        if offset_id > 0 {
+            iter = iter.offset_id(offset_id);
+        }
+        let mut raws = Vec::with_capacity(limit);
+        while let Some(m) = iter.next().await.map_err(map_err)? {
+            if kind.has_thumbs()
+                && let Some(size) = m.media().and_then(|media| thumb_size(&media))
+            {
+                api.remember_thumb((chat, m.id()), size);
+            }
+            raws.push(m.raw.clone());
+        }
+        Ok(types::shared_page_from_tl(&raws, kind, limit))
+    }
+
+    async fn download_thumb(&self, chat: ChatId, id: MessageId) -> Result<Vec<u8>> {
+        let api = &self.0;
+        let size = match api.thumb_for((chat, id)) {
+            Some(s) => s,
+            None => {
+                // Not listed by a shared-media page (cache evicted): look the
+                // message up.
+                let peer = api.peer_ref(chat).await?;
+                let msg = api
+                    .client
+                    .get_messages_by_id(peer, &[id])
+                    .await
+                    .map_err(map_err)?
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .ok_or_else(|| Error::Protocol("message not found".into()))?;
+                msg.media()
+                    .and_then(|m| thumb_size(&m))
+                    .ok_or_else(|| Error::Protocol("no preview".into()))?
+            }
+        };
+        use grammers_client::media::PhotoSize;
+        if let PhotoSize::Cached(c) = &size {
+            return Ok(c.bytes.clone());
+        }
+        let mut dl = api.client.iter_download(&size);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = dl.next().await.map_err(map_err)? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > super::MAX_THUMB_BYTES {
+                return Err(Error::Protocol("thumbnail too large".into()));
+            }
+        }
+        Ok(bytes)
+    }
+
+    async fn dialog_filters(&self) -> Result<Vec<Folder>> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let raw = api
+            .client
+            .invoke(&tl::functions::messages::GetDialogFilters {})
+            .await
+            .map_err(map_err)?;
+        let (folders, peers) = types::folders_from_tl(&raw, api.self_id.load(Ordering::Acquire));
+        api.remember_folder_peers(peers);
+        Ok(folders)
+    }
+
+    async fn save_dialog_filter(&self, folder: Folder) -> Result<()> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let filter = types::folder_to_tl(&folder, api.self_id.load(Ordering::Acquire), &|c| {
+            api.resolve_input_peer(c)
+        })
+        .map_err(|_| Error::Protocol("unknown peer".into()))?;
+        api.client
+            .invoke(&tl::functions::messages::UpdateDialogFilter {
+                id: folder.id,
+                filter: Some(filter),
+            })
+            .await
+            .map(drop)
+            .map_err(map_err)
+    }
+
+    async fn delete_dialog_filter(&self, id: i32) -> Result<()> {
+        use grammers_client::tl;
+        self.0
+            .client
+            .invoke(&tl::functions::messages::UpdateDialogFilter { id, filter: None })
+            .await
+            .map(drop)
+            .map_err(map_err)
+    }
+
+    async fn reorder_dialog_filters(&self, order: Vec<i32>) -> Result<()> {
+        use grammers_client::tl;
+        self.0
+            .client
+            .invoke(&tl::functions::messages::UpdateDialogFiltersOrder { order })
+            .await
+            .map(drop)
+            .map_err(map_err)
     }
 
     fn take_notice(&self) -> Option<String> {
