@@ -156,6 +156,21 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
     }
 
+    // Like the official client, normal users never see API credentials; the
+    // override lives behind this small link on the phone screen.
+    let advanced: Element<'_, Message> = if matches!(app.auth, AuthState::Phone { .. }) {
+        button(
+            text("Advanced: use your own API credentials")
+                .size(m.font_xs)
+                .color(p.text_muted),
+        )
+        .on_press(Message::Ui(Ui::OpenApiSetup))
+        .style(theme::link_button(p))
+        .into()
+    } else {
+        Space::new().height(0).into()
+    };
+
     let footer = text("Unofficial client · not affiliated with Telegram")
         .size(m.font_xs)
         .color(p.text_muted);
@@ -165,6 +180,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
             Space::new().height(Length::Fill),
             form,
             Space::new().height(Length::Fill),
+            advanced,
+            Space::new().height(6),
             footer,
             Space::new().height(16),
         ]
@@ -196,7 +213,11 @@ fn setup_view<'a>(app: &'a App, form: &'a crate::app::SetupForm) -> Element<'a, 
             .font(FONT_SEMIBOLD)
             .color(p.text_primary),
         Space::new().height(8),
-        text("Create an app at my.telegram.org → API development tools,\nthen paste its api_id and api_hash. The hash is kept in your keyring.")
+        text(if form.advanced {
+            "Optional — Ferrogram works without this. Use it only if you registered your own app at my.telegram.org. The hash is kept in your system keyring."
+        } else {
+            "This development build has no built-in API credentials. Official release builds don't need this step. Create an app at my.telegram.org → API development tools and paste its api_id and api_hash."
+        })
             .size(m.font_m)
             .color(p.text_secondary)
             .align_x(Alignment::Center),
@@ -226,6 +247,8 @@ fn setup_view<'a>(app: &'a App, form: &'a crate::app::SetupForm) -> Element<'a, 
         .padding([12, 0])
         .on_press_maybe((!form.busy).then_some(Message::Ui(Ui::SetupSubmit)))
         .style(theme::primary_button(p)),
+        Space::new().height(14),
+        setup_links(app, form),
     ]
     .align_x(Alignment::Center)
     .width(380);
@@ -233,4 +256,25 @@ fn setup_view<'a>(app: &'a App, form: &'a crate::app::SetupForm) -> Element<'a, 
         .center(Length::Fill)
         .style(theme::fill(p.bg_sidebar))
         .into()
+}
+
+fn setup_links<'a>(app: &'a App, form: &'a crate::app::SetupForm) -> Element<'a, Message> {
+    let p = app.theme.palette;
+    let m = app.theme.metrics;
+    let mut r = iced::widget::row![].spacing(18);
+    if form.advanced {
+        r = r.push(
+            button(text("Cancel").size(m.font_s))
+                .on_press(Message::Ui(Ui::CancelSetup))
+                .style(theme::link_button(p)),
+        );
+        if form.has_builtin {
+            r = r.push(
+                button(text("Use built-in credentials").size(m.font_s))
+                    .on_press_maybe((!form.busy).then_some(Message::Ui(Ui::UseBuiltinCredentials)))
+                    .style(theme::link_button(p)),
+            );
+        }
+    }
+    r.into()
 }

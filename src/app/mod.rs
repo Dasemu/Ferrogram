@@ -53,6 +53,21 @@ pub struct SetupForm {
     pub api_hash: crate::auth::SecretInput,
     pub error: Option<String>,
     pub busy: bool,
+    /// Opened by the user ("Advanced") rather than forced by missing
+    /// credentials; such a form can be cancelled.
+    pub advanced: bool,
+    /// This build has Ferrogram's own credentials embedded.
+    pub has_builtin: bool,
+}
+
+impl SetupForm {
+    pub fn new(advanced: bool) -> Self {
+        Self {
+            advanced,
+            has_builtin: crate::config::embedded_credentials().is_some(),
+            ..Self::default()
+        }
+    }
 }
 
 /// A file waiting for the user to confirm sending (picker or drag & drop).
@@ -147,7 +162,7 @@ impl App {
 
         // First frame comes from the cache, never from the network.
         let cached = store.load_chats().unwrap_or_default();
-        let app = Self {
+        let mut app = Self {
             iced_theme: theme.iced(),
             theme,
             api: None,
@@ -196,6 +211,7 @@ impl App {
                     ScreenshotTarget::LoginPhone
                         | ScreenshotTarget::LoginCode
                         | ScreenshotTarget::LoginPassword
+                        | ScreenshotTarget::ApiSetup
                 )
             ) && std::env::var("FERROGRAM_MOCK_LOGGED_OUT").is_err();
             let fake = FakeTelegram::new(FakeOptions {
@@ -208,6 +224,10 @@ impl App {
                 }),
             });
             Task::done(Message::Done(Done::ApiReady(Ok(ApiHandle(fake)))))
+        } else if app.config.api_setup {
+            // `--api-setup`: ask for the user's own credentials first.
+            app.setup = Some(SetupForm::new(true));
+            Task::none()
         } else {
             app.start_real_api()
         };
@@ -550,10 +570,10 @@ impl App {
                 let Some(f) = &mut self.setup else {
                     return Task::none();
                 };
-                let hash = f.api_hash.0.trim().to_owned();
-                let (Ok(api_id), true) = (
-                    f.api_id.parse::<i32>(),
-                    hash.len() >= 16 && hash.chars().all(|c| c.is_ascii_alphanumeric()),
+                let hash = f.api_hash.0.trim().to_ascii_lowercase();
+                let (Some(api_id), true) = (
+                    f.api_id.parse::<i32>().ok().filter(|n| *n > 0),
+                    crate::config::valid_api_hash(&hash),
                 ) else {
                     f.error =
                         Some("Enter the numeric api_id and the 32-character api_hash.".into());
@@ -567,6 +587,40 @@ impl App {
                     async move {
                         tokio::task::spawn_blocking(move || {
                             config.save_api_credentials(secrets.as_ref(), api_id, &hash)
+                        })
+                        .await
+                        .map_err(|_| Error::Cancelled)?
+                    },
+                    |r| Message::Done(Done::CredentialsSaved(r)),
+                )
+            }
+            Ui::OpenApiSetup => {
+                if !self.auth.is_signed_in() {
+                    self.setup = Some(SetupForm::new(true));
+                    return operation::focus(Id::new(AUTH_INPUT_ID));
+                }
+                Task::none()
+            }
+            Ui::CancelSetup => {
+                if self.setup.as_ref().is_some_and(|f| f.advanced) {
+                    self.setup = None;
+                    if self.api.is_none() && !self.config.mock {
+                        return self.start_real_api();
+                    }
+                }
+                Task::none()
+            }
+            Ui::UseBuiltinCredentials => {
+                let Some(f) = &mut self.setup else {
+                    return Task::none();
+                };
+                f.busy = true;
+                let config = self.config.clone();
+                let secrets = self.secrets.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            config.clear_api_override(secrets.as_ref())
                         })
                         .await
                         .map_err(|_| Error::Cancelled)?
@@ -880,6 +934,9 @@ impl App {
             }
             Ui::Escape => {
                 // Close the top-most layer only, like the official client.
+                if self.setup.as_ref().is_some_and(|f| f.advanced) {
+                    return self.update_ui(Ui::CancelSetup);
+                }
                 let closed = std::mem::take(&mut self.main_menu)
                     || self.viewer.take().is_some()
                     || self.menu_for.take().is_some()
@@ -1128,7 +1185,9 @@ impl App {
             Done::ApiReady(Ok(api)) => {
                 self.api = Some(api.clone());
                 self.api_gen += 1;
-                self.setup = None;
+                if !self.setup.as_ref().is_some_and(|f| f.advanced) {
+                    self.setup = None;
+                }
                 let notice = api.take_notice().map_or_else(Task::none, |n| self.toast(n));
                 let restore = Task::perform(async move { api.restore().await }, |r| {
                     Message::Done(Done::Restored(r))
@@ -1136,8 +1195,9 @@ impl App {
                 Task::batch([notice, restore])
             }
             Done::ApiReady(Err(Error::Auth(AuthError::MissingApiCredentials))) => {
+                // Only development builds without embedded credentials get here.
                 self.conn = ConnState::Disconnected;
-                self.setup = Some(SetupForm::default());
+                self.setup = Some(SetupForm::new(false));
                 Task::none()
             }
             Done::ApiReady(Err(e)) => {
@@ -1147,6 +1207,24 @@ impl App {
             }
             Done::CredentialsSaved(Ok(())) => {
                 self.setup = None;
+                if self.config.mock {
+                    return Task::none();
+                }
+                // Different app credentials: shut the old client down (this
+                // also clears its unauthorised session) and start a new one.
+                let old = self.api.take();
+                Task::perform(
+                    async move {
+                        if let Some(api) = old {
+                            let _ = api.log_out().await;
+                        }
+                    },
+                    |_| Message::Done(Done::RestartApi),
+                )
+            }
+            Done::RestartApi => {
+                self.reset_session();
+                self.auth = AuthState::Restoring;
                 self.start_real_api()
             }
             Done::CredentialsSaved(Err(e)) => {

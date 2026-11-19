@@ -28,6 +28,10 @@ pub fn script(config: &Config) -> Task<Message> {
         return Task::none();
     };
     let steps: Vec<(u64, Message)> = match target {
+        ScreenshotTarget::ApiSetup => vec![
+            (300, ui(Ui::OpenApiSetup)),
+            (350, ui(Ui::SetupApiId("123456".into()))),
+        ],
         ScreenshotTarget::LoginPhone => vec![(300, ui(Ui::AuthInput("+34 600 123 412".into())))],
         ScreenshotTarget::LoginCode => vec![
             (300, ui(Ui::AuthInput("+34 600 123 412".into()))),

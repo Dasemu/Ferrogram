@@ -22,6 +22,11 @@ pub enum Ui {
     SetupApiId(String),
     SetupApiHash(SecretInput),
     SetupSubmit,
+    /// "Advanced: use your own API credentials" on the login screen.
+    OpenApiSetup,
+    CancelSetup,
+    /// Remove the user override and use the built-in credentials.
+    UseBuiltinCredentials,
     // login
     AuthInput(SecretInput),
     AuthSubmit,
@@ -73,6 +78,8 @@ pub enum Done {
     /// Retry `restore()` after a network failure (backoff elapsed).
     RetryRestore,
     CredentialsSaved(Result<(), Error>),
+    /// The old client was shut down; start a new one with fresh credentials.
+    RestartApi,
     CodeRequested(Result<(), Error>),
     SignIn(Result<SignInOutcome, Error>),
     Persisted(Result<(), Error>),
