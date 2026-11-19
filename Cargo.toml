@@ -28,6 +28,7 @@ futures = "0.3"
 async-trait = "0.1"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+open = "5"
 
 [dev-dependencies]
 tempfile = "3"

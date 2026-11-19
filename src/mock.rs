@@ -17,7 +17,8 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::auth::SignInOutcome;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
-    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Media, Message, MessageId, Reaction, User,
+    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Media, Message, MessageId, Presence, Reaction,
+    TypingAction, User,
 };
 use crate::net::{Event, EventHub, TelegramApi, UploadKind};
 
@@ -413,6 +414,18 @@ fn chats_and_history() -> (Vec<Chat>, BTreeMap<ChatId, Vec<Message>>) {
             "Next book: The Left Hand of Darkness",
         )],
     );
+    // A few chats have profile photos, like a real account; the rest keep
+    // their initials. Alice is online, the bot is a bot.
+    for c in &mut chats {
+        if [ALICE, RUST_GROUP, DEV_CHANNEL, -303].contains(&c.id) {
+            c.photo_id = Some(7_000 + c.id.rem_euclid(1000));
+        }
+        if c.id == ALICE {
+            c.presence = Presence::Online {
+                until: MOCK_NOW + 5 * MIN,
+            };
+        }
+    }
     if let Some(v) = hist.get_mut(&-303)
         && let Some(m) = v.last_mut()
     {
@@ -554,7 +567,12 @@ impl FakeTelegram {
             if chat == ECHO_BOT
                 && let Ok(echo_id) = echo_id
             {
-                tokio::time::sleep(Duration::from_millis(600)).await;
+                tx.emit(Event::Typing {
+                    chat: ECHO_BOT,
+                    user: ECHO_BOT,
+                    action: Some(TypingAction::Typing),
+                });
+                tokio::time::sleep(Duration::from_millis(1200)).await;
                 let now = chrono::Utc::now().timestamp();
                 let reply = if text.is_empty() {
                     "Nice file!".to_owned()
@@ -793,6 +811,20 @@ impl TelegramApi for FakeTelegram {
         Ok(mock_photo_png(i64::from(id), 640, 427))
     }
 
+    async fn download_avatar(&self, _chat: ChatId, photo_id: i64) -> Result<Vec<u8>> {
+        self.call("download_avatar").await?;
+        mock_avatar_png(photo_id, 160)
+    }
+
+    async fn set_typing(&self, _chat: ChatId, active: bool) -> Result<()> {
+        self.call(if active {
+            "set_typing:on"
+        } else {
+            "set_typing:off"
+        })
+        .await
+    }
+
     async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()> {
         self.call("download_media").await?;
         let media = self
@@ -843,6 +875,29 @@ pub fn mock_photo_png(seed: i64, w: u32, h: u32) -> Vec<u8> {
         }
     }
     encode_png(w, h, &rgba).unwrap_or_default()
+}
+
+/// A flat-coloured avatar with a lighter diagonal band, standing in for a
+/// downloaded profile photo (no image assets are shipped).
+pub fn mock_avatar_png(seed: i64, size: u32) -> Result<Vec<u8>> {
+    const PALETTE: [(u8, u8, u8); 5] = [
+        (0xE1, 0x70, 0x76),
+        (0x65, 0xAA, 0xDD),
+        (0xA6, 0x95, 0xE7),
+        (0x7B, 0xC8, 0x62),
+        (0xEE, 0xA2, 0x74),
+    ];
+    let (r, g, b) = PALETTE[seed.rem_euclid(5) as usize];
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let band = (x + y) % 64 < 16;
+            let k = if band { 1.25 } else { 1.0 };
+            let f = |c: u8| (f32::from(c) * k).min(255.0) as u8;
+            rgba.extend_from_slice(&[f(r), f(g), f(b), 255]);
+        }
+    }
+    encode_png(size, size, &rgba)
 }
 
 /// Encode RGBA8 as PNG.

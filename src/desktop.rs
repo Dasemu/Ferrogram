@@ -211,3 +211,18 @@ mod tests {
         assert_eq!(coalesce(&mixed).unwrap().1, "3 new messages in 2 chats");
     }
 }
+
+/// Open a downloaded file with the system's default handler (`xdg-open`,
+/// `open`, `ShellExecute`) through the `open` crate: the path is passed as a
+/// single argument, never through a shell. Refuses save-only (executable)
+/// names even if a caller forgot to check.
+pub fn open_file(path: &std::path::Path) -> crate::error::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if crate::media::is_save_only(&name) {
+        return Err(crate::error::Error::Protocol("save-only file type".into()));
+    }
+    open::that_detached(path).map_err(|e| crate::error::Error::Io(format!("open: {}", e.kind())))
+}

@@ -5,7 +5,7 @@ pub mod message;
 pub mod screenshot;
 pub mod state;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,7 +16,9 @@ use iced::{Subscription, Task, Theme, event, keyboard, window};
 use tracing::{info, warn};
 
 pub use message::{Done, Message, Ui};
-use state::{ChatList, ComposeMode, Conversation, Lru, PAGE};
+use state::{
+    ChatList, ComposeMode, Conversation, Lru, PAGE, TypingStep, TypingThrottle, TypingTracker,
+};
 
 use crate::auth::secrets::{KeyringStore, MemoryStore, SecretStore};
 use crate::auth::vault::Vault;
@@ -27,6 +29,7 @@ use crate::mock::{FakeOptions, FakeTelegram, MOCK_NOW};
 use crate::model::{ChatId, ConnState, Media, Message as ChatMessage, MessageId, SendState, User};
 use crate::net::{ApiHandle, Event, UploadKind, backoff};
 use crate::store::Store;
+use crate::store::avatars::AvatarDisk;
 use crate::ui::theme::FerroTheme;
 
 pub const HISTORY_ID: &str = "history";
@@ -37,6 +40,14 @@ pub const CHAT_SEARCH_ID: &str = "chat-search";
 pub const IMAGE_BUDGET: usize = 48 * 1024 * 1024;
 /// Photos fetched per open conversation (newest first).
 pub const PHOTO_PREFETCH: usize = 20;
+/// Decoded-size budget for profile photos (≈100 of them at 160 px).
+pub const AVATAR_BUDGET: usize = 10 * 1024 * 1024;
+/// Assumed decoded size of one avatar (160 × 160 × 4 bytes).
+const AVATAR_COST: usize = 160 * 160 * 4;
+/// Chats (from the top of the list) whose avatars are fetched eagerly.
+pub const AVATAR_PREFETCH: usize = 80;
+/// Avatar downloads in flight at once.
+pub const AVATAR_CONCURRENCY: usize = 6;
 
 #[derive(Debug, Clone, Default)]
 pub struct ChatSearch {
@@ -110,6 +121,17 @@ pub struct App {
     pub at_bottom: bool,
     pub photos: Lru<(ChatId, MessageId), image::Handle>,
     pub photo_loading: HashSet<(ChatId, MessageId)>,
+    /// Profile photos by chat id, with the photo id they were made from.
+    pub avatars: Lru<ChatId, (i64, image::Handle)>,
+    pub avatar_loading: HashSet<(ChatId, i64)>,
+    /// Photos that failed to download or decode this session (not retried).
+    pub avatar_failed: HashSet<(ChatId, i64)>,
+    /// `None` in mock mode (no disk writes).
+    pub avatar_disk: Option<AvatarDisk>,
+    /// Sender names seen in messages, for "Ana is typing…" (bounded).
+    pub user_names: HashMap<i64, String>,
+    pub typing: TypingTracker,
+    pub typing_throttle: TypingThrottle,
     pub viewer: Option<(ChatId, MessageId)>,
     pub toast: Option<String>,
     pub main_menu: bool,
@@ -190,6 +212,13 @@ impl App {
             at_bottom: true,
             photos: Lru::new(IMAGE_BUDGET),
             photo_loading: HashSet::new(),
+            avatars: Lru::new(AVATAR_BUDGET),
+            avatar_loading: HashSet::new(),
+            avatar_failed: HashSet::new(),
+            avatar_disk: (!config.mock).then(|| AvatarDisk::new(config.avatar_dir())),
+            user_names: HashMap::new(),
+            typing: TypingTracker::default(),
+            typing_throttle: TypingThrottle::default(),
             viewer: None,
             toast: None,
             main_menu: false,
@@ -232,7 +261,9 @@ impl App {
             app.start_real_api()
         };
         let script = screenshot::script(&app.config);
-        (app, Task::batch([task, script]))
+        // Cached avatars from disk are on screen with the first frame.
+        let avatars = app.fetch_avatars();
+        (app, Task::batch([task, script, avatars]))
     }
 
     /// Build a brand-new grammers client (boot, and after logout/revoke so
@@ -295,6 +326,11 @@ impl App {
                 EventsSource(api.clone(), self.api_gen),
                 events_stream,
             ));
+        }
+        if !self.typing.is_empty() {
+            subs.push(
+                iced::time::every(Duration::from_secs(1)).map(|_| Message::Ui(Ui::TypingTick)),
+            );
         }
         if !self.config.mock {
             subs.push(iced::time::every(Duration::from_secs(30)).map(|_| Message::Ui(Ui::Tick)));
@@ -429,6 +465,12 @@ impl App {
         if self.selected == Some(chat) && self.conversation.is_some() {
             return Task::none();
         }
+        let stop_typing = match self.typing_throttle.reset() {
+            Some(old) => {
+                self.api_call(move |api| Box::pin(async move { api.set_typing(old, false).await }))
+            }
+            None => Task::none(),
+        };
         self.selected = Some(chat);
         self.conversation = Some(Conversation::new(chat));
         self.compose_mode = ComposeMode::Normal;
@@ -461,6 +503,8 @@ impl App {
             net,
             read,
             unread,
+            stop_typing,
+            self.fetch_avatars(),
             operation::focus(Id::new(COMPOSER_ID)),
         ])
     }
@@ -542,6 +586,128 @@ impl App {
             ));
         }
         Task::batch(tasks)
+    }
+
+    /// The profile photo to draw for `chat`, if it is loaded and current.
+    pub fn avatar(&self, chat: ChatId) -> Option<&image::Handle> {
+        let pid = self.chats.get(chat)?.photo_id?;
+        self.avatars
+            .peek(&chat)
+            .filter(|(p, _)| *p == pid)
+            .map(|(_, h)| h)
+    }
+
+    /// Start loading missing profile photos for the top of the chat list
+    /// (and the open chat): disk cache first, then the network, at most
+    /// [`AVATAR_CONCURRENCY`] at a time. Works offline from the disk cache.
+    pub fn fetch_avatars(&mut self) -> Task<Message> {
+        let api = self.api.clone();
+        let wanted: Vec<(ChatId, i64)> = self
+            .chats
+            .all()
+            .iter()
+            .take(AVATAR_PREFETCH)
+            .chain(self.selected.and_then(|id| self.chats.get(id)))
+            .filter_map(|c| c.photo_id.map(|p| (c.id, p)))
+            .collect();
+        let mut tasks = Vec::new();
+        for key in wanted {
+            if self.avatar_loading.len() >= AVATAR_CONCURRENCY {
+                break;
+            }
+            let have = self.avatars.peek(&key.0).is_some_and(|(p, _)| *p == key.1);
+            if have || self.avatar_failed.contains(&key) || !self.avatar_loading.insert(key) {
+                continue;
+            }
+            let (api, disk) = (api.clone(), self.avatar_disk.clone());
+            tasks.push(Task::perform(
+                async move { load_avatar(api, disk, key).await },
+                move |result| {
+                    Message::Done(Done::Avatar {
+                        chat: key.0,
+                        photo_id: key.1,
+                        result,
+                    })
+                },
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Delete cached avatars and opened files (logout / revoked session).
+    fn wipe_media_caches(&self) -> Task<Message> {
+        let disk = self.avatar_disk.clone();
+        let open_dir = (!self.config.mock).then(|| self.config.open_dir());
+        Task::perform(
+            async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(d) = disk {
+                        d.clear();
+                    }
+                    if let Some(d) = open_dir {
+                        let _ = std::fs::remove_dir_all(d);
+                    }
+                })
+                .await;
+            },
+            |()| Message::Done(Done::Call(Ok(()))),
+        )
+    }
+
+    fn now_ms() -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    /// Text for "typing…" in `chat`, if anybody is doing something there.
+    pub fn typing_status(&self, chat: ChatId) -> Option<String> {
+        let actions = self.typing.in_chat(chat);
+        if actions.is_empty() {
+            return None;
+        }
+        let private = chat > 0;
+        let conv = self.conversation.as_ref().filter(|c| c.chat_id == chat);
+        state::typing_text(&actions, private, |u| {
+            self.user_names
+                .get(&u)
+                .cloned()
+                .or_else(|| self.chats.user_name(u, conv))
+        })
+    }
+
+    /// Remember who sent what, so typing statuses can show names.
+    fn remember_names<'a>(&mut self, msgs: impl IntoIterator<Item = &'a ChatMessage>) {
+        const MAX_NAMES: usize = 2_000;
+        for m in msgs {
+            if let (Some(id), Some(name)) = (m.sender_id, &m.sender_name) {
+                if self.user_names.len() >= MAX_NAMES && !self.user_names.contains_key(&id) {
+                    self.user_names.clear();
+                }
+                self.user_names.insert(id, name.clone());
+            }
+        }
+    }
+
+    /// Our own typing action after the composer changed.
+    fn update_typing(&mut self) -> Task<Message> {
+        let Some(chat) = self.selected else {
+            return Task::none();
+        };
+        let has_text = !self.composer.trim().is_empty();
+        let allowed = self.api.is_some()
+            && !matches!(self.compose_mode, ComposeMode::Edit(_))
+            && state::can_send_typing(self.chats.get(chat));
+        match self
+            .typing_throttle
+            .on_input(chat, Self::now_ms(), has_text, allowed)
+        {
+            TypingStep::Nothing => Task::none(),
+            TypingStep::Send => {
+                self.api_call(move |api| Box::pin(async move { api.set_typing(chat, true).await }))
+            }
+            TypingStep::Cancel(c) => {
+                self.api_call(move |api| Box::pin(async move { api.set_typing(c, false).await }))
+            }
+        }
     }
 
     fn toast(&mut self, text: String) -> Task<Message> {
@@ -688,7 +854,7 @@ impl App {
             }
             Ui::ComposerChanged(s) => {
                 self.composer = s;
-                Task::none()
+                self.update_typing()
             }
             Ui::Send => {
                 if self.pending_file.is_some() {
@@ -909,15 +1075,19 @@ impl App {
                 self.main_menu = false;
                 let api = self.api.clone();
                 let store = self.store.clone();
-                Task::perform(
-                    async move {
-                        if let Some(api) = api {
-                            let _ = api.log_out().await;
-                        }
-                        let _ = store.call(|s| s.clear()).await;
-                    },
-                    |_| Message::Done(Done::LoggedOut),
-                )
+                let media = self.wipe_media_caches();
+                Task::batch([
+                    media,
+                    Task::perform(
+                        async move {
+                            if let Some(api) = api {
+                                let _ = api.log_out().await;
+                            }
+                            let _ = store.call(|s| s.clear()).await;
+                        },
+                        |_| Message::Done(Done::LoggedOut),
+                    ),
+                ])
             }
             Ui::Focus(f) => {
                 self.focused = f;
@@ -954,6 +1124,11 @@ impl App {
                     Task::none()
                 }
             }
+            Ui::TypingTick => {
+                self.typing.expire(Self::now_ms());
+                Task::none()
+            }
+            Ui::OpenFile(chat, id) => self.open_file(chat, id),
             Ui::Tick => {
                 if !self.first_frame_logged {
                     self.first_frame_logged = true;
@@ -978,6 +1153,7 @@ impl App {
             return Task::none();
         }
         self.composer.clear();
+        self.typing_throttle.reset();
         self.emoji_open = false;
         let mode = std::mem::replace(&mut self.compose_mode, ComposeMode::Normal);
         if let ComposeMode::Edit(id) = mode {
@@ -1028,6 +1204,7 @@ impl App {
             return Task::none();
         };
         let caption = std::mem::take(&mut self.composer);
+        self.typing_throttle.reset();
         let reply_to = match std::mem::replace(&mut self.compose_mode, ComposeMode::Normal) {
             ComposeMode::Reply(id) => Some(id),
             _ => None,
@@ -1053,6 +1230,58 @@ impl App {
         )
     }
 
+    /// Click on a file: download it into the private open-cache and hand it
+    /// to the system handler. Executable types are save-only.
+    fn open_file(&mut self, chat: ChatId, id: MessageId) -> Task<Message> {
+        self.menu_for = None;
+        let Some((name, size)) = self
+            .conversation
+            .as_ref()
+            .and_then(|c| c.get(id))
+            .and_then(|m| match &m.media {
+                Some(Media::File { name, size, .. }) => Some((name.clone(), *size)),
+                _ => None,
+            })
+        else {
+            return Task::none();
+        };
+        if id <= 0 {
+            return Task::none();
+        }
+        if crate::media::is_save_only(&name) {
+            let t = self.toast(
+                "For your safety this file type is not opened automatically. Choose where to save it."
+                    .into(),
+            );
+            return Task::batch([t, self.update_ui(Ui::SaveMedia(chat, id))]);
+        }
+        if size > crate::media::MAX_OPEN_BYTES {
+            return self.toast("This file is too large to open directly. Use “Save as…”.".into());
+        }
+        let Some(api) = self.api.clone() else {
+            return Task::none();
+        };
+        let path = crate::media::open_path(&self.config.open_dir(), chat, id, &name);
+        Task::perform(
+            async move {
+                if let Some(dir) = path.parent() {
+                    let d = dir.to_path_buf();
+                    tokio::task::spawn_blocking(move || crate::config::ensure_private_dir(&d))
+                        .await
+                        .map_err(|_| Error::Cancelled)??;
+                }
+                // Reuse an earlier download of the same message.
+                if tokio::fs::metadata(&path).await.is_ok_and(|m| m.len() > 0) {
+                    return Ok(path);
+                }
+                api.download_media(chat, id, path.clone()).await?;
+                crate::media::make_non_executable(&path);
+                Ok(path)
+            },
+            |r| Message::Done(Done::FileReady(r)),
+        )
+    }
+
     fn now_ts(&self) -> i64 {
         if self.config.mock && self.config.screenshot.is_some() {
             self.now
@@ -1073,6 +1302,8 @@ impl App {
             }
             Event::SessionRevoked => return self.session_revoked(),
             Event::NewMessage(m) => {
+                self.typing.message_from(m.chat_id, m.sender_id);
+                self.remember_names(std::iter::once(m));
                 if self.config.notifications
                     && state::should_notify(
                         self.chats.get(m.chat_id),
@@ -1120,7 +1351,12 @@ impl App {
                 let (chat, max_id) = (*chat, *max_id);
                 tasks.push(self.store_bg(move |s| s.set_read_outbox(chat, max_id)));
             }
-            Event::ReadInbox { .. } => {}
+            Event::Typing { chat, user, action } => {
+                if Some(*user) != self.me.as_ref().map(|u| u.id) {
+                    self.typing.apply(*chat, *user, *action, Self::now_ms());
+                }
+            }
+            Event::ReadInbox { .. } | Event::UserStatus { .. } => {}
         }
         self.chats.apply_event(&ev, open);
         if let Some(conv) = &mut self.conversation {
@@ -1148,9 +1384,10 @@ impl App {
             },
             |r| Message::Done(Done::Call(r)),
         );
+        let media = self.wipe_media_caches();
         self.reset_session();
         crate::auth::reduce(&mut self.auth, AuthEvent::LoggedOut);
-        Task::batch([wipe, self.rebuild_api()])
+        Task::batch([wipe, media, self.rebuild_api()])
     }
 
     /// Replace the client after logout/revoke so nothing from the old
@@ -1178,6 +1415,11 @@ impl App {
         self.sidebar_messages.clear();
         self.photos = Lru::new(IMAGE_BUDGET);
         self.photo_loading.clear();
+        self.avatars = Lru::new(AVATAR_BUDGET);
+        self.avatar_loading.clear();
+        self.avatar_failed.clear();
+        self.typing.clear();
+        self.typing_throttle.reset();
     }
 
     fn on_done(&mut self, done: Done) -> Task<Message> {
@@ -1310,8 +1552,12 @@ impl App {
             },
             Done::Dialogs(Ok(chats)) => {
                 let to_store = chats.clone();
+                self.remember_names(chats.iter().filter_map(|c| c.last_message.as_ref()));
                 self.chats.replace(chats);
-                self.store_bg(move |s| s.replace_chats(&to_store).map(|_| ()))
+                Task::batch([
+                    self.store_bg(move |s| s.replace_chats(&to_store).map(|_| ())),
+                    self.fetch_avatars(),
+                ])
             }
             Done::Dialogs(Err(e)) => self.on_error(e),
             Done::CacheHistory {
@@ -1320,6 +1566,9 @@ impl App {
                 complete,
                 result,
             } => {
+                if let Ok(page) = &result {
+                    self.remember_names(page);
+                }
                 let Some(conv) = self.conversation.as_mut().filter(|c| c.chat_id == chat) else {
                     return Task::none();
                 };
@@ -1474,6 +1723,47 @@ impl App {
                 }
                 Task::none()
             }
+            Done::Avatar {
+                chat,
+                photo_id,
+                result,
+            } => {
+                let key = (chat, photo_id);
+                self.avatar_loading.remove(&key);
+                match result {
+                    Ok(bytes) => {
+                        let size = state::image_dimensions(&bytes)
+                            .map_or(AVATAR_COST, |(w, h)| (w as usize) * (h as usize) * 4);
+                        self.avatars.insert(
+                            chat,
+                            (photo_id, image::Handle::from_bytes(bytes)),
+                            size,
+                        );
+                    }
+                    // Not available right now (offline, disk miss): the next
+                    // trigger (chat list refresh, opening a chat) retries.
+                    Err(Error::Cancelled) => return Task::none(),
+                    Err(e) => {
+                        warn!(error = %e, "avatar unavailable");
+                        self.avatar_failed.insert(key);
+                    }
+                }
+                self.fetch_avatars()
+            }
+            Done::FileReady(Ok(path)) => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || crate::desktop::open_file(&path))
+                        .await
+                        .map_err(|_| Error::Cancelled)?
+                },
+                |r| Message::Done(Done::FileOpened(r)),
+            ),
+            Done::FileReady(Err(e)) => self.on_error(e),
+            Done::FileOpened(Ok(())) => Task::none(),
+            Done::FileOpened(Err(e)) => {
+                warn!(error = %e, "could not open file");
+                self.toast("No application could open this file. Use “Save as…”.".into())
+            }
             Done::LoggedOut => {
                 self.reset_session();
                 self.auth = AuthState::Phone {
@@ -1498,6 +1788,33 @@ impl App {
         warn!(error = %e, "operation failed");
         self.toast(e.user_message())
     }
+}
+
+/// Disk cache first, then the network. Always validates the bytes before
+/// they reach the image decoder. `Err(Cancelled)` means "not now".
+pub async fn load_avatar(
+    api: Option<ApiHandle>,
+    disk: Option<AvatarDisk>,
+    (chat, photo_id): (ChatId, i64),
+) -> Result<Vec<u8>, Error> {
+    if let Some(d) = disk.clone() {
+        let cached = tokio::task::spawn_blocking(move || d.read(chat, photo_id))
+            .await
+            .map_err(|_| Error::Cancelled)?;
+        if let Some(bytes) = cached.filter(|b| state::avatar_is_acceptable(b)) {
+            return Ok(bytes);
+        }
+    }
+    let api = api.ok_or(Error::Cancelled)?;
+    let bytes = api.download_avatar(chat, photo_id).await?;
+    if !state::avatar_is_acceptable(&bytes) {
+        return Err(Error::Protocol("avatar rejected".into()));
+    }
+    if let Some(d) = disk {
+        let b = bytes.clone();
+        let _ = tokio::task::spawn_blocking(move || d.write(chat, photo_id, &b)).await;
+    }
+    Ok(bytes)
 }
 
 fn open_memory_store() -> Store {

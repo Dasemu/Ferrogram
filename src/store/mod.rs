@@ -13,9 +13,12 @@ use crate::model::{
     CHANNEL_OFFSET, Chat, ChatId, ChatKind, Media, Message, MessageId, Reaction, SendState,
 };
 
+pub mod avatars;
+
 const MIGRATIONS: &[&str] = &[
     include_str!("schema.sql"),
     include_str!("migration_002.sql"),
+    include_str!("migration_003.sql"),
 ];
 
 /// Cheap-to-clone handle. Sync methods are for `boot()` and tests; the app
@@ -96,11 +99,12 @@ impl Store {
         let tx = conn.transaction()?;
         for c in chats {
             tx.execute(
-                "INSERT INTO chats (id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "INSERT INTO chats (id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, title=excluded.title, unread=excluded.unread,
                    muted=excluded.muted, pinned=excluded.pinned, read_outbox=excluded.read_outbox,
-                   read_inbox=excluded.read_inbox, last_date=excluded.last_date, last_message_id=excluded.last_message_id",
+                   read_inbox=excluded.read_inbox, last_date=excluded.last_date, last_message_id=excluded.last_message_id,
+                   photo_id=excluded.photo_id",
                 params![
                     c.id,
                     c.kind.as_str(),
@@ -112,6 +116,7 @@ impl Store {
                     c.read_inbox_max_id,
                     c.last_date,
                     c.last_message.as_ref().map(|m| m.id),
+                    c.photo_id,
                 ],
             )?;
             if let Some(m) = &c.last_message {
@@ -149,7 +154,7 @@ impl Store {
     pub fn load_chats(&self) -> Result<Vec<Chat>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id
+            "SELECT id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id
              FROM chats ORDER BY pinned DESC, last_date DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -164,6 +169,7 @@ impl Store {
             c.read_outbox_max_id = r.get(6)?;
             c.read_inbox_max_id = r.get(7)?;
             c.last_date = r.get(8)?;
+            c.photo_id = r.get(10)?;
             Ok((c, r.get::<_, Option<MessageId>>(9)?))
         })?;
         let mut out = Vec::new();
@@ -467,6 +473,41 @@ mod tests {
         c.pinned = pinned;
         c.last_message = Some(Message::text(id, 10, false, date, "last"));
         c
+    }
+
+    #[test]
+    fn photo_id_roundtrips_and_clears() {
+        let s = Store::open_in_memory().unwrap();
+        let mut c = chat(1, 5, false);
+        c.photo_id = Some(1234567890123);
+        s.upsert_chats(&[c.clone()]).unwrap();
+        assert_eq!(s.load_chats().unwrap()[0].photo_id, Some(1234567890123));
+        c.photo_id = None;
+        s.upsert_chats(&[c]).unwrap();
+        assert_eq!(s.load_chats().unwrap()[0].photo_id, None);
+    }
+
+    #[test]
+    fn v2_database_migrates_to_v3_keeping_chats() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("old.sqlite3");
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch(MIGRATIONS[1]).unwrap();
+            conn.execute(
+                "INSERT INTO chats (id, kind, title) VALUES (7, 'user', 'Old chat')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len());
+        let chats = s.load_chats().unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].title, "Old chat");
+        assert_eq!(chats[0].photo_id, None);
     }
 
     #[test]

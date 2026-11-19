@@ -6,7 +6,7 @@ use iced::{Alignment, Element, Length};
 use super::format;
 use super::icons::Icon;
 use super::theme::{self, FONT_SEMIBOLD};
-use super::widgets::{avatar, badge, emoji_line, icon};
+use super::widgets::{avatar, avatar_photo, badge, emoji_line, icon};
 use crate::app::{App, Message, Ui};
 use crate::model::{Chat, ChatKind, ConnState, Message as ChatMessage, SendState};
 use iced::widget::text::Wrapping;
@@ -213,7 +213,19 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
     }
 
     let mut preview_row = row![].spacing(0).align_y(Alignment::Center);
-    if let Some(last) = &c.last_message {
+    if let Some(status) = app.typing_status(c.id) {
+        // Like Telegram Desktop: the preview becomes the live status.
+        preview_row = preview_row.push(
+            container(
+                text(status)
+                    .size(m.font_m)
+                    .wrapping(Wrapping::None)
+                    .color(if selected { fg } else { p.link }),
+            )
+            .width(Length::Fill)
+            .clip(true),
+        );
+    } else if let Some(last) = &c.last_message {
         let prefix =
             if last.outgoing && c.kind != ChatKind::SavedMessages && c.kind != ChatKind::Channel {
                 Some("You".to_owned())
@@ -259,7 +271,13 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
     }
 
     let content = row![
-        avatar(c.id, &c.title, Some(c.kind), m.avatar_list),
+        avatar_photo(
+            app.avatar(c.id),
+            c.id,
+            &c.title,
+            Some(c.kind),
+            m.avatar_list
+        ),
         column![title_row, preview_row]
             .spacing(4)
             .width(Length::Fill),
@@ -281,7 +299,13 @@ fn message_result_row<'a>(app: &'a App, c: &'a Chat, msg: &'a ChatMessage) -> El
     let p = t.palette;
     let m = t.metrics;
     let content = row![
-        avatar(c.id, &c.title, Some(c.kind), m.avatar_list),
+        avatar_photo(
+            app.avatar(c.id),
+            c.id,
+            &c.title,
+            Some(c.kind),
+            m.avatar_list
+        ),
         column![
             row![
                 text(format::ellipsize(&c.title, 24))

@@ -44,6 +44,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub state_dir: PathBuf,
     pub config_dir: PathBuf,
+    /// Re-creatable files: avatars and files opened with the system handler.
+    pub cache_dir: PathBuf,
     pub mock: bool,
     pub screenshot: Option<(ScreenshotTarget, PathBuf)>,
     pub light_theme: bool,
@@ -72,7 +74,11 @@ impl Config {
         let config_dir = dirs
             .as_ref()
             .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or(fallback);
+            .unwrap_or_else(|| fallback.clone());
+        let cache_dir = dirs
+            .as_ref()
+            .map(|d| d.cache_dir().to_path_buf())
+            .unwrap_or_else(|| fallback.join("cache"));
 
         let mock = args.iter().any(|a| a == "--mock");
         let screenshot = args.iter().position(|a| a == "--screenshot").and_then(|i| {
@@ -85,6 +91,7 @@ impl Config {
             data_dir,
             state_dir,
             config_dir,
+            cache_dir,
             mock: mock || screenshot.is_some(),
             screenshot: screenshot.clone(),
             light_theme: std::env::var("FERRO_THEME").is_ok_and(|v| v == "light"),
@@ -93,6 +100,15 @@ impl Config {
             notifications: !env_flag("FERROGRAM_NO_NOTIFY") && screenshot.is_none(),
             api_setup: args.iter().any(|a| a == "--api-setup"),
         }
+    }
+
+    pub fn avatar_dir(&self) -> PathBuf {
+        self.cache_dir.join("avatars")
+    }
+
+    /// Where files are placed before the system handler opens them.
+    pub fn open_dir(&self) -> PathBuf {
+        self.cache_dir.join("open")
     }
 
     pub fn cache_db_path(&self) -> PathBuf {

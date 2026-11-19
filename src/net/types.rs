@@ -6,7 +6,9 @@
 use grammers_client::tl;
 
 use super::Event;
-use crate::model::{CHANNEL_OFFSET, ChatId, Media, Message, Reaction, SendState};
+use crate::model::{
+    CHANNEL_OFFSET, ChatId, Media, Message, Presence, Reaction, SendState, TypingAction,
+};
 
 /// `tl::Peer` → Bot-API style chat id.
 pub fn peer_to_chat_id(peer: &tl::enums::Peer) -> ChatId {
@@ -262,7 +264,77 @@ pub fn event_from_update(update: &tl::enums::Update) -> Option<Event> {
             max_id: u.max_id,
             still_unread: u32::try_from(u.still_unread_count).unwrap_or(0),
         }),
+        U::UserTyping(u) => Some(typing_event(u.user_id, u.user_id, &u.action)),
+        U::ChatUserTyping(u) => {
+            user_of(&u.from_id).map(|user| typing_event(-u.chat_id, user, &u.action))
+        }
+        U::ChannelUserTyping(u) if u.top_msg_id.is_none() => user_of(&u.from_id)
+            .map(|user| typing_event(channel_chat_id(u.channel_id), user, &u.action)),
+        U::UserStatus(u) => Some(Event::UserStatus {
+            user: u.user_id,
+            presence: presence_from_tl(&u.status, chrono::Utc::now().timestamp()),
+        }),
         _ => None,
+    }
+}
+
+fn user_of(p: &tl::enums::Peer) -> Option<i64> {
+    match p {
+        tl::enums::Peer::User(u) => Some(u.user_id),
+        _ => None,
+    }
+}
+
+fn typing_event(chat: ChatId, user: i64, action: &tl::enums::SendMessageAction) -> Event {
+    Event::Typing {
+        chat,
+        user,
+        action: typing_action_from_tl(action),
+    }
+}
+
+/// `None` means the action ended (cancel / stop).
+pub fn typing_action_from_tl(a: &tl::enums::SendMessageAction) -> Option<TypingAction> {
+    use tl::enums::SendMessageAction as A;
+    Some(match a {
+        A::SendMessageCancelAction | A::SendMessageStopDraftAction(_) => return None,
+        A::SendMessageTypingAction => TypingAction::Typing,
+        A::SendMessageRecordAudioAction => TypingAction::RecordingVoice,
+        A::SendMessageRecordVideoAction | A::SendMessageRecordRoundAction => {
+            TypingAction::RecordingVideo
+        }
+        A::SendMessageUploadPhotoAction(_) => TypingAction::UploadingPhoto,
+        A::SendMessageUploadVideoAction(_) | A::SendMessageUploadRoundAction(_) => {
+            TypingAction::UploadingVideo
+        }
+        A::SendMessageUploadDocumentAction(_) | A::SendMessageUploadAudioAction(_) => {
+            TypingAction::UploadingFile
+        }
+        A::SendMessageChooseStickerAction => TypingAction::ChoosingSticker,
+        _ => TypingAction::Other,
+    })
+}
+
+/// Telegram `UserStatus` → domain presence. A stale "online" (its `expires`
+/// already passed) becomes "last seen at `expires`".
+pub fn presence_from_tl(s: &tl::enums::UserStatus, now: i64) -> Presence {
+    use tl::enums::UserStatus as S;
+    match s {
+        S::Empty => Presence::Unknown,
+        S::Online(o) => {
+            let until = i64::from(o.expires);
+            if until > now {
+                Presence::Online { until }
+            } else {
+                Presence::Offline { was_online: until }
+            }
+        }
+        S::Offline(o) => Presence::Offline {
+            was_online: i64::from(o.was_online),
+        },
+        S::Recently(_) => Presence::Recently,
+        S::LastWeek(_) => Presence::LastWeek,
+        S::LastMonth(_) => Presence::LastMonth,
     }
 }
 

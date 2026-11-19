@@ -19,7 +19,7 @@ use secrecy::SecretString;
 
 use crate::auth::SignInOutcome;
 use crate::error::{Phone, Result};
-use crate::model::{Chat, ChatId, ConnState, Message, MessageId, Reaction};
+use crate::model::{Chat, ChatId, ConnState, Message, MessageId, Presence, Reaction, TypingAction};
 
 /// Hard cap on photo bytes downloaded for display.
 pub const MAX_PHOTO_BYTES: usize = 20 * 1024 * 1024;
@@ -51,6 +51,17 @@ pub enum Event {
         chat: ChatId,
         max_id: MessageId,
         still_unread: u32,
+    },
+    /// Someone started (`Some`) or stopped (`None`) an action in `chat`.
+    Typing {
+        chat: ChatId,
+        user: i64,
+        action: Option<TypingAction>,
+    },
+    /// A user's online status changed.
+    UserStatus {
+        user: i64,
+        presence: Presence,
     },
     SessionRevoked,
 }
@@ -119,6 +130,11 @@ pub trait TelegramApi: Send + Sync {
     async fn search(&self, chat: ChatId, query: String) -> Result<Vec<Message>>;
     /// Bytes of a photo (JPEG/PNG) for display (a thumbnail when available).
     async fn download_photo(&self, chat: ChatId, id: MessageId) -> Result<Vec<u8>>;
+    /// The small (160 px) profile photo `photo_id` of `chat` (JPEG).
+    /// Capped at [`crate::store::avatars::MAX_AVATAR_BYTES`].
+    async fn download_avatar(&self, chat: ChatId, photo_id: i64) -> Result<Vec<u8>>;
+    /// Tell the peer we are typing (`true`) or stopped (`false`).
+    async fn set_typing(&self, chat: ChatId, active: bool) -> Result<()>;
     /// Save a message's media (file, photo) to `path`.
     async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()>;
     /// One-shot user-facing notice from the backend (e.g. session reset).

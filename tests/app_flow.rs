@@ -698,3 +698,277 @@ fn api_setup_flag_opens_the_form() {
     cfg.notifications = false;
     assert!(cfg.api_setup);
 }
+
+// ------------------------------------------------ avatars, typing, files
+
+use ferrogram::app::load_avatar;
+use ferrogram::model::{Media, Presence, TypingAction};
+use ferrogram::store::avatars::AvatarDisk;
+
+#[tokio::test]
+async fn avatar_loads_from_network_then_from_disk_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = AvatarDisk::new(dir.path().join("av"));
+    let fake = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        ..Default::default()
+    });
+    let api = ApiHandle(fake.clone());
+    let alice = mock::mock_chats()
+        .into_iter()
+        .find(|c| c.id == ALICE)
+        .unwrap();
+    let pid = alice.photo_id.expect("mock Alice has a profile photo");
+
+    // Miss on disk -> downloaded and written.
+    let bytes = load_avatar(Some(api.clone()), Some(disk.clone()), (ALICE, pid))
+        .await
+        .unwrap();
+    assert!(ferrogram::app::state::avatar_is_acceptable(&bytes));
+    assert_eq!(disk.read(ALICE, pid).unwrap(), bytes);
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|c| *c == "download_avatar")
+            .count(),
+        1
+    );
+
+    // Hit on disk -> no network call, and it works offline (no API).
+    let again = load_avatar(None, Some(disk.clone()), (ALICE, pid))
+        .await
+        .unwrap();
+    assert_eq!(again, bytes);
+    let again = load_avatar(Some(api.clone()), Some(disk.clone()), (ALICE, pid))
+        .await
+        .unwrap();
+    assert_eq!(again, bytes);
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|c| *c == "download_avatar")
+            .count(),
+        1
+    );
+
+    // Offline with an empty cache is "try later", not a permanent failure.
+    let miss = load_avatar(None, Some(disk.clone()), (ALICE, pid + 1)).await;
+    assert!(matches!(miss, Err(ferrogram::error::Error::Cancelled)));
+
+    // A corrupt cache file is ignored and replaced from the network.
+    std::fs::write(
+        dir.path()
+            .join("av")
+            .join(AvatarDisk::file_name(ALICE, pid)),
+        b"junk",
+    )
+    .unwrap();
+    let healed = load_avatar(Some(api), Some(disk.clone()), (ALICE, pid))
+        .await
+        .unwrap();
+    assert_eq!(healed, bytes);
+}
+
+#[test]
+fn avatar_state_follows_photo_id_and_chat_list() {
+    let mut app = signed_in_app();
+    let alice = app.chats.get(ALICE).unwrap().clone();
+    let pid = alice.photo_id.unwrap();
+    assert!(app.avatar(ALICE).is_none(), "nothing loaded yet");
+    // A chat without a photo id never has an avatar (initials fallback).
+    assert!(app.chats.get(ECHO_BOT).unwrap().photo_id.is_none());
+
+    let png = mock::mock_avatar_png(pid, 160).unwrap();
+    let _ = app.update(Message::Done(Done::Avatar {
+        chat: ALICE,
+        photo_id: pid,
+        result: Ok(png.clone()),
+    }));
+    assert!(app.avatar(ALICE).is_some());
+
+    // The photo changed on the server: the stale image is not drawn.
+    let mut changed = mock::mock_chats();
+    for c in &mut changed {
+        if c.id == ALICE {
+            c.photo_id = Some(pid + 1);
+        }
+    }
+    let _ = app.update(Message::Done(Done::Dialogs(Ok(changed))));
+    assert!(app.avatar(ALICE).is_none());
+
+    // Failures are remembered and not retried; "not now" is retried.
+    let _ = app.update(Message::Done(Done::Avatar {
+        chat: ALICE,
+        photo_id: pid + 1,
+        result: Err(ferrogram::error::Error::Protocol("x".into())),
+    }));
+    assert!(app.avatar_failed.contains(&(ALICE, pid + 1)));
+    let _ = app.update(Message::Done(Done::Avatar {
+        chat: -301,
+        photo_id: 1,
+        result: Err(ferrogram::error::Error::Cancelled),
+    }));
+    assert!(!app.avatar_failed.contains(&(-301, 1)));
+    assert!(app.avatar_loading.len() <= ferrogram::app::AVATAR_CONCURRENCY);
+}
+
+#[test]
+fn avatar_cache_is_bounded_and_cleared_on_logout() {
+    let mut app = signed_in_app();
+    let png = mock::mock_avatar_png(1, 160).unwrap();
+    for chat in 0..500 {
+        let _ = app.update(Message::Done(Done::Avatar {
+            chat,
+            photo_id: 1,
+            result: Ok(png.clone()),
+        }));
+    }
+    assert!(app.avatars.bytes() <= ferrogram::app::AVATAR_BUDGET);
+    assert!(app.avatars.len() < 500);
+    let _ = app.update(Message::Net(Event::SessionRevoked));
+    assert!(app.avatars.is_empty());
+}
+
+#[test]
+fn typing_and_presence_events_drive_the_ui_state() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let typing = |chat, user, action| Message::Net(Event::Typing { chat, user, action });
+    let _ = app.update(typing(ALICE, ALICE, Some(TypingAction::Typing)));
+    assert_eq!(app.typing_status(ALICE).as_deref(), Some("typing…"));
+    // Our own typing (from another device) is not shown.
+    let _ = app.update(typing(ALICE, mock::SELF_ID, Some(TypingAction::Typing)));
+    assert_eq!(app.typing.in_chat(ALICE).len(), 1);
+    // The peer sends the message: status ends.
+    let mut m = ChatMessage::text(ALICE, 700, false, 1, "done typing");
+    m.sender_id = Some(ALICE);
+    let _ = app.update(Message::Net(Event::NewMessage(m)));
+    assert_eq!(app.typing_status(ALICE), None);
+
+    // Group typing resolves the name from the group's last message.
+    let _ = app.update(typing(mock::RUST_GROUP, 311, Some(TypingAction::Typing)));
+    assert_eq!(
+        app.typing_status(mock::RUST_GROUP).as_deref(),
+        Some("Ana is typing…")
+    );
+    let _ = app.update(typing(mock::RUST_GROUP, 311, None));
+    assert_eq!(app.typing_status(mock::RUST_GROUP), None);
+
+    // Expiry.
+    let _ = app.update(typing(ALICE, ALICE, Some(TypingAction::Typing)));
+    assert!(app.typing_status(ALICE).is_some());
+    app.typing.expire(i64::MAX);
+    assert!(app.typing_status(ALICE).is_none());
+
+    // Presence.
+    let _ = app.update(Message::Net(Event::UserStatus {
+        user: ALICE,
+        presence: Presence::Recently,
+    }));
+    assert_eq!(app.chats.get(ALICE).unwrap().presence, Presence::Recently);
+}
+
+#[tokio::test]
+async fn composing_sends_a_throttled_typing_action() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    assert!(app.typing_throttle.chat.is_none());
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("h".into())));
+    assert_eq!(app.typing_throttle.chat, Some(ALICE));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("he".into())));
+    assert_eq!(app.typing_throttle.chat, Some(ALICE));
+    // Emptying the box ends our typing action.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(String::new())));
+    assert!(app.typing_throttle.chat.is_none());
+    // Sending a message resets it too.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("hello".into())));
+    assert!(app.typing_throttle.chat.is_some());
+    let _ = app.update(Message::Ui(Ui::Send));
+    assert!(app.typing_throttle.chat.is_none());
+    // No typing in Saved Messages or while editing.
+    let _ = app.update(Message::Ui(Ui::SelectChat(mock::SELF_ID)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("note".into())));
+    assert!(app.typing_throttle.chat.is_none());
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: ALICE,
+        before: None,
+        result: Ok(mock::mock_history(ALICE)),
+    }));
+    let _ = app.update(Message::Ui(Ui::Edit(149)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("edited".into())));
+    assert!(app.typing_throttle.chat.is_none());
+}
+
+#[tokio::test]
+async fn fake_backend_records_typing_calls() {
+    let api = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        ..Default::default()
+    });
+    api.set_typing(ALICE, true).await.unwrap();
+    api.set_typing(ALICE, false).await.unwrap();
+    let calls = api.calls();
+    assert!(calls.contains(&"set_typing:on".to_owned()));
+    assert!(calls.contains(&"set_typing:off".to_owned()));
+}
+
+#[test]
+fn executable_files_are_save_only_and_never_opened() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let mut exe = ChatMessage::text(ALICE, 800, false, 1, "");
+    exe.media = Some(Media::File {
+        name: "invoice.pdf.exe".into(),
+        size: 10,
+        mime: "application/octet-stream".into(),
+    });
+    let mut pdf = ChatMessage::text(ALICE, 801, false, 2, "");
+    pdf.media = Some(Media::File {
+        name: "trail-map.pdf".into(),
+        size: 10,
+        mime: "application/pdf".into(),
+    });
+    let mut huge = ChatMessage::text(ALICE, 802, false, 3, "");
+    huge.media = Some(Media::File {
+        name: "disk.iso".into(),
+        size: ferrogram::media::MAX_OPEN_BYTES + 1,
+        mime: String::new(),
+    });
+    let _ = app.update(Message::Net(Event::NewMessage(exe)));
+    let _ = app.update(Message::Net(Event::NewMessage(pdf)));
+    let _ = app.update(Message::Net(Event::NewMessage(huge)));
+
+    let _ = app.update(Message::Ui(Ui::OpenFile(ALICE, 800)));
+    assert!(
+        app.toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not opened automatically"),
+        "{:?}",
+        app.toast
+    );
+    app.toast = None;
+    // A safe type starts the download silently.
+    let _ = app.update(Message::Ui(Ui::OpenFile(ALICE, 801)));
+    assert!(app.toast.is_none());
+    // Oversized files are refused with an explanation.
+    let _ = app.update(Message::Ui(Ui::OpenFile(ALICE, 802)));
+    assert!(
+        app.toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("too large")
+    );
+}
+
+#[test]
+fn desktop_open_refuses_save_only_names() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("run.sh");
+    std::fs::write(&p, "#!/bin/sh\n").unwrap();
+    assert!(ferrogram::desktop::open_file(&p).is_err());
+    let p = d.path().join("setup.EXE");
+    std::fs::write(&p, "x").unwrap();
+    assert!(ferrogram::desktop::open_file(&p).is_err());
+}

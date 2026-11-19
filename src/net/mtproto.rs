@@ -19,13 +19,13 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::session::EncryptedSession;
-use super::types::{self, dialog_info, event_from_update, message_from_tl};
+use super::types::{self, dialog_info, event_from_update, message_from_tl, presence_from_tl};
 use super::{Event, EventHub, TelegramApi, UploadKind, backoff};
 use crate::auth::SignInOutcome;
 use crate::auth::vault::Vault;
 use crate::config::ApiCredentials;
 use crate::error::{AuthError, Error, Phone, Result};
-use crate::model::{Chat, ChatId, ChatKind, ConnState, Message, MessageId, User};
+use crate::model::{Chat, ChatId, ChatKind, ConnState, Message, MessageId, Presence, User};
 
 type UpdatesRx = mpsc::Receiver<grammers_session::updates::UpdatesLike>;
 
@@ -86,6 +86,29 @@ fn chat_kind(peer: &Peer, self_id: i64) -> ChatKind {
         Peer::User(_) => ChatKind::User,
         Peer::Group(_) => ChatKind::Group,
         Peer::Channel(_) | Peer::Community(_) => ChatKind::Channel,
+    }
+}
+
+/// Id of the peer's current profile photo (`None` = no photo).
+fn peer_photo_id(peer: &Peer) -> Option<i64> {
+    match peer {
+        Peer::User(u) => u.photo().map(|p| p.photo_id),
+        Peer::Group(g) => g.photo().map(|p| p.photo_id),
+        Peer::Channel(c) => c.photo().map(|p| p.photo_id),
+        Peer::Community(c) => c.photo().map(|p| p.photo_id),
+    }
+}
+
+fn peer_presence(peer: &Peer, now: i64) -> Presence {
+    match peer {
+        Peer::User(u) => match &u.raw {
+            grammers_client::tl::enums::User::User(x) => x
+                .status
+                .as_ref()
+                .map_or(Presence::Unknown, |s| presence_from_tl(s, now)),
+            _ => Presence::Unknown,
+        },
+        _ => Presence::Unknown,
     }
 }
 
@@ -366,6 +389,8 @@ impl TelegramApi for Grammers {
             chat.muted = info.muted;
             chat.read_inbox_max_id = info.read_inbox;
             chat.read_outbox_max_id = info.read_outbox;
+            chat.photo_id = peer_photo_id(d.peer());
+            chat.presence = peer_presence(d.peer(), now);
             chat.last_message = d.last_message.as_ref().and_then(|m| api.convert(m));
             chat.last_date = chat.last_message.as_ref().map_or(0, |m| m.date);
             out.push(chat);
@@ -522,6 +547,45 @@ impl TelegramApi for Grammers {
             }
         }
         Ok(bytes)
+    }
+
+    async fn download_avatar(&self, chat: ChatId, photo_id: i64) -> Result<Vec<u8>> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        let photo = grammers_client::media::ChatPhoto {
+            raw: tl::enums::InputFileLocation::InputPeerPhotoFileLocation(
+                tl::types::InputPeerPhotoFileLocation {
+                    big: false,
+                    peer: peer.into(),
+                    photo_id,
+                },
+            ),
+        };
+        let mut dl = api.client.iter_download(&photo);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = dl.next().await.map_err(map_err)? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > crate::store::avatars::MAX_AVATAR_BYTES {
+                return Err(Error::Protocol("avatar too large".into()));
+            }
+        }
+        Ok(bytes)
+    }
+
+    async fn set_typing(&self, chat: ChatId, active: bool) -> Result<()> {
+        use grammers_client::tl::enums::SendMessageAction;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        let sender = api.client.action(peer);
+        if active {
+            sender
+                .oneshot(SendMessageAction::SendMessageTypingAction)
+                .await
+        } else {
+            sender.cancel().await
+        }
+        .map_err(map_err)
     }
 
     async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()> {

@@ -69,6 +69,11 @@ pub enum Ui {
     Focus(bool),
     Escape,
     Tick,
+    /// 1 s while somebody is typing: expire stale "typing…" statuses.
+    TypingTick,
+    /// Click on a received file: open with the system handler (or save,
+    /// for executables).
+    OpenFile(ChatId, MessageId),
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +136,16 @@ pub enum Done {
         key: (ChatId, MessageId),
         result: Result<Vec<u8>, Error>,
     },
+    /// A profile photo arrived (or failed). `Err(Cancelled)` = not available
+    /// right now (offline), retried later.
+    Avatar {
+        chat: ChatId,
+        photo_id: i64,
+        result: Result<Vec<u8>, Error>,
+    },
+    /// A received file was downloaded and is ready for the system handler.
+    FileReady(Result<PathBuf, Error>),
+    FileOpened(Result<(), Error>),
     LoggedOut,
     Screenshot(iced::window::Screenshot),
     ScreenshotSaved,

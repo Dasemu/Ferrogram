@@ -385,12 +385,13 @@ fn updates_map_to_events() {
         })
     );
     // Unrelated updates are ignored.
-    let typing = tl::enums::Update::UserTyping(tl::types::UpdateUserTyping {
+    let unrelated = tl::enums::Update::UserName(tl::types::UpdateUserName {
         user_id: 5,
-        top_msg_id: None,
-        action: tl::enums::SendMessageAction::SendMessageTypingAction,
+        first_name: "A".into(),
+        last_name: "B".into(),
+        usernames: vec![],
     });
-    assert!(event_from_update(&typing).is_none());
+    assert!(event_from_update(&unrelated).is_none());
 }
 
 #[test]
@@ -461,4 +462,160 @@ fn rpc_errors_map_to_auth_errors() {
         rpc_error(400, "PEER_ID_INVALID", None),
         Error::Protocol(_)
     ));
+}
+
+#[test]
+fn typing_updates_map_to_events() {
+    use ferrogram::model::TypingAction;
+    use tl::enums::SendMessageAction as A;
+    let action = |a: A| wire(a);
+
+    // Private chat: chat id == user id.
+    let u = tl::enums::Update::UserTyping(tl::types::UpdateUserTyping {
+        user_id: 42,
+        top_msg_id: None,
+        action: action(A::SendMessageTypingAction),
+    });
+    assert_eq!(
+        event_from_update(&wire(u)),
+        Some(Event::Typing {
+            chat: 42,
+            user: 42,
+            action: Some(TypingAction::Typing)
+        })
+    );
+
+    // Basic group: negative chat id, the typist comes from `from_id`.
+    let g = tl::enums::Update::ChatUserTyping(tl::types::UpdateChatUserTyping {
+        chat_id: 7,
+        from_id: user(42),
+        action: action(A::SendMessageRecordAudioAction),
+    });
+    assert_eq!(
+        event_from_update(&wire(g)),
+        Some(Event::Typing {
+            chat: -7,
+            user: 42,
+            action: Some(TypingAction::RecordingVoice)
+        })
+    );
+
+    // Channel / supergroup, and a cancel action ends the status.
+    let c = tl::enums::Update::ChannelUserTyping(tl::types::UpdateChannelUserTyping {
+        channel_id: 9,
+        top_msg_id: None,
+        from_id: user(42),
+        action: action(A::SendMessageCancelAction),
+    });
+    assert_eq!(
+        event_from_update(&wire(c)),
+        Some(Event::Typing {
+            chat: -CHANNEL_OFFSET - 9,
+            user: 42,
+            action: None
+        })
+    );
+
+    // Typing by a channel/chat peer (anonymous admin) and in forum topics is ignored.
+    let anon = tl::enums::Update::ChannelUserTyping(tl::types::UpdateChannelUserTyping {
+        channel_id: 9,
+        top_msg_id: None,
+        from_id: channel(9),
+        action: action(A::SendMessageTypingAction),
+    });
+    assert_eq!(event_from_update(&wire(anon)), None);
+    let topic = tl::enums::Update::ChannelUserTyping(tl::types::UpdateChannelUserTyping {
+        channel_id: 9,
+        top_msg_id: Some(3),
+        from_id: user(42),
+        action: action(A::SendMessageTypingAction),
+    });
+    assert_eq!(event_from_update(&wire(topic)), None);
+
+    // Upload actions carry progress; unknown ones degrade to `Other`.
+    for (a, want) in [
+        (
+            A::SendMessageUploadPhotoAction(tl::types::SendMessageUploadPhotoAction {
+                progress: 50,
+            }),
+            TypingAction::UploadingPhoto,
+        ),
+        (
+            A::SendMessageChooseStickerAction,
+            TypingAction::ChoosingSticker,
+        ),
+        (A::SendMessageGamePlayAction, TypingAction::Other),
+    ] {
+        assert_eq!(
+            ferrogram::net::types::typing_action_from_tl(&wire(a)),
+            Some(want)
+        );
+    }
+}
+
+#[test]
+fn user_status_maps_to_presence() {
+    use ferrogram::model::Presence;
+    use ferrogram::net::types::presence_from_tl;
+    use tl::enums::UserStatus as S;
+    let now = 1_795_000_000;
+    let online = |expires| S::Online(tl::types::UserStatusOnline { expires });
+    assert_eq!(
+        presence_from_tl(&wire(online(now as i32 + 30)), now),
+        Presence::Online { until: now + 30 }
+    );
+    // A stale "online" becomes "last seen at <expires>".
+    assert_eq!(
+        presence_from_tl(&wire(online(now as i32 - 30)), now),
+        Presence::Offline {
+            was_online: now - 30
+        }
+    );
+    assert_eq!(
+        presence_from_tl(
+            &wire(S::Offline(tl::types::UserStatusOffline {
+                was_online: 1_794_999_000
+            })),
+            now
+        ),
+        Presence::Offline {
+            was_online: 1_794_999_000
+        }
+    );
+    assert_eq!(presence_from_tl(&wire(S::Empty), now), Presence::Unknown);
+    assert_eq!(
+        presence_from_tl(
+            &wire(S::Recently(tl::types::UserStatusRecently { by_me: false })),
+            now
+        ),
+        Presence::Recently
+    );
+    assert_eq!(
+        presence_from_tl(
+            &wire(S::LastWeek(tl::types::UserStatusLastWeek { by_me: false })),
+            now
+        ),
+        Presence::LastWeek
+    );
+    assert_eq!(
+        presence_from_tl(
+            &wire(S::LastMonth(tl::types::UserStatusLastMonth {
+                by_me: false
+            })),
+            now
+        ),
+        Presence::LastMonth
+    );
+
+    let ev = tl::enums::Update::UserStatus(tl::types::UpdateUserStatus {
+        user_id: 5,
+        status: S::Recently(tl::types::UserStatusRecently { by_me: false }),
+    });
+    assert_eq!(
+        event_from_update(&wire(ev)),
+        Some(Event::UserStatus {
+            user: 5,
+            presence: Presence::Recently
+        })
+    );
 }

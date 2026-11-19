@@ -8,6 +8,7 @@ pub mod config;
 pub mod desktop;
 pub mod error;
 pub mod logging;
+pub mod media;
 pub mod mock;
 pub mod model;
 pub mod net;
