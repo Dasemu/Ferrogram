@@ -1,6 +1,6 @@
 [package]
 name = "ferrogram"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "MIT"
 description = "Lightweight native Telegram desktop client written in Rust (unofficial)"
@@ -32,6 +32,7 @@ open = "5"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ksni = { version = "0.3", default-features = false, features = ["tokio"] }
 resvg = "0.45"
+unicode-segmentation = "1"
 libc = "0.2"
 
 [dev-dependencies]

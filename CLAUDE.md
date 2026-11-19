@@ -53,7 +53,10 @@ a `v*` tag push also releases.
 - Keep iced default features (x11/wayland backends); `default-features=false` breaks softbuffer.
 - `grammers-session` default features pull `libsql` (second SQLite, plain-text session): keep them off.
 - `history` scrollable is `anchor_bottom`: offset 0 = newest; "top" math is in `state::distance_from_top`.
-- Emoji need the `Noto Color Emoji` font span (`widgets::emoji_text`), else monochrome fallbacks.
+- Emoji need the `Noto Color Emoji` font span (`widgets::emoji_text`/`emoji_title`), else monochrome fallbacks.
+  The font is bundled (`assets/fonts/NotoColorEmoji.ttf`, OFL) and loaded only when no system copy exists
+  (`needs_bundled_emoji_font`, +~15-20 MB RSS); keep the family name identical. Segment by grapheme cluster, never per char.
+  `text_input` (composer) cannot take spans: keycaps/flags typed there use fallback fonts (known limit).
 - Containers holding a `Fill` row still need `.width(Fill)` or their background shrinks.
 - `Dialog::peer_ref()` in grammers unwraps; use `peer().to_ref().await` instead.
 - Credentials: override (keyring `api-hash` + config.ini `api_id`) → env → embedded. Never commit real values.

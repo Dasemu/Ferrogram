@@ -2,7 +2,7 @@
 
 use ferrogram::app::App;
 use ferrogram::config::{APP_ID, Config};
-use ferrogram::ui::theme::{FONT, INTER_REGULAR, INTER_SEMIBOLD};
+use ferrogram::ui::theme::{FONT, INTER_REGULAR, INTER_SEMIBOLD, NOTO_COLOR_EMOJI};
 
 /// One window at a time: every window id renders the same view.
 fn view(app: &App, _window: iced::window::Id) -> iced::Element<'_, ferrogram::app::Message> {
@@ -99,12 +99,17 @@ fn main() -> iced::Result {
 
     // A daemon keeps running with zero windows: that is what lets the window
     // be closed (freeing the renderer surfaces) while the app lives in the tray.
-    iced::daemon(move || App::boot(config.clone()), App::update, view)
+    let app = iced::daemon(move || App::boot(config.clone()), App::update, view)
         .title(|app: &App, _window: iced::window::Id| app.title())
         .theme(|app: &App, _window: iced::window::Id| Some(app.theme()))
         .subscription(App::subscription)
         .font(INTER_REGULAR)
         .font(INTER_SEMIBOLD)
-        .default_font(FONT)
-        .run()
+        .default_font(FONT);
+    // Colour emoji without a system font (Telegram Desktop ships its own set).
+    if ferrogram::ui::widgets::needs_bundled_emoji_font() {
+        app.font(NOTO_COLOR_EMOJI).run()
+    } else {
+        app.run()
+    }
 }

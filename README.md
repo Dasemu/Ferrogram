@@ -199,7 +199,7 @@ ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" \
 ```
 
 Screens: `login-phone`, `login-code`, `login-password`, `chats`, `search`,
-`reply`, `media`, `settings`.
+`reply`, `emoji`, `media`, `settings`.
 
 ## Development
 
@@ -215,5 +215,6 @@ See [`docs/architecture.md`](docs/architecture.md) and
 ## Licence
 
 MIT. Inter is under the SIL Open Font License 1.1
-(`assets/fonts/Inter-LICENSE.txt`); Lucide icons are under the ISC licence
+(`assets/fonts/Inter-LICENSE.txt`); Noto Color Emoji (bundled, used when no system copy is
+installed) is under the SIL OFL 1.1 (`assets/fonts/NotoColorEmoji-LICENSE.txt`); Lucide icons are under the ISC licence
 (`assets/icons/LICENSE.txt`).

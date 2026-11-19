@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogram"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "chacha20poly1305",
@@ -1418,6 +1418,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "zbus 5.19.0",
 ]
 

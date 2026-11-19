@@ -2,6 +2,10 @@
 
 Things learned while building Ferrogram, newest first.
 
+- **Never rely on a system emoji font.** Bundle Noto Color Emoji (same family name as
+  the system one, so either works) and load it only when no system copy exists (it costs
+  ~15-20 MB RSS). Classify emoji per grapheme cluster (keycaps, flags, ZWJ, skin tones, VS16),
+  not per char range, and truncate on cluster boundaries. Test with the system font hidden.
 - **dbusmenu ids are renumbered whenever the menu changes** (ksni offsets
   them), and zbus proxies cache properties: tests must read `GetLayout` first
   and use uncached proxies.

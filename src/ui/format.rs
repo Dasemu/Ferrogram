@@ -66,11 +66,13 @@ pub fn file_size(bytes: u64) -> String {
 
 /// Truncate to `max` chars on one line, adding "…".
 pub fn ellipsize(s: &str, max: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
     let line = s.lines().next().unwrap_or_default();
-    if line.chars().count() <= max && !s.contains('\n') {
+    if line.graphemes(true).count() <= max && !s.contains('\n') {
         return line.to_owned();
     }
-    let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
+    // Cut on grapheme boundaries so a ZWJ/flag/keycap emoji is never split.
+    let mut out: String = line.graphemes(true).take(max.saturating_sub(1)).collect();
     out = out.trim_end().to_owned();
     out.push('…');
     out
@@ -222,6 +224,8 @@ mod tests {
         assert_eq!(ellipsize("hello world", 20), "hello world");
         assert_eq!(ellipsize("hello world", 6), "hello…");
         assert_eq!(ellipsize("a\nb", 10), "a…");
+        let fam = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(ellipsize(&format!("{fam}{fam}{fam}"), 2), format!("{fam}…"));
         assert_eq!(badge_count(128), "128");
         assert_eq!(badge_count(1234), "1.2K");
         assert_eq!(badge_count(25_000), "25K");
