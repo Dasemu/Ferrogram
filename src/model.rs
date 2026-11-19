@@ -454,6 +454,21 @@ pub enum SharedBody {
     },
 }
 
+impl fmt::Debug for SharedBody {
+    // File names, links and titles are private: only the kind is printed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Photo { .. } => "Photo",
+            Self::Video { .. } => "Video",
+            Self::Gif { .. } => "Gif",
+            Self::File { .. } => "File",
+            Self::Link { .. } => "Link",
+            Self::Audio { .. } => "Audio",
+            Self::Voice { .. } => "Voice",
+        })
+    }
+}
+
 impl fmt::Debug for SharedItem {
     // File names, links and titles are private.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

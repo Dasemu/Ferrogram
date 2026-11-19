@@ -112,6 +112,12 @@ pub fn script(config: &Config) -> Task<Message> {
             (400, ui(Ui::SelectChat(ALICE))),
             (900, ui(Ui::ChatMenu(Some(RUST_GROUP)))),
         ],
+        ScreenshotTarget::Info(kind) => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (700, ui(Ui::ToggleInfo)),
+            (1000, ui(Ui::InfoTab(kind))),
+            (3000, ui(Ui::Tick)),
+        ],
         ScreenshotTarget::Media => vec![
             (400, ui(Ui::SelectChat(RUST_GROUP))),
             (500, ui(Ui::SelectChat(ALICE))),

@@ -115,20 +115,30 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
     };
     container(
         row![
-            avatar_photo(
-                chat.and_then(|c| app.avatar(c.id)),
-                chat.map_or(0, |c| c.id),
-                title,
-                chat.map(|c| c.kind),
-                m.avatar_header
-            ),
-            column![
-                emoji_title(title.to_string(), m.font_l - 0.5, p.text_primary),
-                text(status)
-                    .size(m.font_s)
-                    .color(if live { p.link } else { p.text_secondary }),
-            ]
-            .spacing(2),
+            mouse_area(
+                row![
+                    avatar_photo(
+                        chat.and_then(|c| app.avatar(c.id)),
+                        chat.map_or(0, |c| c.id),
+                        title,
+                        chat.map(|c| c.kind),
+                        m.avatar_header
+                    ),
+                    column![
+                        emoji_title(title.to_string(), m.font_l - 0.5, p.text_primary),
+                        text(status).size(m.font_s).color(if live {
+                            p.link
+                        } else {
+                            p.text_secondary
+                        }),
+                    ]
+                    .spacing(2),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+            )
+            .on_press(Message::Ui(Ui::ToggleInfo))
+            .interaction(iced::mouse::Interaction::Pointer),
             Space::new().width(Length::Fill),
             ib(Icon::Search, Some(Message::Ui(Ui::ToggleChatSearch))),
             ib(Icon::Phone, None),

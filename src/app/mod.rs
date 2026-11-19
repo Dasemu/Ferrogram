@@ -31,7 +31,8 @@ use crate::config::{Config, ScreenshotTarget};
 use crate::error::{AuthError, Error, Redacted};
 use crate::mock::{FakeOptions, FakeTelegram, MOCK_NOW};
 use crate::model::{
-    Chat, ChatId, ConnState, GlobalHit, Media, Message as ChatMessage, MessageId, SendState, SharedKind, User,
+    Chat, ChatId, ConnState, GlobalHit, Media, Message as ChatMessage, MessageId, SendState,
+    SharedKind, User,
 };
 use crate::net::{ApiHandle, Event, UploadKind, backoff};
 use crate::prefs::{MuteState, Prefs};
@@ -60,6 +61,8 @@ pub const AVATAR_PREFETCH: usize = 80;
 pub const DIALOGS_PAGE: usize = 100;
 /// Start loading the next page this many px before the list's end.
 pub const DIALOGS_LOAD_THRESHOLD: f32 = 300.0;
+/// Load the next shared-content page this far (px) before the panel's end.
+pub const INFO_LOAD_THRESHOLD: f32 = 400.0;
 /// Avatar downloads in flight at once.
 pub const AVATAR_CONCURRENCY: usize = 6;
 
@@ -1639,13 +1642,16 @@ impl App {
                 };
                 Task::batch([
                     persist,
-                    Task::perform(async move { api.set_muted(chat, muted).await }, move |result| {
-                        Message::Done(Done::MuteDone {
-                            chat,
-                            previous,
-                            result,
-                        })
-                    }),
+                    Task::perform(
+                        async move { api.set_muted(chat, muted).await },
+                        move |result| {
+                            Message::Done(Done::MuteDone {
+                                chat,
+                                previous,
+                                result,
+                            })
+                        },
+                    ),
                 ])
             }
             Ui::OpenLink(url) => Task::perform(
@@ -3065,7 +3071,8 @@ impl App {
                         let current = self.info.as_ref().is_some_and(|p| p.chat == key.0);
                         if current {
                             let cost = bytes.len().max(1024);
-                            self.thumbs.insert(key, image::Handle::from_bytes(bytes), cost);
+                            self.thumbs
+                                .insert(key, image::Handle::from_bytes(bytes), cost);
                         }
                         true
                     }

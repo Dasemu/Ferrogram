@@ -427,11 +427,12 @@ pub fn utf16_slice(text: &str, offset: i32, length: i32) -> Option<String> {
     (units >= end && !out.is_empty()).then_some(out)
 }
 
+/// (url, title, description, site) of a link.
+type LinkParts = (String, Option<String>, Option<String>, Option<String>);
+
 /// First link of a message: from its web page preview, else from its
 /// entities. Returns (url, title, description, site).
-fn link_from_message(
-    m: &tl::types::Message,
-) -> Option<(String, Option<String>, Option<String>, Option<String>)> {
+fn link_from_message(m: &tl::types::Message) -> Option<LinkParts> {
     if let Some(tl::enums::MessageMedia::WebPage(w)) = &m.media
         && let tl::enums::WebPage::Page(p) = &w.webpage
         && !p.url.is_empty()

@@ -4,9 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::model::{
-    ChatId, MessageId, PeerInfo, SharedItem, SharedKind, SharedPage,
-};
+use crate::model::{ChatId, MessageId, PeerInfo, SharedItem, SharedKind, SharedPage};
 
 /// Items requested per page.
 pub const PAGE: usize = 40;

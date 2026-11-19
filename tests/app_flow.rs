@@ -1815,3 +1815,295 @@ async fn fake_backend_folder_roundtrip_with_events() {
         Err(Error::Protocol(e)) if e.contains("DIALOG_FILTERS_TOO_MUCH")
     ));
 }
+
+// -------------------------------------------------------------- info panel
+
+use ferrogram::app::info::PAGE as INFO_PAGE;
+use ferrogram::model::SharedKind;
+
+fn app_with_info(chat: i64) -> App {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(chat)));
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    app
+}
+
+fn shared_page(chat: i64, kind: SharedKind, offset: i32) -> ferrogram::model::SharedPage {
+    let all = mock::mock_shared(chat, kind);
+    let older: Vec<_> = all
+        .into_iter()
+        .filter(|i| offset <= 0 || i.id < offset)
+        .collect();
+    let items: Vec<_> = older.iter().take(INFO_PAGE).cloned().collect();
+    let next = (older.len() > INFO_PAGE)
+        .then(|| items.last().map(|i| i.id))
+        .flatten();
+    ferrogram::model::SharedPage { items, next }
+}
+
+#[test]
+fn info_panel_opens_for_the_open_chat_and_closes_with_esc() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    assert!(app.info.is_none(), "needs an open chat");
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    let p = app.info.as_ref().unwrap();
+    assert_eq!((p.chat, p.tab), (ALICE, SharedKind::Media));
+    assert!(
+        p.current().unwrap().loading(),
+        "first page requested at once"
+    );
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(app.info.is_none());
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    assert!(app.info.is_some());
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    assert!(app.info.is_none(), "header click toggles");
+}
+
+#[test]
+fn profile_info_arrives_or_fails_quietly() {
+    let mut app = app_with_info(ALICE);
+    let _ = app.update(Message::Done(Done::PeerInfo {
+        chat: ALICE,
+        result: Ok(mock::mock_peer_info(ALICE)),
+    }));
+    let info = app.info.as_ref().unwrap().info.clone().unwrap();
+    assert_eq!(info.username.as_deref(), Some("alice_j"));
+    assert!(info.phone.is_some());
+    // An answer for another chat is dropped.
+    let _ = app.update(Message::Done(Done::PeerInfo {
+        chat: mock::RUST_GROUP,
+        result: Ok(mock::mock_peer_info(mock::RUST_GROUP)),
+    }));
+    assert_eq!(
+        app.info.as_ref().unwrap().info.as_ref().unwrap().members,
+        None
+    );
+    // A failure keeps the panel and shows no toast.
+    let mut app = app_with_info(ALICE);
+    let _ = app.update(Message::Done(Done::PeerInfo {
+        chat: ALICE,
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    assert!(app.info.as_ref().unwrap().info_failed);
+    assert!(app.toast.is_none());
+}
+
+#[test]
+fn shared_tabs_page_lazily_and_queue_bounded_thumbnails() {
+    let mut app = app_with_info(ALICE);
+    let first = shared_page(ALICE, SharedKind::Media, 0);
+    assert_eq!(first.items.len(), INFO_PAGE);
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Media,
+        offset: 0,
+        result: Ok(first.clone()),
+    }));
+    let tab = app.info.as_ref().unwrap().tab(SharedKind::Media);
+    assert_eq!(tab.items.len(), INFO_PAGE);
+    assert!(tab.next.is_some() && !tab.loading());
+    // Thumbnails: only a few at a time, the rest wait in the queue.
+    assert_eq!(app.thumb_q.pending(), INFO_PAGE);
+
+    // Near the end of the panel the next page is requested (same path as scrolling).
+    let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Media)));
+    assert!(app.info.as_ref().unwrap().tab(SharedKind::Media).loading());
+    // Asking again while it is in flight does not duplicate the request.
+    let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Media)));
+    let offset = first.next.unwrap();
+    let second = shared_page(ALICE, SharedKind::Media, offset);
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Media,
+        offset,
+        result: Ok(second),
+    }));
+    let tab = app.info.as_ref().unwrap().tab(SharedKind::Media);
+    assert_eq!(tab.items.len(), 64);
+    assert!(tab.ended());
+
+    // Another tab loads independently; an empty tab says so.
+    let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Voice)));
+    assert!(app.info.as_ref().unwrap().tab(SharedKind::Voice).loading());
+    let page = shared_page(ALICE, SharedKind::Voice, 0);
+    assert_eq!(page.items.len(), 7);
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Voice,
+        offset: 0,
+        result: Ok(page),
+    }));
+    assert!(app.info.as_ref().unwrap().tab(SharedKind::Voice).ended());
+}
+
+#[test]
+fn failed_pages_show_retry_and_stale_pages_are_ignored() {
+    let mut app = app_with_info(ALICE);
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Media,
+        offset: 0,
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    let t = app.info.as_ref().unwrap().tab(SharedKind::Media);
+    assert!(t.failed && !t.loading());
+    assert!(app.toast.is_none());
+    // Selecting the tab again retries.
+    let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Media)));
+    assert!(app.info.as_ref().unwrap().tab(SharedKind::Media).loading());
+    // A page for a chat that is no longer shown is dropped.
+    let _ = app.update(Message::Ui(Ui::SelectChat(mock::RUST_GROUP)));
+    assert_eq!(
+        app.info.as_ref().unwrap().chat,
+        mock::RUST_GROUP,
+        "panel follows the chat"
+    );
+    assert!(app.info.as_ref().unwrap().current().unwrap().loading());
+    let _ = app.update(Message::Done(Done::SharedPage {
+        chat: ALICE,
+        kind: SharedKind::Media,
+        offset: 0,
+        result: Ok(shared_page(ALICE, SharedKind::Media, 0)),
+    }));
+    assert!(
+        app.info
+            .as_ref()
+            .unwrap()
+            .tab(SharedKind::Media)
+            .items
+            .is_empty()
+    );
+    assert_eq!(app.thumb_q.pending(), 0);
+}
+
+#[test]
+fn thumbnail_cache_is_bounded_and_rejects_bad_images() {
+    let mut app = app_with_info(ALICE);
+    let png = mock::mock_photo_png(1, 160, 120);
+    let _ = app.update(Message::Done(Done::Thumb {
+        key: (ALICE, 5),
+        result: Ok(png.clone()),
+    }));
+    assert!(app.thumbs.peek(&(ALICE, 5)).is_some());
+    // Garbage and another chat's thumbnail are not cached.
+    let _ = app.update(Message::Done(Done::Thumb {
+        key: (ALICE, 6),
+        result: Ok(vec![0u8; 3 * 1024 * 1024]),
+    }));
+    assert!(app.thumbs.peek(&(ALICE, 6)).is_none());
+    let _ = app.update(Message::Done(Done::Thumb {
+        key: (mock::RUST_GROUP, 7),
+        result: Ok(png.clone()),
+    }));
+    assert!(app.thumbs.peek(&(mock::RUST_GROUP, 7)).is_none());
+    // Many thumbnails never exceed the budget.
+    for i in 0..3000 {
+        let _ = app.update(Message::Done(Done::Thumb {
+            key: (ALICE, 1000 + i),
+            result: Ok(png.clone()),
+        }));
+    }
+    assert!(app.thumbs.bytes() <= ferrogram::app::info::THUMB_BUDGET + png.len());
+    // Closing the panel frees them.
+    let _ = app.update(Message::Ui(Ui::ToggleInfo));
+    assert!(app.thumbs.is_empty());
+}
+
+#[test]
+fn notifications_switch_is_optimistic_and_rolls_back() {
+    let mut app = app_with_info(ALICE);
+    assert!(!app.chats.get(ALICE).unwrap().muted);
+    let _ = app.update(Message::Ui(Ui::SetNotifications(false)));
+    assert!(app.chats.get(ALICE).unwrap().muted);
+    let _ = app.update(Message::Done(Done::MuteDone {
+        chat: ALICE,
+        previous: false,
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    assert!(
+        !app.chats.get(ALICE).unwrap().muted,
+        "refused: back to unmuted"
+    );
+    assert!(app.toast.is_some());
+    // Another device mutes: the switch follows.
+    let _ = app.update(Message::Net(Event::Muted {
+        chat: ALICE,
+        muted: true,
+    }));
+    assert!(app.chats.get(ALICE).unwrap().muted);
+    let _ = app.update(Message::Ui(Ui::SetNotifications(true)));
+    assert!(!app.chats.get(ALICE).unwrap().muted);
+}
+
+#[test]
+fn photos_open_the_viewer_and_link_failures_are_reported() {
+    let mut app = app_with_info(ALICE);
+    let _ = app.update(Message::Ui(Ui::OpenMedia(ALICE, 2_700)));
+    assert_eq!(app.viewer, Some((ALICE, 2_700)));
+    assert!(
+        app.photo_loading.contains(&(ALICE, 2_700)),
+        "viewer fetches the photo"
+    );
+    let _ = app.update(Message::Done(Done::LinkOpened(Err(
+        ferrogram::error::Error::Protocol("not a web link".into()),
+    ))));
+    assert!(app.toast.as_deref().unwrap().contains("link"));
+}
+
+#[tokio::test]
+async fn fake_backend_serves_shared_media_info_and_mute() {
+    let fake = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        live_simulation: false,
+        ..Default::default()
+    });
+    let mut events = fake.events();
+    let p1 = fake
+        .shared_media(ALICE, SharedKind::Media, 0, 40)
+        .await
+        .unwrap();
+    assert_eq!(p1.items.len(), 40);
+    let p2 = fake
+        .shared_media(ALICE, SharedKind::Media, p1.next.unwrap(), 40)
+        .await
+        .unwrap();
+    assert_eq!(p2.items.len(), 24);
+    assert_eq!(p2.next, None);
+    assert!(
+        p1.items
+            .iter()
+            .all(|i| p2.items.iter().all(|j| j.id != i.id))
+    );
+    assert!(
+        p1.items.windows(2).all(|w| w[0].id > w[1].id),
+        "newest first"
+    );
+    let none = fake
+        .shared_media(mock::ECHO_BOT, SharedKind::Files, 0, 40)
+        .await
+        .unwrap();
+    assert!(none.items.is_empty() && none.next.is_none());
+
+    let info = fake.peer_info(mock::RUST_GROUP).await.unwrap();
+    assert_eq!(info.members, Some(4_721));
+    assert!(
+        fake.download_thumb(ALICE, p1.items[0].id)
+            .await
+            .unwrap()
+            .len()
+            > 100
+    );
+
+    fake.set_muted(ALICE, true).await.unwrap();
+    assert!(matches!(
+        events.next().await,
+        Some(Event::Muted {
+            chat: ALICE,
+            muted: true
+        })
+    ));
+    assert!(fake.calls().contains(&"mute".to_owned()));
+}

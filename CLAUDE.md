@@ -57,6 +57,10 @@ a `v*` tag push also releases.
   The font is bundled (`assets/fonts/NotoColorEmoji.ttf`, OFL) and loaded only when no system copy exists
   (`needs_bundled_emoji_font`, +~15-20 MB RSS); keep the family name identical. Segment by grapheme cluster, never per char.
   `text_input` (composer) cannot take spans: keycaps/flags typed there use fallback fonts (known limit).
+- Modal/popup layers must be wrapped in `opaque` (use `widgets::modal`), else hover and
+  pointer shape leak to the widgets below. Build `svg`/`image` handles once, never in `view()`.
+- Folder/clipboard/info-panel logic: pure reducers in `app/folders.rs`, `app/info.rs`,
+  `clipboard.rs`; TL only in `net/types.rs`. Thumbnails are bounded (`app::info` consts).
 - Containers holding a `Fill` row still need `.width(Fill)` or their background shrinks.
 - `Dialog::peer_ref()` in grammers unwraps; use `peer().to_ref().await` instead.
 - Credentials: override (keyring `api-hash` + config.ini `api_id`) → env → embedded. Never commit real values.

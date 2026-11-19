@@ -2,6 +2,18 @@
 
 Things learned while building Ferrogram, newest first.
 
+- **A modal backdrop must be `opaque`.** iced's `stack` only hides the cursor
+  from the layers below when the top layer reports a mouse interaction, and a
+  plain `mouse_area` reports none outside its content: the chat rows under
+  the Settings dim kept their hover highlight and pointer shape. Use
+  `widgets::modal`; `tests/ui_layers.rs` probes the real view headlessly.
+- **svg handles hash their whole document on every `from_memory`.** Build icon
+  handles once (`icons::handle`), not per row in `view()`.
+- **X11 clipboard data dies with the last `arboard::Clipboard`.** Keep one
+  long-lived handle, or "Copy image" pastes nothing.
+- **A file copied in a file manager is also text.** The composer has already
+  pasted the path when the async clipboard read says "file": undo that paste.
+
 - **Never rely on a system emoji font.** Bundle Noto Color Emoji (same family name as
   the system one, so either works) and load it only when no system copy exists (it costs
   ~15-20 MB RSS). Classify emoji per grapheme cluster (keycaps, flags, ZWJ, skin tones, VS16),
