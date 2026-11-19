@@ -1,8 +1,10 @@
 name: CI
 
+# Pull requests run CI once (pull_request); pushes run only on the long-lived
+# branches so a PR push does not trigger a duplicate run.
 on:
   push:
-    branches: [main, development, "feat/**"]
+    branches: [main, development]
   pull_request:
 
 env:
