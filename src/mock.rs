@@ -11,17 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use futures::stream::BoxStream;
 use secrecy::{ExposeSecret, SecretString};
-use tokio::sync::mpsc;
 
 use crate::auth::SignInOutcome;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
     CHANNEL_OFFSET, Chat, ChatId, ChatKind, Media, Message, MessageId, Reaction, User,
 };
-use crate::net::{Event, TelegramApi, UploadKind};
+use crate::net::{Event, EventHub, TelegramApi, UploadKind};
 
 /// Fixed "now" so screenshots and tests are deterministic (2026-11-18 14:32 UTC).
 pub const MOCK_NOW: i64 = 1_795_012_320;
@@ -472,14 +470,12 @@ struct State {
 pub struct FakeTelegram {
     state: Mutex<State>,
     opts: FakeOptions,
-    events_tx: mpsc::UnboundedSender<Event>,
-    events_rx: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
+    events: Arc<EventHub>,
 }
 
 impl FakeTelegram {
     pub fn new(opts: FakeOptions) -> Arc<Self> {
         let (chats, history) = chats_and_history();
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             state: Mutex::new(State {
                 authorized: opts.logged_in,
@@ -491,8 +487,7 @@ impl FakeTelegram {
                 next_id: 10_000,
             }),
             opts,
-            events_tx,
-            events_rx: Mutex::new(Some(events_rx)),
+            events: Arc::new(EventHub::new()),
         })
     }
 
@@ -514,7 +509,7 @@ impl FakeTelegram {
         {
             s.history.entry(m.chat_id).or_default().push(m.clone());
         }
-        let _ = self.events_tx.send(ev);
+        self.events.emit(ev);
     }
 
     async fn call(&self, name: &str) -> Result<()> {
@@ -545,7 +540,7 @@ impl FakeTelegram {
         if !self.opts.live_simulation {
             return;
         }
-        let tx = self.events_tx.clone();
+        let tx = Arc::clone(&self.events);
         let chat = sent.chat_id;
         let id = sent.id;
         let text = sent.text.clone();
@@ -555,7 +550,7 @@ impl FakeTelegram {
         });
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(900)).await;
-            let _ = tx.send(Event::ReadOutbox { chat, max_id: id });
+            tx.emit(Event::ReadOutbox { chat, max_id: id });
             if chat == ECHO_BOT
                 && let Ok(echo_id) = echo_id
             {
@@ -568,7 +563,7 @@ impl FakeTelegram {
                 };
                 let mut m = msg(ECHO_BOT, echo_id, false, now, &reply);
                 m.reply_to = Some(id);
-                let _ = tx.send(Event::NewMessage(m));
+                tx.emit(Event::NewMessage(m));
             }
         });
     }
@@ -728,7 +723,7 @@ impl TelegramApi for FakeTelegram {
             m.edited = true;
             m.clone()
         };
-        let _ = self.events_tx.send(Event::MessageEdited(edited));
+        self.events.emit(Event::MessageEdited(edited));
         Ok(())
     }
 
@@ -738,7 +733,7 @@ impl TelegramApi for FakeTelegram {
             h.retain(|m| !ids.contains(&m.id));
         }
         let channel = chat < -CHANNEL_OFFSET;
-        let _ = self.events_tx.send(Event::MessagesDeleted {
+        self.events.emit(Event::MessagesDeleted {
             chat: channel.then_some(chat),
             ids,
         });
@@ -757,7 +752,7 @@ impl TelegramApi for FakeTelegram {
             crate::app::state::toggle_reaction(&mut m.reactions, emoji.as_deref());
             m.reactions.clone()
         };
-        let _ = self.events_tx.send(Event::Reactions {
+        self.events.emit(Event::Reactions {
             chat,
             id,
             reactions,
@@ -798,18 +793,25 @@ impl TelegramApi for FakeTelegram {
         Ok(mock_photo_png(i64::from(id), 640, 427))
     }
 
+    async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()> {
+        self.call("download_media").await?;
+        let media = self
+            .st()?
+            .history
+            .get(&chat)
+            .and_then(|h| h.iter().find(|m| m.id == id))
+            .and_then(|m| m.media.clone());
+        let bytes = match media {
+            Some(Media::Photo { .. }) => mock_photo_png(i64::from(id), 640, 427),
+            Some(Media::File { name, .. }) => format!("mock contents of {name}\n").into_bytes(),
+            _ => return Err(Error::Protocol("no media".into())),
+        };
+        tokio::fs::write(&path, bytes).await?;
+        Ok(())
+    }
+
     fn events(&self) -> BoxStream<'static, Event> {
-        let rx = self.events_rx.lock().ok().and_then(|mut g| g.take());
-        match rx {
-            Some(rx) => {
-                futures::stream::unfold(
-                    rx,
-                    |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
-                )
-                .boxed()
-            }
-            None => futures::stream::empty().boxed(),
-        }
+        self.events.subscribe()
     }
 }
 

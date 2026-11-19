@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use futures::stream::BoxStream;
 use grammers_client::client::{LoginToken, PasswordToken};
 use grammers_client::message::{InputMessage, InputReactions};
@@ -21,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use super::session::EncryptedSession;
 use super::types::{self, dialog_info, event_from_update, message_from_tl};
-use super::{Event, TelegramApi, UploadKind, backoff};
+use super::{Event, EventHub, TelegramApi, UploadKind, backoff};
 use crate::auth::SignInOutcome;
 use crate::auth::vault::Vault;
 use crate::config::ApiCredentials;
@@ -39,8 +38,9 @@ pub struct GrammersApi {
     password_token: Mutex<Option<PasswordToken>>,
     peers: Mutex<HashMap<ChatId, PeerRef>>,
     self_id: AtomicI64,
-    events_tx: mpsc::UnboundedSender<Event>,
-    events_rx: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
+    events: EventHub,
+    /// Set when the stored session was unreadable and had to be discarded.
+    session_reset: std::sync::atomic::AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>> {
@@ -91,9 +91,14 @@ fn chat_kind(peer: &Peer, self_id: i64) -> ChatKind {
 
 impl GrammersApi {
     /// Create the client and spawn the sender pool. Must run inside a tokio
-    /// runtime (it does: iced tasks run on the tokio executor).
-    pub fn start(creds: ApiCredentials, vault: Vault) -> Result<Arc<Self>> {
-        let session = Arc::new(EncryptedSession::load(vault)?);
+    /// runtime (it does: iced tasks run on the tokio executor). The keyring
+    /// read and vault decryption run on a blocking thread.
+    pub async fn start(creds: ApiCredentials, vault: Vault) -> Result<Arc<Self>> {
+        let (session, reset) =
+            tokio::task::spawn_blocking(move || EncryptedSession::load_or_reset(vault))
+                .await
+                .map_err(|_| Error::Cancelled)??;
+        let session = Arc::new(session);
         let SenderPool {
             runner,
             handle,
@@ -101,7 +106,6 @@ impl GrammersApi {
         } = SenderPool::new(Arc::clone(&session), creds.api_id);
         let client = Client::new(handle);
         tokio::spawn(runner.run());
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
         let api = Arc::new(Self {
             client,
             api_hash: creds.api_hash,
@@ -111,13 +115,18 @@ impl GrammersApi {
             password_token: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             self_id: AtomicI64::new(0),
-            events_tx,
-            events_rx: Mutex::new(Some(events_rx)),
+            events: EventHub::new(),
+            session_reset: std::sync::atomic::AtomicBool::new(reset),
         });
         // Periodically flush the (encrypted) session so update state survives crashes.
+        // The flusher stops once the session is cleared (logout/revoke) so a
+        // stale task can never write the old auth key back.
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(20)).await;
+                if session.is_closed() {
+                    break;
+                }
                 let s = Arc::clone(&session);
                 let _ = tokio::task::spawn_blocking(move || s.save_if_dirty()).await;
             }
@@ -126,7 +135,7 @@ impl GrammersApi {
     }
 
     fn emit(&self, ev: Event) {
-        let _ = self.events_tx.send(ev);
+        self.events.emit(ev);
     }
 
     async fn peer_ref(&self, chat: ChatId) -> Result<PeerRef> {
@@ -319,6 +328,9 @@ impl TelegramApi for Grammers {
 
     async fn log_out(&self) -> Result<()> {
         let _ = self.0.client.sign_out().await;
+        // Drop the connection and the in-memory auth key; the app builds a
+        // brand-new client for the next login.
+        self.0.client.disconnect();
         let s = Arc::clone(&self.0.session);
         tokio::task::spawn_blocking(move || s.clear())
             .await
@@ -486,28 +498,72 @@ impl TelegramApi for Grammers {
             .next()
             .and_then(|m| m.photo())
             .ok_or_else(|| Error::Protocol("no photo".into()))?;
-        let mut dl = api.client.iter_download(&photo);
+        // Prefer the 800 px ("x") or 320 px ("m") thumbnail over the original.
+        let thumbs = photo.thumbs();
+        let thumb = ["x", "m"].iter().find_map(|t| {
+            thumbs.iter().find(|s| {
+                s.photo_type() == *t
+                    && matches!(
+                        s,
+                        grammers_client::media::PhotoSize::Size(_)
+                            | grammers_client::media::PhotoSize::Progressive(_)
+                    )
+            })
+        });
+        let mut dl = match thumb {
+            Some(t) => api.client.iter_download(t),
+            None => api.client.iter_download(&photo),
+        };
         let mut bytes = Vec::new();
         while let Some(chunk) = dl.next().await.map_err(map_err)? {
             bytes.extend_from_slice(&chunk);
-            if bytes.len() > 20 * 1024 * 1024 {
+            if bytes.len() > super::MAX_PHOTO_BYTES {
                 return Err(Error::Protocol("photo too large".into()));
             }
         }
         Ok(bytes)
     }
 
-    fn events(&self) -> BoxStream<'static, Event> {
-        let rx = self.0.events_rx.lock().ok().and_then(|mut g| g.take());
-        match rx {
-            Some(rx) => {
-                futures::stream::unfold(
-                    rx,
-                    |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
-                )
-                .boxed()
+    async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()> {
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        let msg = api
+            .client
+            .get_messages_by_id(peer, &[id])
+            .await
+            .map_err(map_err)?
+            .into_iter()
+            .flatten()
+            .next()
+            .ok_or_else(|| Error::Protocol("message not found".into()))?;
+        let media = msg
+            .media()
+            .ok_or_else(|| Error::Protocol("no media".into()))?;
+        // Stream to disk with a hard cap (Telegram's own maximum file size).
+        const MAX_FILE: u64 = 4 * 1024 * 1024 * 1024;
+        let mut file = tokio::fs::File::create(&path).await?;
+        let mut dl = api.client.iter_download(&media);
+        let mut total = 0u64;
+        while let Some(chunk) = dl.next().await.map_err(map_err)? {
+            total += chunk.len() as u64;
+            if total > MAX_FILE {
+                drop(file);
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(Error::Protocol("file too large".into()));
             }
-            None => futures::stream::empty().boxed(),
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
         }
+        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        Ok(())
+    }
+
+    fn take_notice(&self) -> Option<String> {
+        self.0.session_reset.swap(false, Ordering::AcqRel).then(|| {
+            "Your saved session could not be read and was reset. Please log in again.".into()
+        })
+    }
+
+    fn events(&self) -> BoxStream<'static, Event> {
+        self.0.events.subscribe()
     }
 }

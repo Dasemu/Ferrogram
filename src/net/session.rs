@@ -38,6 +38,8 @@ pub struct EncryptedSession {
     data: Mutex<SessionData>,
     vault: Vault,
     dirty: AtomicBool,
+    /// Set by `clear()`: the session is dead and must never be written again.
+    closed: AtomicBool,
 }
 
 impl EncryptedSession {
@@ -51,7 +53,28 @@ impl EncryptedSession {
             data: Mutex::new(data),
             vault,
             dirty: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         })
+    }
+
+    /// Like [`Self::load`], but an unreadable blob (wrong/lost keyring key,
+    /// corrupt file) is deleted and a fresh session is started instead of
+    /// locking the user out forever. Returns `(session, was_reset)`.
+    /// Keyring *access* errors are still returned: then the blob may be fine.
+    pub fn load_or_reset(vault: Vault) -> Result<(Self, bool)> {
+        match Self::load(vault.clone()) {
+            Ok(s) => Ok((s, false)),
+            Err(Error::Keyring(e)) => Err(Error::Keyring(e)),
+            Err(_) => {
+                tracing::warn!("stored session unreadable; starting a fresh one");
+                vault.clear()?;
+                Ok((Self::load(vault)?, true))
+            }
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     fn data(&self) -> std::result::Result<MutexGuard<'_, SessionData>, SessionError> {
@@ -60,6 +83,9 @@ impl EncryptedSession {
 
     /// Encrypt and write the session now (blocking: call from a blocking thread).
     pub fn save(&self) -> Result<()> {
+        if self.is_closed() {
+            return Ok(());
+        }
         let bytes = {
             let d = self
                 .data
@@ -72,13 +98,15 @@ impl EncryptedSession {
     }
 
     pub fn save_if_dirty(&self) -> Result<()> {
-        if self.dirty.load(Ordering::Acquire) {
+        if !self.is_closed() && self.dirty.load(Ordering::Acquire) {
             self.save()?;
         }
         Ok(())
     }
 
     pub fn clear(&self) -> Result<()> {
+        self.closed.store(true, Ordering::Release);
+        self.dirty.store(false, Ordering::Release);
         if let Ok(mut d) = self.data.lock() {
             *d = SessionData::default();
         }
@@ -199,7 +227,7 @@ impl Session for EncryptedSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::secrets::MemoryStore;
+    use crate::auth::secrets::{MemoryStore, SecretStore};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -237,7 +265,36 @@ mod tests {
         let s = EncryptedSession::load(vault.clone()).unwrap();
         s.save().unwrap();
         assert!(vault.path().exists());
+        s.set_home_dc_id(3).await.unwrap();
         s.clear().unwrap();
         assert!(!vault.path().exists());
+        // A dead session is never resurrected by the flusher or a late save.
+        s.set_home_dc_id(5).await.unwrap();
+        s.save_if_dirty().unwrap();
+        s.save().unwrap();
+        assert!(!vault.path().exists());
+        assert!(s.is_closed());
+    }
+
+    #[test]
+    fn unreadable_blob_is_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let vault = Vault::new(store.clone(), dir.path().join("s.enc"));
+        vault.save(b"not json at all").unwrap();
+        assert!(EncryptedSession::load(vault.clone()).is_err());
+        let (s, reset) = EncryptedSession::load_or_reset(vault.clone()).unwrap();
+        assert!(reset);
+        assert!(!vault.path().exists());
+        assert_eq!(s.home_dc_id().unwrap(), SessionData::default().home_dc);
+        // Wrong key: also reset rather than locked out.
+        vault.save(b"{}").unwrap();
+        store
+            .set(
+                crate::auth::vault::VAULT_KEY,
+                &crate::auth::secrets::Secret::new(vec![9u8; 32]),
+            )
+            .unwrap();
+        assert!(EncryptedSession::load_or_reset(vault).unwrap().1);
     }
 }

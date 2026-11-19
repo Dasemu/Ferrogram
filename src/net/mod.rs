@@ -21,6 +21,9 @@ use crate::auth::SignInOutcome;
 use crate::error::{Phone, Result};
 use crate::model::{Chat, ChatId, ConnState, Message, MessageId, Reaction};
 
+/// Hard cap on photo bytes downloaded for display.
+pub const MAX_PHOTO_BYTES: usize = 20 * 1024 * 1024;
+
 /// Events pushed by the protocol client (architecture §3, `Net(..)`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -114,10 +117,16 @@ pub trait TelegramApi: Send + Sync {
     async fn react(&self, chat: ChatId, id: MessageId, emoji: Option<String>) -> Result<()>;
     async fn mark_read(&self, chat: ChatId) -> Result<()>;
     async fn search(&self, chat: ChatId, query: String) -> Result<Vec<Message>>;
-    /// Bytes of a photo (JPEG/PNG) for display.
+    /// Bytes of a photo (JPEG/PNG) for display (a thumbnail when available).
     async fn download_photo(&self, chat: ChatId, id: MessageId) -> Result<Vec<u8>>;
+    /// Save a message's media (file, photo) to `path`.
+    async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()>;
+    /// One-shot user-facing notice from the backend (e.g. session reset).
+    fn take_notice(&self) -> Option<String> {
+        None
+    }
 
-    /// The live update stream. Only the first call returns a live stream.
+    /// The live update stream. A new call takes over from the previous one.
     fn events(&self) -> BoxStream<'static, Event>;
 }
 
@@ -135,6 +144,69 @@ impl std::ops::Deref for ApiHandle {
     type Target = dyn TelegramApi;
     fn deref(&self) -> &Self::Target {
         &*self.0
+    }
+}
+
+/// Fan-in point for protocol events. `subscribe()` can be called again
+/// (e.g. after logout → login): the newest subscriber takes over and the
+/// previous stream ends, so events are never silently swallowed by a stale
+/// receiver.
+pub struct EventHub {
+    tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Event>>>,
+    /// Events emitted while nobody is subscribed (bounded).
+    backlog: std::sync::Mutex<std::collections::VecDeque<Event>>,
+}
+
+const BACKLOG_MAX: usize = 256;
+
+impl Default for EventHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventHub {
+    pub fn new() -> Self {
+        Self {
+            tx: std::sync::Mutex::new(None),
+            backlog: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub fn emit(&self, ev: Event) {
+        let Ok(guard) = self.tx.lock() else {
+            return;
+        };
+        if let Some(tx) = guard.as_ref()
+            && tx.send(ev.clone()).is_ok()
+        {
+            return;
+        }
+        drop(guard);
+        if let Ok(mut b) = self.backlog.lock() {
+            if b.len() >= BACKLOG_MAX {
+                b.pop_front();
+            }
+            b.push_back(ev);
+        }
+    }
+
+    pub fn subscribe(&self) -> BoxStream<'static, Event> {
+        use futures::StreamExt;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Ok(mut b) = self.backlog.lock() {
+            for ev in b.drain(..) {
+                let _ = tx.send(ev);
+            }
+        }
+        if let Ok(mut g) = self.tx.lock() {
+            *g = Some(tx);
+        }
+        futures::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
+        )
+        .boxed()
     }
 }
 
