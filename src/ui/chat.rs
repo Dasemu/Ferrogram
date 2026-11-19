@@ -685,6 +685,14 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> Element<'a, Message> 
             false,
         ));
     }
+    if matches!(msg.media, Some(Media::File { .. } | Media::Photo { .. })) {
+        items = items.push(item(
+            Icon::Download,
+            "Save As…",
+            Message::Ui(Ui::SaveMedia(msg.chat_id, msg.id)),
+            false,
+        ));
+    }
     items = items.push(item(
         Icon::Trash,
         "Delete",

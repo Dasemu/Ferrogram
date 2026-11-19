@@ -61,7 +61,7 @@ pub fn script(config: &Config) -> Task<Message> {
                     "Coffee sounds amazing, see you there".into(),
                 )),
             ),
-            (1000, ui(Ui::MessageMenu(Some(146)))),
+            (1000, ui(Ui::MessageMenu(Some(145)))),
         ],
         ScreenshotTarget::Media => vec![
             (400, ui(Ui::SelectChat(RUST_GROUP))),
