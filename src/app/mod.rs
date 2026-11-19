@@ -1,6 +1,7 @@
 //! App state + update (the "Elm" side). No I/O happens here directly: every
 //! side effect is a `Task` that calls `net`, `store` or `auth`.
 
+pub mod background;
 pub mod message;
 pub mod screenshot;
 pub mod state;
@@ -15,6 +16,7 @@ use iced::widget::{Id, image, operation};
 use iced::{Subscription, Task, Theme, event, keyboard, window};
 use tracing::{info, warn};
 
+use background::{Action, Geometry, WindowState};
 pub use message::{Done, Message, Ui};
 use state::{
     ChatList, ComposeMode, Conversation, Lru, PAGE, TypingStep, TypingThrottle, TypingTracker,
@@ -30,8 +32,11 @@ use crate::model::{
     ChatId, ConnState, GlobalHit, Media, Message as ChatMessage, MessageId, SendState, User,
 };
 use crate::net::{ApiHandle, Event, UploadKind, backoff};
+use crate::prefs::{MuteState, Prefs};
+use crate::remote::{MuteRequest, Remote};
 use crate::store::Store;
 use crate::store::avatars::AvatarDisk;
+use crate::tray::{TrayHandle, TrayModel};
 use crate::ui::theme::FerroTheme;
 
 pub const HISTORY_ID: &str = "history";
@@ -153,6 +158,26 @@ pub struct App {
     pub tz_offset: i32,
     pub started: Instant,
     pub first_frame_logged: bool,
+    // ---- background mode (docs/architecture.md section 11.4)
+    pub prefs: Prefs,
+    /// Window / tray state machine; decides close-to-tray vs quit.
+    pub window: WindowState,
+    /// The one window while it is open (the app is an `iced::daemon`).
+    pub window_id: Option<window::Id>,
+    /// Last size and position, restored when the window is shown again.
+    pub geometry: Geometry,
+    pub tray: Option<TrayHandle>,
+    /// What the tray last showed; only changes are sent to the panel.
+    pub tray_sent: Option<TrayModel>,
+    pub settings_open: bool,
+    /// "Launch at login" as last read from / written to disk.
+    pub autostart: bool,
+}
+
+/// Requests from outside the window (see `remote`).
+fn remote_requests() -> impl futures::Stream<Item = Message> {
+    use futures::StreamExt;
+    crate::remote::stream().map(|r| Message::Ui(Ui::Remote(r)))
 }
 
 /// Hashable wrapper so the update stream can be a `Subscription::run_with`.
@@ -194,6 +219,22 @@ impl App {
                 open_memory_store()
             });
             (store, Arc::new(KeyringStore))
+        };
+
+        // Device preferences (mock mode never touches the disk).
+        let prefs = if config.mock {
+            Prefs::default()
+        } else {
+            Prefs::load(&config.prefs_path())
+        };
+        let autostart = !config.mock && crate::autostart::system_is_enabled();
+        let geometry = if config.screenshot.is_some() {
+            Geometry {
+                size: (1280.0, 800.0),
+                position: None,
+            }
+        } else {
+            Geometry::default()
         };
 
         // First frame comes from the cache, never from the network.
@@ -249,6 +290,14 @@ impl App {
             tz_offset: if config.mock { 0 } else { tz_offset },
             started: Instant::now(),
             first_frame_logged: !config.trace_startup,
+            prefs,
+            window: WindowState::new(prefs.close_to_tray),
+            window_id: None,
+            geometry,
+            tray: None,
+            tray_sent: None,
+            settings_open: false,
+            autostart,
             config,
         };
 
@@ -284,9 +333,211 @@ impl App {
             app.start_real_api()
         };
         let script = screenshot::script(&app.config);
+
+        // Window and tray. A screenshot run has no tray and always a window.
+        let screenshot = app.config.screenshot.is_some();
+        let minimized = !screenshot && (app.config.minimized || app.prefs.start_minimized);
+        let open = match app.window.start(minimized) {
+            Action::Open => app.open_window(false),
+            _ => Task::none(),
+        };
+        let tray = if screenshot {
+            // No panel to talk to: behave exactly like a plain window.
+            app.window.tray_ready(false);
+            Task::none()
+        } else {
+            app.start_tray(minimized)
+        };
+
         // Cached avatars from disk are on screen with the first frame.
         let avatars = app.fetch_avatars();
-        (app, Task::batch([task, script, avatars]))
+        (app, Task::batch([open, tray, task, script, avatars]))
+    }
+
+    // ------------------------------------------------- window and tray
+
+    fn window_settings(&self) -> window::Settings {
+        let g = self.geometry;
+        window::Settings {
+            size: iced::Size::new(g.size.0, g.size.1),
+            position: g.position.map_or(window::Position::Default, |(x, y)| {
+                window::Position::Specific(iced::Point::new(x, y))
+            }),
+            min_size: Some(iced::Size::new(
+                background::MIN_SIZE.0,
+                background::MIN_SIZE.1,
+            )),
+            resizable: self.config.screenshot.is_none(),
+            // The close button is a request we answer ourselves: to the
+            // tray when there is one, otherwise by quitting.
+            exit_on_close_request: false,
+            #[cfg(target_os = "linux")]
+            platform_specific: window::settings::PlatformSpecific {
+                application_id: crate::config::APP_ID.into(),
+                ..Default::default()
+            },
+            ..window::Settings::default()
+        }
+    }
+
+    /// Open the window; `raise` also asks the compositor to focus it (a
+    /// window shown from the tray, as opposed to the first one at startup).
+    fn open_window(&mut self, raise: bool) -> Task<Message> {
+        let (id, opened) = window::open(self.window_settings());
+        self.window_id = Some(id);
+        opened.then(move |id| {
+            let opened = Task::done(Message::Done(Done::WindowOpened(id)));
+            if raise {
+                Task::batch([window::gain_focus(id), opened])
+            } else {
+                opened
+            }
+        })
+    }
+
+    /// Close the window but keep running. The window (and with it the
+    /// renderer surfaces) is freed; so are the decoded images, which are
+    /// reloaded from the disk cache when the window comes back.
+    fn close_window(&mut self) -> Task<Message> {
+        let Some(id) = self.window_id.take() else {
+            return Task::none();
+        };
+        self.focused = false;
+        self.viewer = None;
+        self.menu_for = None;
+        self.emoji_open = false;
+        self.main_menu = false;
+        self.settings_open = false;
+        self.photos = Lru::new(IMAGE_BUDGET);
+        self.photo_loading.clear();
+        self.avatars = Lru::new(AVATAR_BUDGET);
+        self.avatar_loading.clear();
+        // The window and renderer are dropped when the runtime handles the
+        // close, a moment after this returns: trim the heap after that.
+        let trim = Task::perform(
+            async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _ = tokio::task::spawn_blocking(crate::memory::release_to_os).await;
+            },
+            |()| Message::Done(Done::Call(Ok(()))),
+        );
+        Task::batch([window::close(id), trim])
+    }
+
+    /// Carry out what the window state machine decided.
+    fn apply_window(&mut self, action: Action) -> Task<Message> {
+        match action {
+            Action::None => Task::none(),
+            Action::Open => {
+                let open = self.open_window(true);
+                // Images were dropped while hidden: load what is on screen.
+                Task::batch([open, self.fetch_avatars(), self.fetch_photos()])
+            }
+            Action::CloseWindow => self.close_window(),
+            Action::Focus => self.window_id.map_or_else(Task::none, |id| {
+                Task::batch([window::minimize(id, false), window::gain_focus(id)])
+            }),
+            Action::Exit => self.quit(),
+        }
+    }
+
+    /// Stop the tray service, then end the process.
+    fn quit(&mut self) -> Task<Message> {
+        match self.tray.take() {
+            Some(tray) => {
+                Task::future(async move { tray.shutdown().await }).then(|()| iced::exit())
+            }
+            None => iced::exit(),
+        }
+    }
+
+    fn start_tray(&self, minimized: bool) -> Task<Message> {
+        // At login the panel may start after us: a minimized start keeps
+        // trying for a while before the window is shown instead.
+        let attempts = if minimized { 15 } else { 3 };
+        let model = self.tray_model();
+        let sink: crate::tray::Sink = Arc::new(crate::remote::send);
+        Task::perform(
+            crate::tray::spawn(model, sink, attempts, Duration::from_secs(1)),
+            |r| Message::Done(Done::TrayReady(r)),
+        )
+    }
+
+    fn real_now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    pub fn muted(&self) -> bool {
+        self.prefs.mute.is_muted(Self::real_now())
+    }
+
+    /// What the tray should show right now.
+    pub fn tray_model(&self) -> TrayModel {
+        TrayModel {
+            unread: if self.auth.is_signed_in() {
+                self.chats.total_unread()
+            } else {
+                0
+            },
+            window_open: self.window.open,
+            muted: self.prefs.mute.describe(Self::real_now(), self.tz_offset),
+            start_minimized: self.prefs.start_minimized,
+        }
+    }
+
+    /// Push the tray model to the panel when it changed (called after every
+    /// update, so unread counts and state always follow the app).
+    fn sync_tray(&mut self) -> Option<Task<Message>> {
+        let tray = self.tray.clone()?;
+        let model = self.tray_model();
+        if self.tray_sent.as_ref() == Some(&model) {
+            return None;
+        }
+        self.tray_sent = Some(model.clone());
+        Some(Task::future(async move { tray.set_model(model).await }).discard())
+    }
+
+    fn save_prefs(&self) -> Task<Message> {
+        if self.config.mock {
+            return Task::none();
+        }
+        let (prefs, path) = (self.prefs, self.config.prefs_path());
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || prefs.save(&path))
+                    .await
+                    .map_err(|_| Error::Cancelled)?
+                    .map_err(|e| Error::Io(format!("settings: {}", e.kind())))
+            },
+            |r| Message::Done(Done::Call(r)),
+        )
+    }
+
+    fn on_remote(&mut self, request: Remote) -> Task<Message> {
+        match request {
+            Remote::Mute(m) => {
+                let now = Self::real_now();
+                self.prefs.mute = match m {
+                    MuteRequest::OneHour => MuteState::for_secs(now, 3600),
+                    MuteRequest::UntilEnabled => MuteState::UntilEnabled,
+                    MuteRequest::Off => MuteState::Off,
+                };
+                self.save_prefs()
+            }
+            Remote::ToggleStartMinimized => {
+                self.update_ui(Ui::SetStartMinimized(!self.prefs.start_minimized))
+            }
+            other => {
+                let action = self.window.handle(other);
+                let mut tasks = vec![self.apply_window(action)];
+                if let Remote::Show { chat: Some(chat) } = other
+                    && self.chats.get(chat).is_some()
+                {
+                    tasks.push(self.update_ui(Ui::SelectChat(chat)));
+                }
+                Task::batch(tasks)
+            }
+        }
     }
 
     /// Build a brand-new grammers client (boot, and after logout/revoke so
@@ -338,12 +589,21 @@ impl App {
             iced::Event::Window(window::Event::FileDropped(p)) => {
                 Some(Message::Ui(Ui::FileDropped(p)))
             }
+            iced::Event::Window(window::Event::CloseRequested) => {
+                Some(Message::Ui(Ui::CloseRequested))
+            }
+            iced::Event::Window(window::Event::Resized(size)) => {
+                Some(Message::Ui(Ui::WindowResized(size)))
+            }
+            iced::Event::Window(window::Event::Moved(p)) => Some(Message::Ui(Ui::WindowMoved(p))),
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 ..
             }) => Some(Message::Ui(Ui::Escape)),
             _ => None,
         })];
+        // Tray menu, second launch and notification clicks.
+        subs.push(Subscription::run(remote_requests));
         if let (Some(api), true) = (&self.api, self.auth.is_signed_in()) {
             subs.push(Subscription::run_with(
                 EventsSource(api.clone(), self.api_gen),
@@ -367,10 +627,14 @@ impl App {
     // ------------------------------------------------------------- update
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
+        let task = match message {
             Message::Ui(ui) => self.update_ui(ui),
             Message::Net(ev) => self.on_event(ev),
             Message::Done(done) => self.on_done(done),
+        };
+        match self.sync_tray() {
+            Some(sync) => Task::batch([task, sync]),
+            None => task,
         }
     }
 
@@ -670,6 +934,10 @@ impl App {
 
     /// Request (thumbnail) downloads for photos in the open conversation.
     fn fetch_photos(&mut self) -> Task<Message> {
+        // Nothing is drawn while the window is closed in the tray.
+        if self.window_id.is_none() {
+            return Task::none();
+        }
         let Some(conv) = &self.conversation else {
             return Task::none();
         };
@@ -749,6 +1017,9 @@ impl App {
     /// (and the open chat): disk cache first, then the network, at most
     /// [`AVATAR_CONCURRENCY`] at a time. Works offline from the disk cache.
     pub fn fetch_avatars(&mut self) -> Task<Message> {
+        if self.window_id.is_none() {
+            return Task::none();
+        }
         let api = self.api.clone();
         let wanted: Vec<(ChatId, i64)> = self
             .chats
@@ -1316,6 +1587,53 @@ impl App {
                 self.toast = None;
                 Task::none()
             }
+            Ui::Remote(request) => self.on_remote(request),
+            Ui::CloseRequested => {
+                let action = self.window.close_requested();
+                self.apply_window(action)
+            }
+            Ui::WindowResized(size) => {
+                self.geometry.resized(size.width, size.height);
+                Task::none()
+            }
+            Ui::WindowMoved(p) => {
+                self.geometry.moved(p.x, p.y);
+                Task::none()
+            }
+            Ui::OpenSettings => {
+                self.main_menu = false;
+                self.settings_open = true;
+                Task::none()
+            }
+            Ui::CloseSettings => {
+                self.settings_open = false;
+                Task::none()
+            }
+            Ui::SetCloseToTray(on) => {
+                self.prefs.close_to_tray = on;
+                self.window.close_to_tray = on;
+                self.save_prefs()
+            }
+            Ui::SetStartMinimized(on) => {
+                self.prefs.start_minimized = on;
+                self.save_prefs()
+            }
+            Ui::SetAutostart(on) => {
+                if self.config.mock {
+                    // Demo mode never writes outside its own process.
+                    self.autostart = on;
+                    return Task::none();
+                }
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || crate::autostart::set_enabled(on))
+                            .await
+                            .map_err(|_| Error::Cancelled)?
+                            .map_err(|e| Error::Io(format!("autostart: {}", e.kind())))
+                    },
+                    |r| Message::Done(Done::AutostartSet(r)),
+                )
+            }
             Ui::LogOut => {
                 self.main_menu = false;
                 let api = self.api.clone();
@@ -1352,7 +1670,8 @@ impl App {
                 if self.setup.as_ref().is_some_and(|f| f.advanced) {
                     return self.update_ui(Ui::CancelSetup);
                 }
-                let closed = std::mem::take(&mut self.main_menu)
+                let closed = std::mem::take(&mut self.settings_open)
+                    || std::mem::take(&mut self.main_menu)
                     || self.viewer.take().is_some()
                     || self.menu_for.take().is_some()
                     || self.pending_file.take().is_some()
@@ -1567,6 +1886,7 @@ impl App {
                 self.typing.message_from(m.chat_id, m.sender_id);
                 self.remember_names(std::iter::once(m));
                 if self.config.notifications
+                    && !self.muted()
                     && state::should_notify(
                         self.chats.get(m.chat_id),
                         m,
@@ -1580,7 +1900,11 @@ impl App {
                         m,
                         self.config.notification_preview,
                     );
-                    crate::desktop::notify(title, body);
+                    crate::desktop::notify(crate::desktop::Toast {
+                        title,
+                        body,
+                        chat: Some(m.chat_id),
+                    });
                 }
                 let m2 = m.clone();
                 tasks.push(self.store_bg(move |s| s.upsert_messages(&[m2])));
@@ -2139,6 +2463,29 @@ impl App {
             }
             Done::Screenshot(shot) => screenshot::save(&self.config, shot),
             Done::ScreenshotSaved => iced::exit(),
+            Done::TrayReady(Ok(handle)) => {
+                info!("tray icon registered");
+                self.tray = Some(handle);
+                // Whatever changed while registering goes out on the next sync.
+                self.tray_sent = None;
+                let action = self.window.tray_ready(true);
+                self.apply_window(action)
+            }
+            Done::TrayReady(Err(reason)) => {
+                info!(%reason, "no tray: closing the window quits");
+                let action = self.window.tray_ready(false);
+                self.apply_window(action)
+            }
+            Done::WindowOpened(_) => Task::none(),
+            Done::AutostartSet(Ok(on)) => {
+                self.autostart = on;
+                Task::none()
+            }
+            Done::AutostartSet(Err(e)) => {
+                warn!(error = %e, "could not change autostart");
+                self.autostart = crate::autostart::system_is_enabled();
+                self.toast("Could not change the launch-at-login setting".into())
+            }
         }
     }
 

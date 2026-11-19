@@ -71,6 +71,18 @@ pub enum Ui {
     CloseMedia,
     LogOut,
     ToggleMainMenu,
+    // background mode
+    /// A request from the tray, a second launch or a notification click.
+    Remote(crate::remote::Remote),
+    /// The window's close button (or Alt+F4): to the tray, or quit.
+    CloseRequested,
+    WindowResized(iced::Size),
+    WindowMoved(iced::Point),
+    OpenSettings,
+    CloseSettings,
+    SetCloseToTray(bool),
+    SetStartMinimized(bool),
+    SetAutostart(bool),
     DismissToast,
     // window / keyboard
     Focus(bool),
@@ -160,6 +172,11 @@ pub enum Done {
     FileReady(Result<PathBuf, Error>),
     FileOpened(Result<(), Error>),
     LoggedOut,
+    /// The tray registration finished (the text is the failure reason).
+    TrayReady(Result<crate::tray::TrayHandle, String>),
+    WindowOpened(iced::window::Id),
+    /// Autostart was switched; carries the state now on disk.
+    AutostartSet(Result<bool, Error>),
     Screenshot(iced::window::Screenshot),
     ScreenshotSaved,
 }
