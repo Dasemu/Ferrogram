@@ -63,6 +63,7 @@ fn open_chat_merges_cache_then_network_and_pages_older() {
     let _ = app.update(Message::Done(Done::CacheHistory {
         chat: ALICE,
         before: None,
+        complete: false,
         result: Ok(newest[PAGE - 10..].to_vec()),
     }));
     assert_eq!(app.conversation.as_ref().unwrap().messages().len(), 10);
@@ -76,13 +77,19 @@ fn open_chat_merges_cache_then_network_and_pages_older() {
     assert!(!conv.reached_start);
     let oldest = conv.oldest_id().unwrap();
 
-    // Older page: partial cache hit -> network fills it.
+    // Older page outside the confirmed range -> network fills it.
     let older: Vec<_> = history.iter().filter(|m| m.id < oldest).cloned().collect();
+    app.conversation.as_mut().unwrap().loading_older = true; // as load_older() does
     let _ = app.update(Message::Done(Done::CacheHistory {
         chat: ALICE,
         before: Some(oldest),
-        result: Ok(older[older.len() - 5..].to_vec()),
+        complete: false,
+        result: Ok(Vec::new()),
     }));
+    assert!(
+        app.conversation.as_ref().unwrap().loading_older,
+        "network fetch must still be pending"
+    );
     let _ = app.update(Message::Done(Done::NetHistory {
         chat: ALICE,
         before: Some(oldest),
@@ -324,7 +331,7 @@ async fn login(api: &FakeTelegram, phone: &str, code: &str, password: Option<&st
         if step >= inputs.len() || s.is_signed_in() {
             return s;
         }
-        auth::reduce(&mut s, AuthEvent::Input(inputs[step].clone()));
+        auth::reduce(&mut s, AuthEvent::Input(inputs[step].clone().into()));
         step += 1;
         pending = auth::reduce(&mut s, AuthEvent::Submit);
         if pending.is_none() {
@@ -391,8 +398,215 @@ async fn fake_update_stream_delivers_echo_and_read_receipts() {
         }
     }
     assert!(got_read && got_echo);
-    // Second subscriber gets an empty stream rather than stealing events.
-    assert!(api.events().next().await.is_none());
+    // A new subscriber takes over; the old stream ends instead of
+    // swallowing events.
+    let mut fresh = api.events();
+    assert!(events.next().await.is_none());
+    api.push_event(Event::ReadOutbox {
+        chat: ECHO_BOT,
+        max_id: 1,
+    });
+    assert!(matches!(fresh.next().await, Some(Event::ReadOutbox { .. })));
+}
+
+#[tokio::test]
+async fn login_logout_login_still_receives_events() {
+    let api = FakeTelegram::new(FakeOptions {
+        live_simulation: false,
+        ..Default::default()
+    });
+    assert!(
+        login(&api, "+34600123412", mock::CODE_PLAIN, None)
+            .await
+            .is_signed_in()
+    );
+    let _first = api.events();
+    api.log_out().await.unwrap();
+    assert!(api.dialogs(10).await.is_err());
+    assert!(
+        login(&api, "+34600123412", mock::CODE_PLAIN, None)
+            .await
+            .is_signed_in()
+    );
+    // The app subscribes again after re-login (new subscription generation).
+    let mut second = api.events();
+    api.edit_message(ALICE, 149, "after relogin".into())
+        .await
+        .unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(2), second.next())
+        .await
+        .expect("event after re-login");
+    assert!(matches!(ev, Some(Event::MessageEdited(m)) if m.text == "after relogin"));
+}
+
+#[test]
+fn logout_bumps_subscription_generation() {
+    let mut app = signed_in_app();
+    let gen_before = app.api_gen;
+    let _ = app.update(Message::Done(Done::LoggedOut));
+    assert!(matches!(app.auth, AuthState::Phone { .. }));
+    assert!(app.api_gen > gen_before, "event subscription must restart");
+}
+
+#[test]
+fn offline_restore_keeps_cache_and_retries() {
+    let mut app = mock_app();
+    // Cached chats from a previous run.
+    app.chats.replace(mock::mock_chats());
+    let fake = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        live_simulation: false,
+        ..Default::default()
+    });
+    let _ = app.update(Message::Done(Done::ApiReady(Ok(ApiHandle(fake)))));
+    let _ = app.update(Message::Done(Done::Restored(Err(
+        ferrogram::error::Error::Net("offline".into()),
+    ))));
+    assert_eq!(
+        app.auth,
+        AuthState::Restoring,
+        "never drop to the phone screen"
+    );
+    assert!(app.shows_main(), "cached chats stay visible");
+    assert_eq!(app.restore_attempt, 1);
+    assert!(matches!(
+        app.conn,
+        ferrogram::model::ConnState::Reconnecting { attempt: 1 }
+    ));
+    let _ = app.update(Message::Done(Done::Restored(Err(
+        ferrogram::error::Error::Net("still offline".into()),
+    ))));
+    assert_eq!(app.restore_attempt, 2);
+    // Network comes back.
+    let _ = app.update(Message::Done(Done::Restored(Ok(Some(mock::me())))));
+    assert!(app.auth.is_signed_in());
+    assert_eq!(app.restore_attempt, 0);
+
+    // A definite "not authorized" does go to the phone screen.
+    let mut app = mock_app();
+    let _ = app.update(Message::Done(Done::Restored(Ok(None))));
+    assert!(matches!(app.auth, AuthState::Phone { .. }));
+}
+
+#[test]
+fn pending_messages_have_no_actions_and_failures_roll_back() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: ALICE,
+        before: None,
+        result: Ok(mock::mock_history(ALICE)),
+    }));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("pending".into())));
+    let _ = app.update(Message::Ui(Ui::Send));
+    let temp = app
+        .conversation
+        .as_ref()
+        .unwrap()
+        .messages()
+        .last()
+        .unwrap()
+        .id;
+    assert!(temp < 0);
+    let _ = app.update(Message::Ui(Ui::MessageMenu(Some(temp))));
+    assert!(app.menu_for.is_none());
+    let _ = app.update(Message::Ui(Ui::Delete(temp)));
+    assert!(app.conversation.as_ref().unwrap().get(temp).is_some());
+
+    // Optimistic delete that fails on the server is restored.
+    let old = app.conversation.as_ref().unwrap().get(150).unwrap().clone();
+    let _ = app.update(Message::Ui(Ui::Delete(150)));
+    assert!(app.conversation.as_ref().unwrap().get(150).is_none());
+    let _ = app.update(Message::Done(Done::Rollback {
+        old: old.clone(),
+        error: ferrogram::error::Error::Protocol("MESSAGE_DELETE_FORBIDDEN".into()),
+    }));
+    assert_eq!(app.conversation.as_ref().unwrap().get(150), Some(&old));
+    assert!(app.toast.is_some());
+}
+
+#[test]
+fn dropped_files_need_confirmation_and_folders_are_rejected() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Done(Done::FileStat {
+        path: "/tmp/some-dir".into(),
+        result: Ok((0, true)),
+    }));
+    assert!(app.pending_file.is_none());
+    assert!(app.toast.as_deref().unwrap().contains("Folders"));
+    let _ = app.update(Message::Done(Done::FileStat {
+        path: "/tmp/cat.jpg".into(),
+        result: Ok((1234, false)),
+    }));
+    let f = app.pending_file.clone().unwrap();
+    assert_eq!((f.name.as_str(), f.size), ("cat.jpg", 1234));
+    let before = app.conversation.as_ref().unwrap().messages().len();
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(app.pending_file.is_none(), "Esc cancels the preview");
+    assert_eq!(app.conversation.as_ref().unwrap().messages().len(), before);
+    let _ = app.update(Message::Done(Done::FileStat {
+        path: "/tmp/cat.jpg".into(),
+        result: Ok((1234, false)),
+    }));
+    let _ = app.update(Message::Ui(Ui::SendPendingFile));
+    assert!(app.pending_file.is_none());
+    assert_eq!(
+        app.conversation.as_ref().unwrap().messages().len(),
+        before + 1
+    );
+}
+
+#[test]
+fn stale_sidebar_results_are_dropped_and_no_api_never_hangs() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SidebarSearch("hik".into())));
+    let _ = app.update(Message::Ui(Ui::SidebarSearch("hike".into())));
+    let _ = app.update(Message::Done(Done::SidebarResults {
+        query: "hik".into(),
+        result: Ok(vec![ChatMessage::text(ALICE, 1, false, 0, "stale")]),
+    }));
+    assert!(app.sidebar_messages.is_empty());
+    let _ = app.update(Message::Done(Done::SidebarResults {
+        query: "hike".into(),
+        result: Ok(vec![ChatMessage::text(ALICE, 1, false, 0, "fresh")]),
+    }));
+    assert_eq!(app.sidebar_messages.len(), 1);
+
+    // Login form without a client: the step fails instead of spinning.
+    let mut app = mock_app();
+    let _ = app.update(Message::Done(Done::Restored(Ok(None))));
+    let _ = app.update(Message::Ui(Ui::AuthInput("+34 600 123 412".into())));
+    let _ = app.update(Message::Ui(Ui::AuthSubmit));
+    assert!(!app.auth.is_busy());
+}
+
+#[tokio::test]
+async fn received_files_can_be_saved() {
+    let api = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        ..Default::default()
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("trail-map.pdf");
+    api.download_media(ALICE, 145, out.clone()).await.unwrap();
+    assert!(
+        std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("trail-map.pdf")
+    );
+    assert!(
+        api.download_media(ALICE, 141, out).await.is_err(),
+        "text-only message"
+    );
+}
+
+#[test]
+fn ui_messages_do_not_leak_typed_secrets() {
+    let ui = Ui::AuthInput("hunter2".into());
+    let setup = Ui::SetupApiHash("0123456789abcdef0123456789abcdef".into());
+    let dbg = format!("{ui:?} {setup:?}");
+    assert!(!dbg.contains("hunter2") && !dbg.contains("0123456789abcdef"));
 }
 
 #[tokio::test]
