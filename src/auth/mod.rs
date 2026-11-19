@@ -17,7 +17,30 @@ pub enum SignInOutcome {
     PasswordRequired { hint: Option<String> },
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+/// Text typed into a login field (phone, code or password). `Debug` never
+/// prints it, so it is safe inside messages/events that may be logged.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct SecretInput(pub String);
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretInput(len={})", self.0.chars().count())
+    }
+}
+
+impl From<String> for SecretInput {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for SecretInput {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+#[derive(Clone, PartialEq, Default)]
 pub enum AuthState {
     /// Checking the keyring for a stored session.
     #[default]
@@ -42,8 +65,56 @@ pub enum AuthState {
     SignedIn(UserSummary),
 }
 
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = |s: &String| s.chars().count();
+        match self {
+            Self::Restoring => f.write_str("Restoring"),
+            Self::Phone { input, error, busy } => f
+                .debug_struct("Phone")
+                .field("input_len", &len(input))
+                .field("error", error)
+                .field("busy", busy)
+                .finish(),
+            Self::Code {
+                phone,
+                input,
+                error,
+                busy,
+            } => f
+                .debug_struct("Code")
+                .field("phone", phone)
+                .field("input_len", &len(input))
+                .field("error", error)
+                .field("busy", busy)
+                .finish(),
+            Self::Password {
+                hint,
+                input,
+                error,
+                busy,
+            } => f
+                .debug_struct("Password")
+                .field("has_hint", &hint.is_some())
+                .field("input_len", &len(input))
+                .field("error", error)
+                .field("busy", busy)
+                .finish(),
+            Self::SignedIn(u) => f.debug_tuple("SignedIn").field(&u.id).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for UserSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserSummary")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Non-sensitive part of the logged-in user kept in the auth state.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct UserSummary {
     pub id: i64,
     pub name: String,
@@ -53,7 +124,7 @@ pub struct UserSummary {
 pub enum AuthEvent {
     /// Result of trying to restore a stored session. `Ok(Some(user))` = logged in.
     Restored(Result<Option<User>, Error>),
-    Input(String),
+    Input(SecretInput),
     Submit,
     Back,
     CodeRequested(Result<(), Error>),
@@ -102,7 +173,7 @@ pub fn reduce(state: &mut AuthState, event: AuthEvent) -> Option<AuthCommand> {
         }
 
         // ---- phone entry
-        (S::Phone { error, busy, .. }, E::Input(s)) => {
+        (S::Phone { error, busy, .. }, E::Input(SecretInput(s))) => {
             let input: String = s
                 .chars()
                 .filter(|c| c.is_ascii_digit() || " +-()".contains(*c))
@@ -151,7 +222,7 @@ pub fn reduce(state: &mut AuthState, event: AuthEvent) -> Option<AuthCommand> {
             S::Code {
                 phone, error, busy, ..
             },
-            E::Input(s),
+            E::Input(SecretInput(s)),
         ) => {
             let input: String = s.chars().filter(char::is_ascii_digit).take(6).collect();
             *state = S::Code {
@@ -221,7 +292,7 @@ pub fn reduce(state: &mut AuthState, event: AuthEvent) -> Option<AuthCommand> {
             S::Password {
                 hint, error, busy, ..
             },
-            E::Input(s),
+            E::Input(SecretInput(s)),
         ) => {
             *state = S::Password {
                 hint,
@@ -484,6 +555,27 @@ mod tests {
         });
         reduce(&mut s, AuthEvent::LoggedOut);
         assert!(matches!(s, AuthState::Phone { error: Some(_), .. }));
+    }
+
+    #[test]
+    fn debug_never_prints_typed_secrets() {
+        let s = AuthState::Password {
+            hint: Some("my dog".into()),
+            input: "hunter2".into(),
+            error: None,
+            busy: false,
+        };
+        let code = AuthState::Code {
+            phone: Phone::new("+34600123412"),
+            input: "54321".into(),
+            error: None,
+            busy: false,
+        };
+        let ev = AuthEvent::Input("hunter2".into());
+        let all = format!("{s:?} {code:?} {ev:?}");
+        for needle in ["hunter2", "my dog", "54321", "600123"] {
+            assert!(!all.contains(needle), "{needle} leaked in {all}");
+        }
     }
 
     #[test]

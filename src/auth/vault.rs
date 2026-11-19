@@ -62,11 +62,16 @@ impl Vault {
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ct);
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::config::ensure_private_dir(dir)?;
         }
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &out)?;
-        restrict_permissions(&tmp);
+        {
+            use std::io::Write;
+            // Created 0600 from the start: no window where it is world-readable.
+            let mut f = crate::config::create_private_file(&tmp)?;
+            f.write_all(&out)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -102,15 +107,6 @@ impl Vault {
     }
 }
 
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +126,12 @@ mod tests {
             b"AUTH-KEY-BYTES-0123456789"
         );
         assert_eq!(store.len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(v.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         v.clear().unwrap();
         assert!(v.load().unwrap().is_none());
         assert!(store.is_empty());
