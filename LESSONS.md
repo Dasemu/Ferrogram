@@ -77,3 +77,4 @@ Things learned while building Ferrogram, newest first.
   leading `+`.
 - **Deterministic screenshots:** pin "now" (`mock::MOCK_NOW`) and the time
   zone offset in mock mode, and drive the UI with a timed message script.
+- Bot pushes made with `GITHUB_TOKEN` never trigger `push` workflows, so the release workflow chains off the version workflow with `workflow_run` (conclusion `success`, branch `main`, checkout `ref: main` for the bump commit).
