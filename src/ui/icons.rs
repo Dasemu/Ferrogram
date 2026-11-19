@@ -50,6 +50,19 @@ icons! {
     Bot => "bot.svg",
     Download => "download.svg",
     ArrowDown => "arrow-down.svg",
+    ArrowUp => "arrow-up.svg",
+    Plus => "plus.svg",
+    Link => "link.svg",
+    Music => "music.svg",
+    Mic => "mic.svg",
+    Play => "play.svg",
+    Film => "film.svg",
+    Folder => "folder.svg",
+    Bell => "bell.svg",
+    BellOff => "bell-off.svg",
+    Info => "info.svg",
+    AtSign => "at-sign.svg",
+    ImagePlay => "image-play.svg",
 }
 
 /// Handles are built once per icon and cloned (an `Arc` bump) by `view()`.

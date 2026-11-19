@@ -20,7 +20,8 @@ use secrecy::SecretString;
 use crate::auth::SignInOutcome;
 use crate::error::{Phone, Result};
 use crate::model::{
-    Chat, ChatId, ConnState, Draft, GlobalHit, Message, MessageId, Presence, Reaction, TypingAction,
+    Chat, ChatId, ConnState, Draft, Folder, GlobalHit, Message, MessageId, Presence, Reaction,
+    TypingAction,
 };
 
 /// Hard cap on photo bytes downloaded for display.
@@ -70,6 +71,17 @@ pub enum Event {
         chat: ChatId,
         draft: Option<Draft>,
     },
+    /// A folder was created, edited (`Some`) or deleted (`None`), maybe on
+    /// another device (`updateDialogFilter`).
+    FolderChanged {
+        id: i32,
+        folder: Option<Folder>,
+    },
+    /// The folder order changed (`updateDialogFilterOrder`).
+    FoldersOrder(Vec<i32>),
+    /// Something about the folders changed that the update does not say
+    /// (`updateDialogFilters`): fetch them again.
+    FoldersStale,
     SessionRevoked,
 }
 
@@ -159,6 +171,15 @@ pub trait TelegramApi: Send + Sync {
     async fn set_typing(&self, chat: ChatId, active: bool) -> Result<()>;
     /// Save a message's media (file, photo) to `path`.
     async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()>;
+    /// The account's chat folders in order (`messages.getDialogFilters`).
+    async fn dialog_filters(&self) -> Result<Vec<Folder>>;
+    /// Create or replace a folder (`messages.updateDialogFilter`); a new
+    /// folder has an id no other folder uses.
+    async fn save_dialog_filter(&self, folder: Folder) -> Result<()>;
+    /// Delete a folder (`messages.updateDialogFilter` without a filter).
+    async fn delete_dialog_filter(&self, id: i32) -> Result<()>;
+    /// Reorder folders (`messages.updateDialogFiltersOrder`).
+    async fn reorder_dialog_filters(&self, order: Vec<i32>) -> Result<()>;
     /// One-shot user-facing notice from the backend (e.g. session reset).
     fn take_notice(&self) -> Option<String> {
         None

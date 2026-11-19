@@ -3,10 +3,11 @@
 //! parser path (`Deserializable`) is exercised as well.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ferrogram::model::{CHANNEL_OFFSET, Media};
+use ferrogram::model::{CHANNEL_OFFSET, Folder, Media};
 use ferrogram::net::Event;
 use ferrogram::net::types::{
-    dialog_info, event_from_update, largest_size, message_from_tl, peer_to_chat_id, rpc_error,
+    dialog_info, event_from_update, event_from_update_as, folder_from_tl, folder_to_tl,
+    folders_from_tl, largest_size, message_from_tl, peer_to_chat_id, rpc_error,
 };
 use grammers_client::tl;
 use grammers_client::tl::{Deserializable, Serializable};
@@ -706,4 +707,204 @@ fn drafts_convert_from_updates_and_dialogs() {
         draft: draft_message("topic", None),
     });
     assert_eq!(event_from_update(&wire(topic)), None);
+}
+
+// ------------------------------------------------------------------ folders
+
+fn ip_user(id: i64) -> tl::enums::InputPeer {
+    tl::enums::InputPeer::User(tl::types::InputPeerUser {
+        user_id: id,
+        access_hash: id * 7,
+    })
+}
+
+fn ip_chat(id: i64) -> tl::enums::InputPeer {
+    tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: id })
+}
+
+fn ip_channel(id: i64) -> tl::enums::InputPeer {
+    tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+        channel_id: id,
+        access_hash: id * 3,
+    })
+}
+
+fn title(t: &str) -> tl::enums::TextWithEntities {
+    tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+        text: t.into(),
+        entities: Vec::new(),
+    })
+}
+
+fn raw_filter() -> tl::types::DialogFilter {
+    tl::types::DialogFilter {
+        contacts: true,
+        non_contacts: false,
+        groups: true,
+        broadcasts: false,
+        bots: true,
+        exclude_muted: true,
+        exclude_read: false,
+        exclude_archived: true,
+        title_noanimate: false,
+        id: 5,
+        title: title("Work"),
+        emoticon: Some("💼".into()),
+        color: None,
+        pinned_peers: vec![ip_user(11), tl::enums::InputPeer::PeerSelf],
+        // 11 is listed twice (pinned and included): it must not repeat.
+        include_peers: vec![ip_user(11), ip_chat(7), ip_channel(900)],
+        exclude_peers: vec![ip_user(12)],
+    }
+}
+
+#[test]
+fn dialog_filter_converts_to_a_folder() {
+    let wire = wire(tl::enums::DialogFilter::Filter(raw_filter()));
+    let (f, peers) = folder_from_tl(&wire, 42).unwrap();
+    assert_eq!((f.id, f.title.as_str()), (5, "Work"));
+    assert_eq!(f.emoticon.as_deref(), Some("💼"));
+    assert!(f.contacts && f.groups && f.bots);
+    assert!(!f.non_contacts && !f.channels);
+    assert!(f.exclude_muted && f.exclude_archived && !f.exclude_read);
+    assert_eq!(
+        f.pinned,
+        vec![11, 42],
+        "inputPeerSelf is Saved Messages (our id)"
+    );
+    assert_eq!(
+        f.include,
+        vec![-7, -CHANNEL_OFFSET - 900],
+        "Bot API ids; the pinned chat is not repeated"
+    );
+    assert_eq!(f.exclude, vec![12]);
+    assert!(!f.shared);
+    // Access hashes are kept for saving the folder again.
+    assert!(peers.iter().any(|(id, p)| *id == 11 && *p == ip_user(11)));
+    assert!(
+        peers
+            .iter()
+            .any(|(id, p)| *id == -CHANNEL_OFFSET - 900 && *p == ip_channel(900))
+    );
+}
+
+#[test]
+fn default_and_chatlist_filters() {
+    assert!(folder_from_tl(&tl::enums::DialogFilter::Default, 1).is_none());
+    let shared = tl::enums::DialogFilter::Chatlist(tl::types::DialogFilterChatlist {
+        has_my_invites: true,
+        title_noanimate: false,
+        id: 9,
+        title: title("Shared"),
+        emoticon: None,
+        color: None,
+        pinned_peers: vec![],
+        include_peers: vec![ip_channel(5)],
+    });
+    let (f, _) = folder_from_tl(&wire(shared), 1).unwrap();
+    assert!(f.shared);
+    assert_eq!(f.include, vec![-CHANNEL_OFFSET - 5]);
+    assert!(
+        !f.contacts && !f.groups,
+        "shared folders have no type rules"
+    );
+}
+
+#[test]
+fn folder_converts_back_to_tl() {
+    let (f, peers) = folder_from_tl(&tl::enums::DialogFilter::Filter(raw_filter()), 42).unwrap();
+    let known: std::collections::HashMap<_, _> = peers.into_iter().collect();
+    let resolve = |id: i64| known.get(&id).cloned();
+    let back = folder_to_tl(&f, 42, &resolve).unwrap();
+    let tl::enums::DialogFilter::Filter(d) = wire(back) else {
+        panic!("a normal folder is a dialogFilter");
+    };
+    assert_eq!(d.id, 5);
+    assert!(d.contacts && d.groups && d.bots && !d.broadcasts && !d.non_contacts);
+    assert!(d.exclude_muted && d.exclude_archived && !d.exclude_read);
+    assert_eq!(
+        d.pinned_peers,
+        vec![ip_user(11), tl::enums::InputPeer::PeerSelf]
+    );
+    assert_eq!(d.include_peers, vec![ip_chat(7), ip_channel(900)]);
+    assert_eq!(d.exclude_peers, vec![ip_user(12)]);
+    let tl::enums::TextWithEntities::Entities(t) = &d.title;
+    assert_eq!(t.text, "Work");
+}
+
+#[test]
+fn saving_a_folder_never_drops_unknown_chats_silently() {
+    let mut f = Folder::new(3, "X");
+    f.include = vec![5, 6];
+    let only5 = |id: i64| (id == 5).then(|| ip_user(5));
+    assert_eq!(folder_to_tl(&f, 1, &only5).unwrap_err(), 6);
+    // A pinned chat is written once, in `pinned_peers`.
+    let mut g = Folder::new(3, "X");
+    g.pinned = vec![5];
+    g.include = vec![5];
+    let tl::enums::DialogFilter::Filter(d) = folder_to_tl(&g, 1, &only5).unwrap() else {
+        panic!()
+    };
+    assert_eq!((d.pinned_peers.len(), d.include_peers.len()), (1, 0));
+    // A shared folder goes back as a chat list, not as a filter.
+    g.shared = true;
+    assert!(matches!(
+        folder_to_tl(&g, 1, &only5).unwrap(),
+        tl::enums::DialogFilter::Chatlist(_)
+    ));
+}
+
+#[test]
+fn folder_list_skips_the_all_chats_placeholder() {
+    let r = tl::enums::messages::DialogFilters::Filters(tl::types::messages::DialogFilters {
+        tags_enabled: false,
+        filters: vec![
+            tl::enums::DialogFilter::Default,
+            tl::enums::DialogFilter::Filter(raw_filter()),
+        ],
+    });
+    let (folders, peers) = folders_from_tl(&wire(r), 42);
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0].id, 5);
+    assert!(!peers.is_empty());
+}
+
+#[test]
+fn folder_updates_map_to_events() {
+    let changed = tl::enums::Update::DialogFilter(tl::types::UpdateDialogFilter {
+        id: 5,
+        filter: Some(tl::enums::DialogFilter::Filter(raw_filter())),
+    });
+    match event_from_update_as(&wire(changed), 42) {
+        Some(Event::FolderChanged {
+            id: 5,
+            folder: Some(f),
+        }) => {
+            assert_eq!(f.title, "Work");
+            assert!(f.pinned.contains(&42));
+        }
+        other => panic!("{other:?}"),
+    }
+    let deleted = tl::enums::Update::DialogFilter(tl::types::UpdateDialogFilter {
+        id: 5,
+        filter: None,
+    });
+    assert_eq!(
+        event_from_update(&wire(deleted)),
+        Some(Event::FolderChanged {
+            id: 5,
+            folder: None
+        })
+    );
+    let order = tl::enums::Update::DialogFilterOrder(tl::types::UpdateDialogFilterOrder {
+        order: vec![0, 7, 5],
+    });
+    assert_eq!(
+        event_from_update(&wire(order)),
+        Some(Event::FoldersOrder(vec![0, 7, 5]))
+    );
+    assert_eq!(
+        event_from_update(&tl::enums::Update::DialogFilters),
+        Some(Event::FoldersStale)
+    );
 }

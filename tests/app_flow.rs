@@ -1503,3 +1503,315 @@ fn copy_image_closes_the_menu() {
     let _ = app.update(Message::Done(Done::ImageCopied(Ok(()))));
     assert_eq!(app.toast.as_deref(), Some("Image copied."));
 }
+
+// ------------------------------------------------------------------ folders
+
+use ferrogram::app::folders::{EditorFlag, Picker};
+use ferrogram::model::Folder;
+
+fn app_with_folders() -> App {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Done(Done::Folders(Ok(mock::mock_folders()))));
+    app
+}
+
+fn visible_ids(app: &App) -> Vec<i64> {
+    app.visible_chats().iter().map(|c| c.id).collect()
+}
+
+#[test]
+fn folder_tabs_filter_the_chat_list() {
+    let mut app = app_with_folders();
+    assert_eq!(app.folders.ids(), vec![2, 3, 4]);
+    let all = visible_ids(&app);
+    assert!(all.len() > 10, "All chats shows everything");
+
+    // Work: groups + Echo Bot, without muted chats.
+    let _ = app.update(Message::Ui(Ui::SelectFolder(Some(2))));
+    let work = visible_ids(&app);
+    assert!(work.contains(&ECHO_BOT) && work.contains(&mock::RUST_GROUP));
+    assert!(
+        !work.contains(&mock::DEV_CHANNEL),
+        "channels are not in Work"
+    );
+    assert!(!work.contains(&ALICE));
+    // Muted groups are excluded by the flag ("Weekend Hiking" is muted).
+    assert!(
+        app.chats
+            .all()
+            .iter()
+            .any(|c| c.muted && c.kind == ferrogram::model::ChatKind::Group)
+    );
+    assert!(
+        work.iter()
+            .all(|id| !app.chats.get(*id).unwrap().muted || *id == ECHO_BOT)
+    );
+
+    // People: contacts and non-contacts, but not the Echo Bot (never list).
+    let _ = app.update(Message::Ui(Ui::SelectFolder(Some(3))));
+    let people = visible_ids(&app);
+    assert!(people.contains(&ALICE));
+    assert!(!people.contains(&ECHO_BOT));
+    assert!(people.iter().all(|id| *id > 0));
+
+    // Back to everything; unknown folder ids fall back to All chats.
+    let _ = app.update(Message::Ui(Ui::SelectFolder(None)));
+    assert_eq!(visible_ids(&app), all);
+    let _ = app.update(Message::Ui(Ui::SelectFolder(Some(99))));
+    assert_eq!(app.folders.selected, None);
+}
+
+#[test]
+fn folder_updates_from_other_devices_are_applied() {
+    let mut app = app_with_folders();
+    let _ = app.update(Message::Ui(Ui::SelectFolder(Some(4))));
+    let mut f = Folder::new(6, "Fresh");
+    f.bots = true;
+    let _ = app.update(Message::Net(Event::FolderChanged {
+        id: 6,
+        folder: Some(f),
+    }));
+    assert_eq!(app.folders.ids(), vec![2, 3, 4, 6]);
+    let _ = app.update(Message::Net(Event::FoldersOrder(vec![0, 6, 2, 3, 4])));
+    assert_eq!(app.folders.ids(), vec![6, 2, 3, 4]);
+    // The open folder is deleted elsewhere: back to All chats.
+    let _ = app.update(Message::Net(Event::FolderChanged {
+        id: 4,
+        folder: None,
+    }));
+    assert_eq!(app.folders.selected, None);
+    assert_eq!(app.folders.ids(), vec![6, 2, 3]);
+    // A stale marker asks for a refetch but changes nothing by itself.
+    let _ = app.update(Message::Net(Event::FoldersStale));
+    assert_eq!(app.folders.ids(), vec![6, 2, 3]);
+}
+
+#[test]
+fn add_to_folder_is_optimistic_and_rolls_back_on_refusal() {
+    let mut app = app_with_folders();
+    let _ = app.update(Message::Ui(Ui::ChatMenu(Some(ALICE))));
+    assert_eq!(app.folders.chat_menu, Some(ALICE));
+    let before = app.folders.list.clone();
+    // Alice is a contact, not in Work: toggling includes her.
+    let _ = app.update(Message::Ui(Ui::ChatInFolder(ALICE, 2)));
+    assert_eq!(app.folders.chat_menu, None, "menu closes");
+    assert!(app.folders.get(2).unwrap().include.contains(&ALICE));
+    // The server said no: the list goes back and the user is told.
+    let _ = app.update(Message::Done(Done::FolderOp {
+        before: before.clone(),
+        result: Err(ferrogram::error::Error::Protocol(
+            "400 DIALOG_FILTERS_TOO_MUCH".into(),
+        )),
+    }));
+    assert_eq!(app.folders.list, before);
+    assert!(
+        app.toast
+            .as_deref()
+            .unwrap()
+            .contains("maximum number of folders")
+    );
+    // Toggling again from the menu of a shown chat removes it.
+    let _ = app.update(Message::Ui(Ui::ChatInFolder(ECHO_BOT, 2)));
+    assert!(!app.folders.get(2).unwrap().include.contains(&ECHO_BOT));
+}
+
+#[test]
+fn deleting_and_reordering_folders() {
+    let mut app = app_with_folders();
+    let _ = app.update(Message::Ui(Ui::OpenFolders));
+    assert!(app.folders.manager_open);
+    let _ = app.update(Message::Ui(Ui::FolderMove(4, -1)));
+    assert_eq!(app.folders.ids(), vec![2, 4, 3]);
+    let _ = app.update(Message::Ui(Ui::FolderMove(2, -1)));
+    assert_eq!(app.folders.ids(), vec![2, 4, 3], "first folder stays");
+    // Delete asks first.
+    let _ = app.update(Message::Ui(Ui::FolderDeleteAsk(4)));
+    assert_eq!(app.folders.confirm_delete, Some(4));
+    assert_eq!(app.folders.ids(), vec![2, 4, 3]);
+    let _ = app.update(Message::Ui(Ui::FolderDeleteCancel));
+    assert_eq!(app.folders.confirm_delete, None);
+    let _ = app.update(Message::Ui(Ui::FolderDeleteConfirm(4)));
+    assert_eq!(app.folders.ids(), vec![2, 3]);
+    // A refused delete brings the folder back.
+    let before = vec![Folder::new(2, "a"), Folder::new(4, "b")];
+    let _ = app.update(Message::Done(Done::FolderOp {
+        before: before.clone(),
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    assert_eq!(app.folders.list, before);
+    // Esc closes the manager.
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(!app.folders.manager_open);
+}
+
+#[test]
+fn folder_editor_create_validate_save() {
+    let mut app = app_with_folders();
+    let _ = app.update(Message::Ui(Ui::FolderNew(Some(ALICE))));
+    let ed = app.folder_editor.as_ref().unwrap();
+    assert!(ed.is_new);
+    assert_eq!(ed.folder.id, 5, "lowest free id");
+    assert!(ed.contains(Picker::Include, ALICE), "from the chat menu");
+
+    // A name is required.
+    let _ = app.update(Message::Ui(Ui::FolderSave));
+    assert!(
+        app.folder_editor
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("name")
+    );
+    assert!(!app.folder_editor.as_ref().unwrap().saving);
+
+    let _ = app.update(Message::Ui(Ui::FolderTitle("Friends and family".into())));
+    assert_eq!(
+        app.folder_editor
+            .as_ref()
+            .unwrap()
+            .folder
+            .title
+            .chars()
+            .count(),
+        12
+    );
+    let _ = app.update(Message::Ui(Ui::FolderFlag(EditorFlag::Groups)));
+    let _ = app.update(Message::Ui(Ui::FolderPick(Some(Picker::Exclude))));
+    let _ = app.update(Message::Ui(Ui::FolderChatToggle(
+        Picker::Exclude,
+        mock::RUST_GROUP,
+    )));
+    let _ = app.update(Message::Ui(Ui::FolderPick(None)));
+    // Esc inside the picker closes only the picker.
+    let _ = app.update(Message::Ui(Ui::FolderPick(Some(Picker::Include))));
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(app.folder_editor.as_ref().unwrap().picker.is_none());
+    assert!(app.folder_editor.is_some());
+
+    let _ = app.update(Message::Ui(Ui::FolderSave));
+    assert!(
+        app.folder_editor.as_ref().unwrap().saving,
+        "waits for the server"
+    );
+    let saved = app.folder_editor.as_ref().unwrap().to_save();
+    assert!(saved.exclude.contains(&mock::RUST_GROUP));
+    // The server refuses (too many folders): the editor stays open with the reason.
+    let _ = app.update(Message::Done(Done::FolderSaved {
+        folder: saved.clone(),
+        result: Err(ferrogram::error::Error::Protocol(
+            "400 DIALOG_FILTERS_TOO_MUCH".into(),
+        )),
+    }));
+    let ed = app.folder_editor.as_ref().unwrap();
+    assert!(!ed.saving);
+    assert!(
+        ed.error
+            .as_deref()
+            .unwrap()
+            .contains("maximum number of folders")
+    );
+    assert_eq!(app.folders.ids(), vec![2, 3, 4]);
+    // Retry succeeds: the folder is in the list and the editor closed.
+    let _ = app.update(Message::Ui(Ui::FolderSave));
+    let _ = app.update(Message::Done(Done::FolderSaved {
+        folder: saved.clone(),
+        result: Ok(()),
+    }));
+    assert!(app.folder_editor.is_none());
+    assert_eq!(app.folders.ids(), vec![2, 3, 4, 5]);
+    assert_eq!(app.folders.get(5).unwrap().title, "Friends and");
+
+    // Editing an existing folder starts from its current values.
+    let _ = app.update(Message::Ui(Ui::FolderEdit(5)));
+    let ed = app.folder_editor.as_ref().unwrap();
+    assert!(!ed.is_new);
+    assert!(ed.flag(EditorFlag::Groups));
+    let _ = app.update(Message::Ui(Ui::Escape));
+    assert!(app.folder_editor.is_none());
+}
+
+#[test]
+fn shared_folders_are_not_edited_here() {
+    let mut app = signed_in_app();
+    let mut shared = Folder::new(7, "Shared");
+    shared.shared = true;
+    shared.include = vec![mock::DEV_CHANNEL];
+    let _ = app.update(Message::Done(Done::Folders(Ok(vec![shared]))));
+    let _ = app.update(Message::Ui(Ui::FolderEdit(7)));
+    assert!(app.folder_editor.is_none());
+    assert!(app.toast.as_deref().unwrap().contains("official app"));
+    let before = app.folders.list.clone();
+    let _ = app.update(Message::Ui(Ui::ChatInFolder(ALICE, 7)));
+    assert_eq!(app.folders.list, before);
+}
+
+#[tokio::test]
+async fn fake_backend_folder_roundtrip_with_events() {
+    use ferrogram::error::Error;
+    let fake = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        live_simulation: false,
+        ..Default::default()
+    });
+    let mut events = fake.events();
+    let list = fake.dialog_filters().await.unwrap();
+    assert_eq!(list.iter().map(|f| f.id).collect::<Vec<_>>(), vec![2, 3, 4]);
+
+    let mut f = Folder::new(5, "Trips");
+    f.include = vec![ALICE];
+    fake.save_dialog_filter(f.clone()).await.unwrap();
+    assert!(matches!(
+        events.next().await,
+        Some(Event::FolderChanged { id: 5, folder: Some(ref g) }) if g.title == "Trips"
+    ));
+    assert_eq!(fake.dialog_filters().await.unwrap().len(), 4);
+
+    // The server validates like Telegram does.
+    let empty = Folder::new(6, "Empty");
+    assert!(matches!(
+        fake.save_dialog_filter(empty).await,
+        Err(Error::Protocol(e)) if e.contains("FILTER_INCLUDE_EMPTY")
+    ));
+    assert!(matches!(
+        fake.save_dialog_filter(Folder::new(6, " ")).await,
+        Err(Error::Protocol(e)) if e.contains("FILTER_TITLE_EMPTY")
+    ));
+
+    fake.reorder_dialog_filters(vec![5, 4, 3, 2]).await.unwrap();
+    assert!(matches!(events.next().await, Some(Event::FoldersOrder(o)) if o == vec![5, 4, 3, 2]));
+    let ids: Vec<_> = fake
+        .dialog_filters()
+        .await
+        .unwrap()
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(ids, vec![5, 4, 3, 2]);
+
+    fake.delete_dialog_filter(3).await.unwrap();
+    assert!(matches!(
+        events.next().await,
+        Some(Event::FolderChanged {
+            id: 3,
+            folder: None
+        })
+    ));
+    assert_eq!(fake.dialog_filters().await.unwrap().len(), 3);
+
+    // The folder limit.
+    for i in 0..10 {
+        let mut g = Folder::new(20 + i, format!("F{i}"));
+        g.bots = true;
+        if fake.save_dialog_filter(g).await.is_err() {
+            break;
+        }
+    }
+    let mut over = Folder::new(99, "Over");
+    over.bots = true;
+    assert!(matches!(
+        fake.save_dialog_filter(over).await,
+        Err(Error::Protocol(e)) if e.contains("DIALOG_FILTERS_TOO_MUCH")
+    ));
+}

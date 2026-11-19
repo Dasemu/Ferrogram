@@ -23,6 +23,16 @@ pub enum ScreenshotTarget {
     Media,
     ApiSetup,
     Settings,
+    /// Folder tabs with a folder selected.
+    Folders,
+    /// The "Chat folders" manager dialog.
+    FolderManager,
+    /// The folder editor (name, chats, types, exclusions).
+    FolderEditor,
+    /// The chat picker of the folder editor.
+    FolderPicker,
+    /// A chat row's context menu with "Add to folder".
+    ChatMenu,
 }
 
 impl ScreenshotTarget {
@@ -38,6 +48,11 @@ impl ScreenshotTarget {
             "media" => Self::Media,
             "api-setup" => Self::ApiSetup,
             "settings" => Self::Settings,
+            "folders" => Self::Folders,
+            "folder-manager" => Self::FolderManager,
+            "folder-editor" => Self::FolderEditor,
+            "folder-picker" => Self::FolderPicker,
+            "chat-menu" => Self::ChatMenu,
             _ => return None,
         })
     }

@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use iced::widget::scrollable::Viewport;
 
+use crate::app::folders::{EditorFlag, Picker};
 use crate::auth::{SecretInput, SignInOutcome};
 use crate::error::Error;
-use crate::model::{Chat, ChatId, GlobalHit, Message as ChatMessage, MessageId, User};
+use crate::model::{Chat, ChatId, Folder, GlobalHit, Message as ChatMessage, MessageId, User};
 use crate::net::{ApiHandle, Event};
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,34 @@ pub enum Ui {
     TextPasted(String),
     /// "Copy image" on a photo message.
     CopyImage(ChatId, MessageId),
+    // chat folders
+    /// A folder tab (`None` = All chats).
+    SelectFolder(Option<i32>),
+    /// Right click on a folder tab: toggle its small menu.
+    FolderTabMenu(Option<i32>),
+    /// Right click on a chat row: toggle its menu ("Add to folder").
+    ChatMenu(Option<ChatId>),
+    /// Add the chat to / remove it from a folder.
+    ChatInFolder(ChatId, i32),
+    OpenFolders,
+    CloseFolders,
+    /// Move a folder up (-1) or down (+1) in the order.
+    FolderMove(i32, isize),
+    FolderDeleteAsk(i32),
+    FolderDeleteConfirm(i32),
+    FolderDeleteCancel,
+    /// Open the editor for a new folder (optionally with one chat in it).
+    FolderNew(Option<ChatId>),
+    FolderEdit(i32),
+    FolderTitle(String),
+    FolderFlag(EditorFlag),
+    /// Open (`Some`) or close (`None`) the chat picker of the editor.
+    FolderPick(Option<Picker>),
+    FolderPickQuery(String),
+    FolderChatToggle(Picker, ChatId),
+    FolderChatRemove(Picker, ChatId),
+    FolderSave,
+    FolderEditorClose,
     CancelPendingFile,
     ToggleEmoji,
     InsertEmoji(&'static str),
@@ -165,6 +194,19 @@ pub enum Done {
         path: Option<PathBuf>,
     },
     MediaSaved(Result<(), Error>),
+    /// The folder list from the server.
+    Folders(Result<Vec<Folder>, Error>),
+    /// The editor's folder was saved (or refused).
+    FolderSaved {
+        folder: Folder,
+        result: Result<(), Error>,
+    },
+    /// An optimistic folder change finished; on failure the list goes back
+    /// to `before`.
+    FolderOp {
+        before: Vec<Folder>,
+        result: Result<(), Error>,
+    },
     /// The clipboard content found after Ctrl+V.
     Pasted(crate::clipboard::Clip),
     /// A pasted image was written to a private temporary file.

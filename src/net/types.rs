@@ -7,7 +7,8 @@ use grammers_client::tl;
 
 use super::Event;
 use crate::model::{
-    CHANNEL_OFFSET, ChatId, Draft, Media, Message, Presence, Reaction, SendState, TypingAction,
+    CHANNEL_OFFSET, ChatId, Draft, Folder, Media, Message, Presence, Reaction, SendState,
+    TypingAction,
 };
 
 /// `tl::Peer` → Bot-API style chat id.
@@ -226,9 +227,26 @@ pub fn reactions_from_tl(r: &tl::enums::MessageReactions) -> Vec<Reaction> {
 }
 
 /// Map a raw update into a domain event. `None` for updates we ignore.
+/// (`self_id` is unknown here: a folder entry for "Saved Messages" is dropped.)
 pub fn event_from_update(update: &tl::enums::Update) -> Option<Event> {
+    event_from_update_as(update, 0)
+}
+
+/// Like [`event_from_update`], knowing our own user id (folders refer to
+/// Saved Messages as `inputPeerSelf`).
+pub fn event_from_update_as(update: &tl::enums::Update, self_id: i64) -> Option<Event> {
     use tl::enums::Update as U;
     match update {
+        U::DialogFilter(u) => Some(Event::FolderChanged {
+            id: u.id,
+            folder: u
+                .filter
+                .as_ref()
+                .and_then(|f| folder_from_tl(f, self_id))
+                .map(|(f, _)| f),
+        }),
+        U::DialogFilterOrder(u) => Some(Event::FoldersOrder(u.order.clone())),
+        U::DialogFilters => Some(Event::FoldersStale),
         U::NewMessage(u) => message_from_tl(&u.message).map(Event::NewMessage),
         U::NewChannelMessage(u) => message_from_tl(&u.message).map(Event::NewMessage),
         U::EditMessage(u) => message_from_tl(&u.message).map(Event::MessageEdited),
@@ -358,6 +376,169 @@ pub fn presence_from_tl(s: &tl::enums::UserStatus, now: i64) -> Presence {
         S::LastWeek(_) => Presence::LastWeek,
         S::LastMonth(_) => Presence::LastMonth,
     }
+}
+
+// ------------------------------------------------------------------ folders
+
+/// The chat an `InputPeer` points at (Bot API id). `None` for empty peers and
+/// for `inputPeerSelf` while our id is unknown (0).
+pub fn input_peer_chat_id(p: &tl::enums::InputPeer, self_id: i64) -> Option<ChatId> {
+    use tl::enums::InputPeer as P;
+    match p {
+        P::Empty => None,
+        P::PeerSelf => (self_id != 0).then_some(self_id),
+        P::Chat(c) => Some(-c.chat_id),
+        P::User(u) => Some(u.user_id),
+        P::Channel(c) => Some(channel_chat_id(c.channel_id)),
+        P::UserFromMessage(u) => Some(u.user_id),
+        P::ChannelFromMessage(c) => Some(channel_chat_id(c.channel_id)),
+    }
+}
+
+fn peers_to_ids(
+    peers: &[tl::enums::InputPeer],
+    self_id: i64,
+    keep: &mut Vec<(ChatId, tl::enums::InputPeer)>,
+) -> Vec<ChatId> {
+    let mut out = Vec::new();
+    for p in peers {
+        if let Some(id) = input_peer_chat_id(p, self_id)
+            && !out.contains(&id)
+        {
+            out.push(id);
+            keep.push((id, p.clone()));
+        }
+    }
+    out
+}
+
+/// `dialogFilter` / `dialogFilterChatlist` → domain folder, plus the
+/// `InputPeer`s it names (their access hashes are needed to save the folder
+/// again). `None` for the "All chats" placeholder (`dialogFilterDefault`).
+pub fn folder_from_tl(
+    f: &tl::enums::DialogFilter,
+    self_id: i64,
+) -> Option<(Folder, Vec<(ChatId, tl::enums::InputPeer)>)> {
+    let mut peers = Vec::new();
+    match f {
+        tl::enums::DialogFilter::Default => None,
+        tl::enums::DialogFilter::Filter(d) => {
+            let mut folder = Folder::new(d.id, folder_title(&d.title));
+            folder.emoticon = d.emoticon.clone();
+            folder.contacts = d.contacts;
+            folder.non_contacts = d.non_contacts;
+            folder.groups = d.groups;
+            folder.channels = d.broadcasts;
+            folder.bots = d.bots;
+            folder.exclude_muted = d.exclude_muted;
+            folder.exclude_read = d.exclude_read;
+            folder.exclude_archived = d.exclude_archived;
+            folder.pinned = peers_to_ids(&d.pinned_peers, self_id, &mut peers);
+            folder.include = peers_to_ids(&d.include_peers, self_id, &mut peers);
+            folder.include.retain(|c| !folder.pinned.contains(c));
+            folder.exclude = peers_to_ids(&d.exclude_peers, self_id, &mut peers);
+            Some((folder, peers))
+        }
+        tl::enums::DialogFilter::Chatlist(d) => {
+            let mut folder = Folder::new(d.id, folder_title(&d.title));
+            folder.emoticon = d.emoticon.clone();
+            folder.shared = true;
+            folder.pinned = peers_to_ids(&d.pinned_peers, self_id, &mut peers);
+            folder.include = peers_to_ids(&d.include_peers, self_id, &mut peers);
+            folder.include.retain(|c| !folder.pinned.contains(c));
+            Some((folder, peers))
+        }
+    }
+}
+
+fn folder_title(t: &tl::enums::TextWithEntities) -> String {
+    let tl::enums::TextWithEntities::Entities(t) = t;
+    t.text.clone()
+}
+
+/// Domain folder → `dialogFilter` for `messages.updateDialogFilter`.
+/// `resolve` finds the `InputPeer` of a chat; the first chat it cannot
+/// resolve is returned as the error (saving without it would silently drop
+/// it from the folder).
+pub fn folder_to_tl(
+    f: &Folder,
+    self_id: i64,
+    resolve: &dyn Fn(ChatId) -> Option<tl::enums::InputPeer>,
+) -> Result<tl::enums::DialogFilter, ChatId> {
+    let peer = |id: ChatId| -> Result<tl::enums::InputPeer, ChatId> {
+        if self_id != 0 && id == self_id {
+            return Ok(tl::enums::InputPeer::PeerSelf);
+        }
+        resolve(id).ok_or(id)
+    };
+    let list = |ids: &[ChatId]| {
+        ids.iter()
+            .map(|id| peer(*id))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let title = tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+        text: f.title.clone(),
+        entities: Vec::new(),
+    });
+    let pinned_peers = list(&f.pinned)?;
+    // Pinned chats are listed once, in `pinned_peers`.
+    let include: Vec<ChatId> = f
+        .include
+        .iter()
+        .copied()
+        .filter(|c| !f.pinned.contains(c))
+        .collect();
+    let include_peers = list(&include)?;
+    if f.shared {
+        return Ok(tl::enums::DialogFilter::Chatlist(
+            tl::types::DialogFilterChatlist {
+                has_my_invites: false,
+                title_noanimate: false,
+                id: f.id,
+                title,
+                emoticon: f.emoticon.clone(),
+                color: None,
+                pinned_peers,
+                include_peers,
+            },
+        ));
+    }
+    Ok(tl::enums::DialogFilter::Filter(tl::types::DialogFilter {
+        contacts: f.contacts,
+        non_contacts: f.non_contacts,
+        groups: f.groups,
+        broadcasts: f.channels,
+        bots: f.bots,
+        exclude_muted: f.exclude_muted,
+        exclude_read: f.exclude_read,
+        exclude_archived: f.exclude_archived,
+        title_noanimate: false,
+        id: f.id,
+        title,
+        emoticon: f.emoticon.clone(),
+        color: None,
+        pinned_peers,
+        include_peers,
+        exclude_peers: list(&f.exclude)?,
+    }))
+}
+
+/// All folders of a `messages.dialogFilters` answer, in server order, and
+/// whether the "All chats" placeholder was part of it.
+pub fn folders_from_tl(
+    r: &tl::enums::messages::DialogFilters,
+    self_id: i64,
+) -> (Vec<Folder>, Vec<(ChatId, tl::enums::InputPeer)>) {
+    let tl::enums::messages::DialogFilters::Filters(r) = r;
+    let mut folders = Vec::new();
+    let mut peers = Vec::new();
+    for f in &r.filters {
+        if let Some((folder, p)) = folder_from_tl(f, self_id) {
+            folders.push(folder);
+            peers.extend(p);
+        }
+    }
+    (folders, peers)
 }
 
 /// Per-dialog counters from a raw `tl::Dialog`.

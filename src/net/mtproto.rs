@@ -19,14 +19,14 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::session::EncryptedSession;
-use super::types::{self, dialog_info, event_from_update, message_from_tl, presence_from_tl};
+use super::types::{self, dialog_info, event_from_update_as, message_from_tl, presence_from_tl};
 use super::{Event, EventHub, TelegramApi, UploadKind, backoff};
 use crate::auth::SignInOutcome;
 use crate::auth::vault::Vault;
 use crate::config::ApiCredentials;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
-    Chat, ChatId, ChatKind, ConnState, GlobalHit, Message, MessageId, Presence, User,
+    Chat, ChatId, ChatKind, ConnState, Folder, GlobalHit, Message, MessageId, Presence, User,
 };
 
 type UpdatesRx = mpsc::Receiver<grammers_session::updates::UpdatesLike>;
@@ -39,6 +39,9 @@ pub struct GrammersApi {
     login_token: Mutex<Option<LoginToken>>,
     password_token: Mutex<Option<PasswordToken>>,
     peers: Mutex<HashMap<ChatId, PeerRef>>,
+    /// `InputPeer`s (with access hashes) named by the account's folders, so a
+    /// folder can be saved again even for chats outside the loaded list.
+    folder_peers: Mutex<HashMap<ChatId, grammers_client::tl::enums::InputPeer>>,
     /// The dialog iterator survives between calls so "load more" continues
     /// from the offset instead of re-reading the list.
     dialogs_iter: tokio::sync::Mutex<Option<grammers_client::client::DialogIter>>,
@@ -104,6 +107,17 @@ fn peer_photo_id(peer: &Peer) -> Option<i64> {
     }
 }
 
+/// Is this user in our contacts?
+fn peer_is_contact(peer: &Peer) -> bool {
+    match peer {
+        Peer::User(u) => match &u.raw {
+            grammers_client::tl::enums::User::User(x) => x.contact,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn peer_presence(peer: &Peer, now: i64) -> Presence {
     match peer {
         Peer::User(u) => match &u.raw {
@@ -142,6 +156,7 @@ impl GrammersApi {
             login_token: Mutex::new(None),
             password_token: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
+            folder_peers: Mutex::new(HashMap::new()),
             dialogs_iter: tokio::sync::Mutex::new(None),
             self_id: AtomicI64::new(0),
             events: EventHub::new(),
@@ -195,12 +210,30 @@ impl GrammersApi {
             chat.read_outbox_max_id = info.read_outbox;
             chat.photo_id = peer_photo_id(d.peer());
             chat.presence = peer_presence(d.peer(), now);
+            chat.contact = peer_is_contact(d.peer());
             chat.draft = info.draft;
             chat.last_message = d.last_message.as_ref().and_then(|m| self.convert(m));
             chat.last_date = chat.last_message.as_ref().map_or(0, |m| m.date);
             out.push(chat);
         }
         Ok(out)
+    }
+
+    fn remember_folder_peers(&self, peers: Vec<(ChatId, grammers_client::tl::enums::InputPeer)>) {
+        if let Ok(mut m) = self.folder_peers.lock() {
+            // Bounded: a folder holds at most a few hundred chats.
+            if m.len() > 4096 {
+                m.clear();
+            }
+            m.extend(peers);
+        }
+    }
+
+    fn resolve_input_peer(&self, chat: ChatId) -> Option<grammers_client::tl::enums::InputPeer> {
+        if let Some(p) = self.peers.lock().ok()?.get(&chat).copied() {
+            return Some(p.into());
+        }
+        self.folder_peers.lock().ok()?.get(&chat).cloned()
     }
 
     fn emit(&self, ev: Event) {
@@ -270,7 +303,17 @@ impl GrammersApi {
                             grammers_client::update::Update::MessageEdited(m) => {
                                 me.convert(m).map(Event::MessageEdited)
                             }
-                            other => event_from_update(other.raw()),
+                            other => {
+                                let self_id = me.self_id.load(Ordering::Acquire);
+                                if let grammers_client::tl::enums::Update::DialogFilter(u) =
+                                    other.raw()
+                                    && let Some(f) = &u.filter
+                                    && let Some((_, peers)) = types::folder_from_tl(f, self_id)
+                                {
+                                    me.remember_folder_peers(peers);
+                                }
+                                event_from_update_as(other.raw(), self_id)
+                            }
                         };
                         if let Some(ev) = event {
                             me.emit(ev);
@@ -709,6 +752,56 @@ impl TelegramApi for Grammers {
         }
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
         Ok(())
+    }
+
+    async fn dialog_filters(&self) -> Result<Vec<Folder>> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let raw = api
+            .client
+            .invoke(&tl::functions::messages::GetDialogFilters {})
+            .await
+            .map_err(map_err)?;
+        let (folders, peers) = types::folders_from_tl(&raw, api.self_id.load(Ordering::Acquire));
+        api.remember_folder_peers(peers);
+        Ok(folders)
+    }
+
+    async fn save_dialog_filter(&self, folder: Folder) -> Result<()> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let filter = types::folder_to_tl(&folder, api.self_id.load(Ordering::Acquire), &|c| {
+            api.resolve_input_peer(c)
+        })
+        .map_err(|_| Error::Protocol("unknown peer".into()))?;
+        api.client
+            .invoke(&tl::functions::messages::UpdateDialogFilter {
+                id: folder.id,
+                filter: Some(filter),
+            })
+            .await
+            .map(drop)
+            .map_err(map_err)
+    }
+
+    async fn delete_dialog_filter(&self, id: i32) -> Result<()> {
+        use grammers_client::tl;
+        self.0
+            .client
+            .invoke(&tl::functions::messages::UpdateDialogFilter { id, filter: None })
+            .await
+            .map(drop)
+            .map_err(map_err)
+    }
+
+    async fn reorder_dialog_filters(&self, order: Vec<i32>) -> Result<()> {
+        use grammers_client::tl;
+        self.0
+            .client
+            .invoke(&tl::functions::messages::UpdateDialogFiltersOrder { order })
+            .await
+            .map(drop)
+            .map_err(map_err)
     }
 
     fn take_notice(&self) -> Option<String> {

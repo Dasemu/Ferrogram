@@ -1,6 +1,7 @@
 //! Views: pure functions `&App -> Element<Message>`.
 
 pub mod chat;
+pub mod folders;
 pub mod format;
 pub mod icons;
 pub mod login;
@@ -41,6 +42,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     if app.settings_open {
         layers = layers.push(settings::view(app));
+    }
+    if app.folders.manager_open {
+        layers = layers.push(folders::manager(app));
+    }
+    if let Some(editor) = folders::editor(app) {
+        layers = layers.push(editor);
     }
     layers.into()
 }

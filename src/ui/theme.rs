@@ -361,6 +361,19 @@ pub fn icon_button(p: Palette, round: bool) -> impl Fn(&Theme, button::Status) -
     }
 }
 
+/// A folder tab: plain text, accent colour when selected (the underline is
+/// drawn by the strip).
+pub fn folder_tab(p: Palette, selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| button::Style {
+        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+            .then_some(Background::Color(p.bg_hover)),
+        text_color: if selected { p.link } else { p.text_secondary },
+        border: border::rounded(6.0),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 pub fn menu_item(p: Palette, danger: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| button::Style {
         background: matches!(status, button::Status::Hovered | button::Status::Pressed)

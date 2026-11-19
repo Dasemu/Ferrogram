@@ -2,6 +2,7 @@
 //! side effect is a `Task` that calls `net`, `store` or `auth`.
 
 pub mod background;
+pub mod folders;
 pub mod message;
 pub mod screenshot;
 pub mod state;
@@ -29,7 +30,7 @@ use crate::config::{Config, ScreenshotTarget};
 use crate::error::{AuthError, Error, Redacted};
 use crate::mock::{FakeOptions, FakeTelegram, MOCK_NOW};
 use crate::model::{
-    ChatId, ConnState, GlobalHit, Media, Message as ChatMessage, MessageId, SendState, User,
+    Chat, ChatId, ConnState, GlobalHit, Media, Message as ChatMessage, MessageId, SendState, User,
 };
 use crate::net::{ApiHandle, Event, UploadKind, backoff};
 use crate::prefs::{MuteState, Prefs};
@@ -43,6 +44,7 @@ pub const HISTORY_ID: &str = "history";
 pub const COMPOSER_ID: &str = "composer";
 pub const AUTH_INPUT_ID: &str = "auth-input";
 pub const CHAT_SEARCH_ID: &str = "chat-search";
+pub const FOLDER_TITLE_ID: &str = "folder-title";
 /// Image cache budget (architecture §3).
 pub const IMAGE_BUDGET: usize = 48 * 1024 * 1024;
 /// Photos fetched per open conversation (newest first).
@@ -174,6 +176,10 @@ pub struct App {
     /// What the tray last showed; only changes are sent to the panel.
     pub tray_sent: Option<TrayModel>,
     pub settings_open: bool,
+    /// Chat folders: list, selection and open menus.
+    pub folders: folders::FolderState,
+    /// The folder editor dialog, when open.
+    pub folder_editor: Option<folders::FolderEditor>,
     /// "Launch at login" as last read from / written to disk.
     pub autostart: bool,
 }
@@ -243,6 +249,8 @@ impl App {
 
         // First frame comes from the cache, never from the network.
         let cached = store.load_chats().unwrap_or_default();
+        let mut cached_folders = folders::FolderState::default();
+        cached_folders.set_list(store.load_folders().unwrap_or_default());
         let mut app = Self {
             iced_theme: theme.iced(),
             theme,
@@ -302,6 +310,8 @@ impl App {
             tray: None,
             tray_sent: None,
             settings_open: false,
+            folders: cached_folders,
+            folder_editor: None,
             autostart,
             config,
         };
@@ -702,7 +712,7 @@ impl App {
     }
 
     fn on_signed_in(&mut self, user: Option<User>) -> Task<Message> {
-        let mut tasks = vec![self.fetch_dialogs()];
+        let mut tasks = vec![self.fetch_dialogs(), self.fetch_folders()];
         if let Some(u) = &user {
             let id = u.id.to_string();
             tasks.push(self.store_bg(move |s| s.set_kv("self_id", &id)));
@@ -714,6 +724,62 @@ impl App {
             tasks.push(operation::focus(Id::new(COMPOSER_ID)));
         }
         Task::batch(tasks)
+    }
+
+    // ------------------------------------------------------- folders
+
+    fn fetch_folders(&self) -> Task<Message> {
+        let Some(api) = self.api.clone() else {
+            return Task::none();
+        };
+        Task::perform(async move { api.dialog_filters().await }, |r| {
+            Message::Done(Done::Folders(r))
+        })
+    }
+
+    /// Cache the folder list for the next first frame.
+    fn persist_folders(&self) -> Task<Message> {
+        let list = self.folders.list.clone();
+        self.store_bg(move |s| s.save_folders(&list))
+    }
+
+    /// Apply a folder change at once and tell the server; the list is put
+    /// back if the server refuses.
+    fn save_folder_optimistic(&mut self, folder: crate::model::Folder) -> Task<Message> {
+        let before = self.folders.list.clone();
+        self.folders.upsert(folder.clone());
+        let persist = self.persist_folders();
+        let Some(api) = self.api.clone() else {
+            return persist;
+        };
+        Task::batch([
+            persist,
+            Task::perform(
+                async move { api.save_dialog_filter(folder).await },
+                move |result| Message::Done(Done::FolderOp { before, result }),
+            ),
+        ])
+    }
+
+    /// Folders are evaluated on the chats we have loaded: while a folder
+    /// shows only a few and the account has more dialogs, page them in.
+    fn fill_folder(&mut self) -> Task<Message> {
+        const WANT: usize = 15;
+        let Some(f) = self.folders.current() else {
+            return Task::none();
+        };
+        if folders::FolderState::chats_in(f, self.chats.all()).len() >= WANT {
+            return Task::none();
+        }
+        self.load_more_dialogs()
+    }
+
+    /// Chats shown in the list: the selected folder's, or all.
+    pub fn visible_chats(&self) -> Vec<&Chat> {
+        match self.folders.current() {
+            Some(f) => folders::FolderState::chats_in(f, self.chats.all()),
+            None => self.chats.all().iter().collect(),
+        }
     }
 
     fn fetch_dialogs(&self) -> Task<Message> {
@@ -1414,6 +1480,197 @@ impl App {
                 self.drop_pending();
                 Task::none()
             }
+            Ui::SelectFolder(id) => {
+                self.folders.selected = id.filter(|i| self.folders.get(*i).is_some());
+                self.folders.tab_menu = None;
+                self.folders.chat_menu = None;
+                self.fill_folder()
+            }
+            Ui::FolderTabMenu(id) => {
+                self.folders.chat_menu = None;
+                self.folders.tab_menu = if self.folders.tab_menu == id {
+                    None
+                } else {
+                    id
+                };
+                Task::none()
+            }
+            Ui::ChatMenu(id) => {
+                self.folders.tab_menu = None;
+                self.folders.chat_menu = if self.folders.chat_menu == id {
+                    None
+                } else {
+                    id
+                };
+                Task::none()
+            }
+            Ui::ChatInFolder(chat, fid) => {
+                self.folders.chat_menu = None;
+                let (Some(c), Some(mut f)) = (
+                    self.chats.get(chat).cloned(),
+                    self.folders.get(fid).cloned(),
+                ) else {
+                    return Task::none();
+                };
+                if f.shared {
+                    return self.toast("Shared folders are edited in the official app.".into());
+                }
+                f.toggle_chat(&c);
+                if f.explicit_len() > crate::model::FOLDER_CHATS_MAX {
+                    return self
+                        .toast(Error::Protocol("FILTER_INCLUDE_TOO_MUCH".into()).user_message());
+                }
+                self.save_folder_optimistic(f)
+            }
+            Ui::OpenFolders => {
+                self.main_menu = false;
+                self.folders.manager_open = true;
+                self.folders.confirm_delete = None;
+                Task::none()
+            }
+            Ui::CloseFolders => {
+                self.folders.manager_open = false;
+                self.folders.confirm_delete = None;
+                Task::none()
+            }
+            Ui::FolderMove(id, delta) => {
+                let before = self.folders.list.clone();
+                let Some(order) = self.folders.step(id, delta) else {
+                    return Task::none();
+                };
+                let persist = self.persist_folders();
+                let Some(api) = self.api.clone() else {
+                    return persist;
+                };
+                Task::batch([
+                    persist,
+                    Task::perform(
+                        async move { api.reorder_dialog_filters(order).await },
+                        move |result| Message::Done(Done::FolderOp { before, result }),
+                    ),
+                ])
+            }
+            Ui::FolderDeleteAsk(id) => {
+                // Confirmed inside the folder manager (also from a tab menu).
+                self.folders.tab_menu = None;
+                self.folders.manager_open = true;
+                self.folders.confirm_delete = Some(id);
+                Task::none()
+            }
+            Ui::FolderDeleteCancel => {
+                self.folders.confirm_delete = None;
+                Task::none()
+            }
+            Ui::FolderDeleteConfirm(id) => {
+                self.folders.confirm_delete = None;
+                self.folders.tab_menu = None;
+                let before = self.folders.list.clone();
+                if self.folders.remove(id).is_none() {
+                    return Task::none();
+                }
+                let persist = self.persist_folders();
+                let Some(api) = self.api.clone() else {
+                    return persist;
+                };
+                Task::batch([
+                    persist,
+                    Task::perform(
+                        async move { api.delete_dialog_filter(id).await },
+                        move |result| Message::Done(Done::FolderOp { before, result }),
+                    ),
+                ])
+            }
+            Ui::FolderNew(chat) => {
+                self.folders.chat_menu = None;
+                self.folders.tab_menu = None;
+                let mut ed = folders::FolderEditor::create(self.folders.next_id());
+                if let Some(c) = chat {
+                    ed.toggle_chat(folders::Picker::Include, c);
+                }
+                self.folder_editor = Some(ed);
+                operation::focus(Id::new(FOLDER_TITLE_ID))
+            }
+            Ui::FolderEdit(id) => {
+                self.folders.tab_menu = None;
+                let Some(f) = self.folders.get(id).cloned() else {
+                    return Task::none();
+                };
+                if f.shared {
+                    return self.toast("Shared folders are edited in the official app.".into());
+                }
+                self.folder_editor = Some(folders::FolderEditor::edit(f));
+                operation::focus(Id::new(FOLDER_TITLE_ID))
+            }
+            Ui::FolderTitle(t) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.set_title(&t);
+                }
+                Task::none()
+            }
+            Ui::FolderFlag(flag) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.toggle(flag);
+                }
+                Task::none()
+            }
+            Ui::FolderPick(which) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.picker = which;
+                    ed.query.clear();
+                }
+                Task::none()
+            }
+            Ui::FolderPickQuery(q) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.query = q;
+                }
+                Task::none()
+            }
+            Ui::FolderChatToggle(which, chat) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.toggle_chat(which, chat);
+                }
+                Task::none()
+            }
+            Ui::FolderChatRemove(which, chat) => {
+                if let Some(ed) = &mut self.folder_editor {
+                    ed.remove_chat(which, chat);
+                }
+                Task::none()
+            }
+            Ui::FolderEditorClose => {
+                self.folder_editor = None;
+                Task::none()
+            }
+            Ui::FolderSave => {
+                let Some(ed) = &mut self.folder_editor else {
+                    return Task::none();
+                };
+                if ed.saving {
+                    return Task::none();
+                }
+                if let Err(e) = ed.validate() {
+                    ed.error = Some(e.message());
+                    return Task::none();
+                }
+                let folder = ed.to_save();
+                let Some(api) = self.api.clone() else {
+                    ed.error = Some(Error::Net("not connected".into()).user_message());
+                    return Task::none();
+                };
+                ed.saving = true;
+                ed.error = None;
+                let sent = folder.clone();
+                Task::perform(
+                    async move { api.save_dialog_filter(sent).await },
+                    move |result| {
+                        Message::Done(Done::FolderSaved {
+                            folder: folder.clone(),
+                            result,
+                        })
+                    },
+                )
+            }
             Ui::Paste => {
                 if self.selected.is_none()
                     || !self.auth.is_signed_in()
@@ -1713,7 +1970,17 @@ impl App {
                 if self.setup.as_ref().is_some_and(|f| f.advanced) {
                     return self.update_ui(Ui::CancelSetup);
                 }
-                let closed = std::mem::take(&mut self.settings_open)
+                if let Some(ed) = &mut self.folder_editor {
+                    // Innermost first: the chat picker, then the editor.
+                    if ed.picker.take().is_none() {
+                        self.folder_editor = None;
+                    }
+                    return Task::none();
+                }
+                let closed = std::mem::take(&mut self.folders.manager_open)
+                    || self.folders.chat_menu.take().is_some()
+                    || self.folders.tab_menu.take().is_some()
+                    || std::mem::take(&mut self.settings_open)
                     || std::mem::take(&mut self.main_menu)
                     || self.viewer.take().is_some()
                     || self.menu_for.take().is_some()
@@ -2032,6 +2299,15 @@ impl App {
                 return Task::none();
             }
             Event::SessionRevoked => return self.session_revoked(),
+            Event::FolderChanged { id, folder } => {
+                self.folders.apply_changed(*id, folder.clone());
+                return Task::batch([self.persist_folders(), self.fill_folder()]);
+            }
+            Event::FoldersOrder(order) => {
+                self.folders.apply_order(order);
+                return self.persist_folders();
+            }
+            Event::FoldersStale => return self.fetch_folders(),
             Event::NewMessage(m) => {
                 self.typing.message_from(m.chat_id, m.sender_id);
                 self.remember_names(std::iter::once(m));
@@ -2176,6 +2452,8 @@ impl App {
         self.typing_throttle.reset();
         self.dialogs_exhausted = false;
         self.dialogs_loading = false;
+        self.folders = folders::FolderState::default();
+        self.folder_editor = None;
     }
 
     fn on_done(&mut self, done: Done) -> Task<Message> {
@@ -2328,7 +2606,7 @@ impl App {
                         s.upsert_chats(&to_store)
                     }
                 });
-                Task::batch([persist, self.fetch_avatars()])
+                Task::batch([persist, self.fetch_avatars(), self.fill_folder()])
             }
             Done::Dialogs(Err(e)) => self.on_error(e),
             Done::MoreDialogs(Ok(chats)) => {
@@ -2340,6 +2618,7 @@ impl App {
                 Task::batch([
                     self.store_bg(move |s| s.upsert_chats(&to_store)),
                     self.fetch_avatars(),
+                    self.fill_folder(),
                 ])
             }
             Done::MoreDialogs(Err(e)) => {
@@ -2553,6 +2832,41 @@ impl App {
             Done::PasteSaved(Err(e)) => self.on_error(e),
             Done::ImageCopied(Ok(())) => self.toast("Image copied.".into()),
             Done::ImageCopied(Err(e)) => self.on_error(e),
+            Done::Folders(Ok(list)) => {
+                self.folders.set_list(list);
+                Task::batch([self.persist_folders(), self.fill_folder()])
+            }
+            Done::Folders(Err(e)) => {
+                // Folders are optional chrome: log, never toast.
+                warn!(error = %e, "could not load chat folders");
+                Task::none()
+            }
+            Done::FolderSaved { folder, result } => match result {
+                Ok(()) => {
+                    self.folders.upsert(folder);
+                    self.folder_editor = None;
+                    Task::batch([self.persist_folders(), self.fill_folder()])
+                }
+                Err(e) => {
+                    if e.is_session_revoked() {
+                        return self.session_revoked();
+                    }
+                    warn!(error = %e, "could not save folder");
+                    if let Some(ed) = &mut self.folder_editor {
+                        ed.saving = false;
+                        ed.error = Some(e.user_message());
+                    }
+                    Task::none()
+                }
+            },
+            Done::FolderOp { before, result } => match result {
+                Ok(()) => Task::none(),
+                Err(e) => {
+                    self.folders.set_list(before);
+                    let persist = self.persist_folders();
+                    Task::batch([persist, self.on_error(e)])
+                }
+            },
             Done::MediaSaved(Ok(())) => self.toast("File saved.".into()),
             Done::MediaSaved(Err(e)) => self.on_error(e),
             Done::Photo { key, result } => {

@@ -161,6 +161,9 @@ impl ChatList {
             Event::Reactions { .. }
             | Event::Typing { .. }
             | Event::Connection(_)
+            | Event::FolderChanged { .. }
+            | Event::FoldersOrder(_)
+            | Event::FoldersStale
             | Event::SessionRevoked => {}
         }
     }

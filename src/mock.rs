@@ -17,7 +17,7 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::auth::SignInOutcome;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
-    CHANNEL_OFFSET, Chat, ChatId, ChatKind, GlobalHit, Media, Message, MessageId, Presence,
+    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Folder, GlobalHit, Media, Message, MessageId, Presence,
     Reaction, TypingAction, User,
 };
 use crate::net::{Event, EventHub, TelegramApi, UploadKind};
@@ -469,6 +469,8 @@ fn chats_and_history() -> (Vec<Chat>, BTreeMap<ChatId, Vec<Message>>) {
                 date: MOCK_NOW - 600,
             });
         }
+        // Everybody but Carla is in the mock account's contacts.
+        c.contact = c.kind == ChatKind::User && c.title != "Carla Gómez";
         if c.id == ALICE {
             c.presence = Presence::Online {
                 until: MOCK_NOW + 5 * MIN,
@@ -533,6 +535,7 @@ struct State {
     next_id: MessageId,
     /// How many dialogs the paging cursor has handed out.
     dialog_cursor: usize,
+    folders: Vec<Folder>,
 }
 
 pub struct FakeTelegram {
@@ -569,6 +572,7 @@ impl FakeTelegram {
                 calls: Vec::new(),
                 next_id: 10_000,
                 dialog_cursor: 0,
+                folders: mock_folders(),
             }),
             opts,
             events: Arc::new(EventHub::new()),
@@ -970,9 +974,88 @@ impl TelegramApi for FakeTelegram {
         Ok(())
     }
 
+    async fn dialog_filters(&self) -> Result<Vec<Folder>> {
+        self.call("dialog_filters").await?;
+        self.require_auth()?;
+        Ok(self.st()?.folders.clone())
+    }
+
+    async fn save_dialog_filter(&self, folder: Folder) -> Result<()> {
+        self.call("save_dialog_filter").await?;
+        self.require_auth()?;
+        // The same checks the server makes.
+        if folder.title.trim().is_empty() {
+            return Err(Error::Protocol("400 FILTER_TITLE_EMPTY".into()));
+        }
+        if !folder.has_rules() {
+            return Err(Error::Protocol("400 FILTER_INCLUDE_EMPTY".into()));
+        }
+        let mut s = self.st()?;
+        match s.folders.iter_mut().find(|f| f.id == folder.id) {
+            Some(slot) => *slot = folder.clone(),
+            None => {
+                if s.folders.len() >= MOCK_MAX_FOLDERS {
+                    return Err(Error::Protocol("400 DIALOG_FILTERS_TOO_MUCH".into()));
+                }
+                s.folders.push(folder.clone());
+            }
+        }
+        drop(s);
+        self.events.emit(Event::FolderChanged {
+            id: folder.id,
+            folder: Some(folder),
+        });
+        Ok(())
+    }
+
+    async fn delete_dialog_filter(&self, id: i32) -> Result<()> {
+        self.call("delete_dialog_filter").await?;
+        self.require_auth()?;
+        self.st()?.folders.retain(|f| f.id != id);
+        self.events.emit(Event::FolderChanged { id, folder: None });
+        Ok(())
+    }
+
+    async fn reorder_dialog_filters(&self, order: Vec<i32>) -> Result<()> {
+        self.call("reorder_dialog_filters").await?;
+        self.require_auth()?;
+        let mut s = self.st()?;
+        let mut rest = std::mem::take(&mut s.folders);
+        let mut out = Vec::new();
+        for id in &order {
+            if let Some(i) = rest.iter().position(|f| f.id == *id) {
+                out.push(rest.remove(i));
+            }
+        }
+        out.extend(rest);
+        s.folders = out;
+        drop(s);
+        self.events.emit(Event::FoldersOrder(order));
+        Ok(())
+    }
+
     fn events(&self) -> BoxStream<'static, Event> {
         self.events.subscribe()
     }
+}
+
+/// The server's folder limit in mock mode.
+pub const MOCK_MAX_FOLDERS: usize = 10;
+
+/// Folders of the mock account (shown in mock mode and screenshots).
+pub fn mock_folders() -> Vec<Folder> {
+    let mut work = Folder::new(2, "Work");
+    work.groups = true;
+    work.include = vec![ECHO_BOT];
+    work.exclude_muted = true;
+    let mut people = Folder::new(3, "People");
+    people.contacts = true;
+    people.non_contacts = true;
+    people.exclude = vec![ECHO_BOT];
+    let mut news = Folder::new(4, "News");
+    news.channels = true;
+    news.exclude_read = true;
+    vec![work, people, news]
 }
 
 /// A procedurally generated landscape-ish PNG (sky gradient, mountains),
