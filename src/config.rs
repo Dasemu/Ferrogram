@@ -20,6 +20,7 @@ pub enum ScreenshotTarget {
     Search,
     Reply,
     Media,
+    ApiSetup,
 }
 
 impl ScreenshotTarget {
@@ -32,6 +33,7 @@ impl ScreenshotTarget {
             "search" => Self::Search,
             "reply" => Self::Reply,
             "media" => Self::Media,
+            "api-setup" => Self::ApiSetup,
             _ => return None,
         })
     }
@@ -50,6 +52,8 @@ pub struct Config {
     pub notification_preview: bool,
     /// Desktop notifications on/off (`FERROGRAM_NO_NOTIFY=1` disables).
     pub notifications: bool,
+    /// `--api-setup`: open "use your own API credentials" on start.
+    pub api_setup: bool,
 }
 
 impl Config {
@@ -87,6 +91,7 @@ impl Config {
             trace_startup: env_flag("FERRO_TRACE_STARTUP"),
             notification_preview: !env_flag("FERROGRAM_NOTIFY_SENDER_ONLY"),
             notifications: !env_flag("FERROGRAM_NO_NOTIFY") && screenshot.is_none(),
+            api_setup: args.iter().any(|a| a == "--api-setup"),
         }
     }
 
@@ -107,26 +112,33 @@ impl Config {
     }
 
     /// Telegram API credentials (blocking: touches the keyring, call from a
-    /// blocking thread).
-    ///
-    /// * `api_id` (not secret): `FERROGRAM_API_ID`, else `config.ini`.
-    /// * `api_hash` (secret): `FERROGRAM_API_HASH`, else the OS keyring
-    ///   (`dev.ferro.ferrogram` / `api-hash`). It is never read from or
-    ///   written to a plain file. A legacy `api_hash` line found in
-    ///   `config.ini`, or a hash given via the env var, is imported into the
-    ///   keyring; the legacy line is then removed from the file.
+    /// blocking thread). See [`ApiCredentials::resolve`] for the order.
     pub fn load_api_credentials(&self, secrets: &dyn SecretStore) -> Result<ApiCredentials> {
+        let env = |k: &str| std::env::var(k).ok();
+        ApiCredentials::resolve(self.gather_credential_inputs(
+            secrets,
+            &env,
+            embedded_credentials(),
+        )?)
+    }
+
+    /// Collect every credential source (injectable env lookup and embedded
+    /// values, so tests can cover each path). Also migrates a legacy
+    /// `api_hash` line out of `config.ini` into the keyring.
+    pub fn gather_credential_inputs(
+        &self,
+        secrets: &dyn SecretStore,
+        env: &dyn Fn(&str) -> Option<String>,
+        embedded: Option<(i32, &'static str)>,
+    ) -> Result<CredentialInputs> {
         let path = self.config_ini();
-        let file = std::fs::read_to_string(&path).unwrap_or_default();
-        let env_hash = std::env::var("FERROGRAM_API_HASH")
-            .ok()
-            .filter(|h| !h.trim().is_empty());
+        let mut file = std::fs::read_to_string(&path).unwrap_or_default();
         if let Some(legacy) = ini_value(&file, "api_hash")
             && secrets
                 .set(API_HASH_KEY, &Secret::new(legacy.into_bytes()))
                 .is_ok()
         {
-            let cleaned: String = file
+            file = file
                 .lines()
                 .filter(|l| {
                     l.split_once('=')
@@ -134,30 +146,23 @@ impl Config {
                 })
                 .map(|l| format!("{l}\n"))
                 .collect();
-            let _ = write_private(&path, &cleaned);
+            let _ = write_private(&path, &file);
             tracing::info!("migrated api_hash from config.ini into the keyring");
         }
-        if let Some(h) = &env_hash {
-            // Import so the env var is only needed once.
-            let _ = secrets.set(API_HASH_KEY, &Secret::new(h.trim().as_bytes().to_vec()));
-        }
-        let keyring_hash = match env_hash {
-            Some(_) => None,
-            None => secrets
-                .get(API_HASH_KEY)?
-                .and_then(|s| String::from_utf8(s.expose().to_vec()).ok()),
-        };
-        let file = std::fs::read_to_string(&path).unwrap_or_default();
-        ApiCredentials::resolve(
-            std::env::var("FERROGRAM_API_ID").ok(),
-            std::env::var("FERROGRAM_API_HASH").ok(),
-            &file,
-            keyring_hash,
-        )
+        let override_hash = secrets
+            .get(API_HASH_KEY)?
+            .and_then(|s| String::from_utf8(s.expose().to_vec()).ok());
+        Ok(CredentialInputs {
+            override_id: ini_value(&file, "api_id"),
+            override_hash,
+            env_id: env("FERROGRAM_API_ID"),
+            env_hash: env("FERROGRAM_API_HASH"),
+            embedded,
+        })
     }
 
-    /// First-run setup: `api_id` to `config.ini` (0600), `api_hash` to the
-    /// keyring. Blocking.
+    /// "Use your own API credentials": `api_id` to `config.ini` (0600),
+    /// `api_hash` to the keyring. Blocking.
     pub fn save_api_credentials(
         &self,
         secrets: &dyn SecretStore,
@@ -172,6 +177,68 @@ impl Config {
         write_private(&self.config_ini(), &format!("api_id = {api_id}\n"))?;
         Ok(())
     }
+
+    /// Drop the user override and go back to the built-in credentials.
+    pub fn clear_api_override(&self, secrets: &dyn SecretStore) -> Result<()> {
+        secrets.delete(API_HASH_KEY)?;
+        match std::fs::remove_file(self.config_ini()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Credentials embedded at build time by `build.rs` (validated there).
+pub fn embedded_credentials() -> Option<(i32, &'static str)> {
+    let id = option_env!("FERROGRAM_EMBEDDED_API_ID")?.parse().ok()?;
+    let hash = option_env!("FERROGRAM_EMBEDDED_API_HASH")?;
+    Some((id, hash))
+}
+
+/// Where the credentials in use came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// "Use your own API credentials" (config.ini api_id + keyring api_hash).
+    UserOverride,
+    /// `FERROGRAM_API_ID` / `FERROGRAM_API_HASH` at runtime (developers).
+    Environment,
+    /// Ferrogram's own app, baked into release builds.
+    Embedded,
+}
+
+/// Raw inputs for [`ApiCredentials::resolve`].
+#[derive(Default)]
+pub struct CredentialInputs {
+    pub override_id: Option<String>,
+    pub override_hash: Option<String>,
+    pub env_id: Option<String>,
+    pub env_hash: Option<String>,
+    pub embedded: Option<(i32, &'static str)>,
+}
+
+impl std::fmt::Debug for CredentialInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialInputs")
+            .field(
+                "override",
+                &(self.override_id.is_some() && self.override_hash.is_some()),
+            )
+            .field("env", &(self.env_id.is_some() && self.env_hash.is_some()))
+            .field("embedded", &self.embedded.is_some())
+            .finish()
+    }
+}
+
+/// `api_hash` must be 32 hex characters.
+pub fn valid_api_hash(h: &str) -> bool {
+    h.len() == 32 && h.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn parse_pair(id: Option<&String>, hash: Option<&String>) -> Option<(i32, String)> {
+    let id = id?.trim().parse::<i32>().ok().filter(|n| *n > 0)?;
+    let hash = hash?.trim();
+    valid_api_hash(hash).then(|| (id, hash.to_owned()))
 }
 
 /// Keyring account holding the Telegram `api_hash`.
@@ -194,26 +261,50 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
 pub struct ApiCredentials {
     pub api_id: i32,
     pub api_hash: SecretString,
+    pub source: CredentialSource,
 }
 
 impl ApiCredentials {
-    /// Pure resolution: `api_id` from env or file, `api_hash` from env or
-    /// keyring. A hash in the file is deliberately ignored.
-    pub fn resolve(
-        env_id: Option<String>,
-        env_hash: Option<String>,
-        file: &str,
-        keyring_hash: Option<String>,
-    ) -> Result<Self> {
-        let id = env_id.or_else(|| ini_value(file, "api_id"));
-        let hash = env_hash.filter(|h| !h.trim().is_empty()).or(keyring_hash);
-        match (id.and_then(|i| i.trim().parse::<i32>().ok()), hash) {
-            (Some(api_id), Some(h)) if !h.trim().is_empty() => Ok(Self {
-                api_id,
-                api_hash: SecretString::from(h.trim().to_owned()),
-            }),
-            _ => Err(Error::Auth(AuthError::MissingApiCredentials)),
+    /// Resolution order (first complete, well-formed pair wins):
+    /// 1. user override ("Advanced: use your own API credentials"),
+    /// 2. runtime env vars (developers),
+    /// 3. the values embedded in the release build.
+    ///
+    /// Malformed pairs are skipped (with a warning, values never logged).
+    pub fn resolve(i: CredentialInputs) -> Result<Self> {
+        let candidates = [
+            (
+                CredentialSource::UserOverride,
+                parse_pair(i.override_id.as_ref(), i.override_hash.as_ref()),
+                i.override_id.is_some() || i.override_hash.is_some(),
+            ),
+            (
+                CredentialSource::Environment,
+                parse_pair(i.env_id.as_ref(), i.env_hash.as_ref()),
+                i.env_id.is_some() || i.env_hash.is_some(),
+            ),
+            (
+                CredentialSource::Embedded,
+                i.embedded.map(|(id, h)| (id, h.to_owned())),
+                false,
+            ),
+        ];
+        for (source, pair, present) in candidates {
+            match pair {
+                Some((api_id, hash)) => {
+                    return Ok(Self {
+                        api_id,
+                        api_hash: SecretString::from(hash),
+                        source,
+                    });
+                }
+                None if present => {
+                    tracing::warn!(?source, "ignoring incomplete or malformed API credentials");
+                }
+                None => {}
+            }
         }
+        Err(Error::Auth(AuthError::MissingApiCredentials))
     }
 }
 
@@ -258,62 +349,128 @@ mod tests {
     use super::*;
     use secrecy::ExposeSecret;
 
-    #[test]
-    fn credentials_env_wins_over_file() {
-        let c = ApiCredentials::resolve(
-            Some("123".into()),
-            Some("abc".into()),
-            "api_id=9\napi_hash=zzz",
-            Some("keyring".into()),
-        )
-        .unwrap();
-        assert_eq!(c.api_id, 123);
-        assert_eq!(c.api_hash.expose_secret(), "abc");
-    }
+    const H1: &str = "0123456789abcdef0123456789abcdef";
+    const H2: &str = "fedcba9876543210fedcba9876543210";
+    const H3: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    #[test]
-    fn credentials_id_from_file_hash_from_keyring_only() {
-        let file = "# comment\napi_id = 42\napi_hash = \"h\"\n";
-        let c = ApiCredentials::resolve(None, None, file, Some("kh".into())).unwrap();
-        assert_eq!(c.api_id, 42);
-        assert_eq!(c.api_hash.expose_secret(), "kh");
-        // A hash in the plain file is never used.
-        assert!(ApiCredentials::resolve(None, None, file, None).is_err());
-    }
-
-    #[test]
-    fn save_and_migrate_credentials() {
-        use crate::auth::secrets::MemoryStore;
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config::from_env(&["x".into(), "--mock".into()]);
-        cfg.config_dir = dir.path().join("cfg");
-        let secrets = MemoryStore::new();
-        cfg.save_api_credentials(&secrets, 7, "secret-hash")
-            .unwrap();
-        let ini = std::fs::read_to_string(cfg.config_ini()).unwrap();
-        assert!(ini.contains("api_id = 7") && !ini.contains("secret-hash"));
-        // Legacy file with a plain-text hash is migrated and scrubbed.
-        std::fs::write(cfg.config_ini(), "api_id = 8\napi_hash = legacy\n").unwrap();
-        let secrets = MemoryStore::new();
-        if std::env::var_os("FERROGRAM_API_HASH").is_none()
-            && std::env::var_os("FERROGRAM_API_ID").is_none()
-        {
-            let c = cfg.load_api_credentials(&secrets).unwrap();
-            assert_eq!((c.api_id, c.api_hash.expose_secret()), (8, "legacy"));
-            assert!(
-                !std::fs::read_to_string(cfg.config_ini())
-                    .unwrap()
-                    .contains("legacy")
-            );
+    fn inputs() -> CredentialInputs {
+        CredentialInputs {
+            override_id: Some("11".into()),
+            override_hash: Some(H1.into()),
+            env_id: Some("22".into()),
+            env_hash: Some(H2.into()),
+            embedded: Some((33, H3)),
         }
+    }
+
+    #[test]
+    fn embedded_values_are_well_formed_when_present() {
+        // Release builds (FERROGRAM_API_ID/HASH set at build time) embed a
+        // validated pair; CI builds embed nothing. Either way it is usable.
+        if let Some((id, hash)) = embedded_credentials() {
+            assert!(id > 0 && valid_api_hash(hash));
+        }
+    }
+
+    #[test]
+    fn resolution_order_override_env_embedded() {
+        let c = ApiCredentials::resolve(inputs()).unwrap();
+        assert_eq!((c.api_id, c.source), (11, CredentialSource::UserOverride));
+        assert_eq!(c.api_hash.expose_secret(), H1);
+
+        let mut i = inputs();
+        i.override_hash = None;
+        let c = ApiCredentials::resolve(i).unwrap();
+        assert_eq!((c.api_id, c.source), (22, CredentialSource::Environment));
+
+        let mut i = inputs();
+        i.override_id = None;
+        i.env_hash = Some("not-hex".into()); // malformed: skipped
+        let c = ApiCredentials::resolve(i).unwrap();
+        assert_eq!((c.api_id, c.source), (33, CredentialSource::Embedded));
+        assert_eq!(c.api_hash.expose_secret(), H3);
     }
 
     #[test]
     fn missing_credentials_is_an_auth_error() {
         assert!(matches!(
-            ApiCredentials::resolve(None, None, "", None),
+            ApiCredentials::resolve(CredentialInputs::default()),
             Err(Error::Auth(AuthError::MissingApiCredentials))
         ));
+        let i = CredentialInputs {
+            env_id: Some("abc".into()),
+            env_hash: Some(H1.into()),
+            ..Default::default()
+        };
+        assert!(ApiCredentials::resolve(i).is_err());
+        assert!(
+            !format!("{:?}", inputs()).contains(H1),
+            "Debug must not print hashes"
+        );
+    }
+
+    #[test]
+    fn gather_uses_keyring_override_env_and_embedded() {
+        use crate::auth::secrets::MemoryStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::from_env(&["x".into(), "--mock".into()]);
+        cfg.config_dir = dir.path().join("cfg");
+        let secrets = MemoryStore::new();
+        let no_env = |_: &str| None;
+        let dev_env = |k: &str| match k {
+            "FERROGRAM_API_ID" => Some("22".to_owned()),
+            "FERROGRAM_API_HASH" => Some(H2.to_owned()),
+            _ => None,
+        };
+
+        // (c) Release build, fresh install: the embedded values.
+        let c = ApiCredentials::resolve(
+            cfg.gather_credential_inputs(&secrets, &no_env, Some((33, H3)))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(c.source, CredentialSource::Embedded);
+
+        // (b) Developer env vars beat the embedded values.
+        let c = ApiCredentials::resolve(
+            cfg.gather_credential_inputs(&secrets, &dev_env, Some((33, H3)))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!((c.api_id, c.source), (22, CredentialSource::Environment));
+
+        // (a) A saved user override beats both; the hash stays out of files.
+        cfg.save_api_credentials(&secrets, 11, H1).unwrap();
+        let ini = std::fs::read_to_string(cfg.config_ini()).unwrap();
+        assert!(ini.contains("api_id = 11") && !ini.contains(H1));
+        let c = ApiCredentials::resolve(
+            cfg.gather_credential_inputs(&secrets, &dev_env, Some((33, H3)))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!((c.api_id, c.source), (11, CredentialSource::UserOverride));
+
+        // Clearing the override returns to the built-in values.
+        cfg.clear_api_override(&secrets).unwrap();
+        let c = ApiCredentials::resolve(
+            cfg.gather_credential_inputs(&secrets, &no_env, Some((33, H3)))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(c.source, CredentialSource::Embedded);
+
+        // Legacy plain-text hash is migrated into the keyring and scrubbed.
+        std::fs::write(cfg.config_ini(), format!("api_id = 8\napi_hash = {H2}\n")).unwrap();
+        let i = cfg
+            .gather_credential_inputs(&secrets, &no_env, None)
+            .unwrap();
+        let c = ApiCredentials::resolve(i).unwrap();
+        assert_eq!((c.api_id, c.source), (8, CredentialSource::UserOverride));
+        assert!(
+            !std::fs::read_to_string(cfg.config_ini())
+                .unwrap()
+                .contains(H2)
+        );
     }
 
     #[test]
