@@ -2,6 +2,25 @@
 
 Things learned while building Ferrogram, newest first.
 
+- **iced's `image::border_radius` is not drawn by the tiny-skia renderer.**
+  Round avatars by masking the pixels (alpha) when decoding, so every
+  renderer agrees. Decode on a blocking thread.
+- **"Small blobs are fine" is the wrong default for a cache validator.** A
+  corrupt cache file passed the old photo check and would be drawn blank
+  forever; avatars now require a parseable JPEG/PNG header.
+- **Keep the dialog iterator.** `iter_dialogs()` restarts from the top each
+  time; holding it between calls makes "load more" a plain continuation. The
+  prune-on-refresh step must then run only when the first page was complete.
+- **A search hit needs a detached window.** Appending live messages to a
+  window around an old message creates an invisible gap. Mark it detached and
+  offer "jump to latest".
+- **Typing indicators and draft sync are best effort.** They fail in
+  channels you cannot post in; log, never toast.
+- **Executable detection looks at the last extension only after stripping
+  trailing dots and spaces** (`evil.exe.`), and file names from the network
+  are sanitised before they touch the disk (separators, controls, bidi
+  overrides).
+
 - **Embed app credentials with build.rs, not only `option_env!`.** A build
   script can validate the values (and fail the build on a typo),
   `cargo:rerun-if-env-changed` rebuilds when they change, and the values

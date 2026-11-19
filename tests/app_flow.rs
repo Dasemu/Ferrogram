@@ -698,3 +698,683 @@ fn api_setup_flag_opens_the_form() {
     cfg.notifications = false;
     assert!(cfg.api_setup);
 }
+
+// ------------------------------------------------ avatars, typing, files
+
+use ferrogram::app::load_avatar;
+use ferrogram::media::AvatarImage;
+use ferrogram::model::{Media, Presence, TypingAction};
+use ferrogram::store::avatars::AvatarDisk;
+
+#[tokio::test]
+async fn avatar_loads_from_network_then_from_disk_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = AvatarDisk::new(dir.path().join("av"));
+    let fake = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        ..Default::default()
+    });
+    let api = ApiHandle(fake.clone());
+    let alice = mock::mock_chats()
+        .into_iter()
+        .find(|c| c.id == ALICE)
+        .unwrap();
+    let pid = alice.photo_id.expect("mock Alice has a profile photo");
+
+    // Miss on disk -> downloaded and written.
+    let bytes = load_avatar(Some(api.clone()), Some(disk.clone()), (ALICE, pid))
+        .await
+        .unwrap();
+    assert!(ferrogram::app::state::avatar_is_acceptable(&bytes));
+    assert_eq!(disk.read(ALICE, pid).unwrap(), bytes);
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|c| *c == "download_avatar")
+            .count(),
+        1
+    );
+
+    // Hit on disk -> no network call, and it works offline (no API).
+    let again = load_avatar(None, Some(disk.clone()), (ALICE, pid))
+        .await
+        .unwrap();
+    assert_eq!(again, bytes);
+    let again = load_avatar(Some(api.clone()), Some(disk.clone()), (ALICE, pid))
+        .await
+        .unwrap();
+    assert_eq!(again, bytes);
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|c| *c == "download_avatar")
+            .count(),
+        1
+    );
+
+    // Offline with an empty cache is "try later", not a permanent failure.
+    let miss = load_avatar(None, Some(disk.clone()), (ALICE, pid + 1)).await;
+    assert!(matches!(miss, Err(ferrogram::error::Error::Cancelled)));
+
+    // A corrupt cache file is ignored and replaced from the network.
+    std::fs::write(
+        dir.path()
+            .join("av")
+            .join(AvatarDisk::file_name(ALICE, pid)),
+        b"junk",
+    )
+    .unwrap();
+    let healed = load_avatar(Some(api), Some(disk.clone()), (ALICE, pid))
+        .await
+        .unwrap();
+    assert_eq!(healed, bytes);
+}
+
+#[test]
+fn avatar_state_follows_photo_id_and_chat_list() {
+    let mut app = signed_in_app();
+    let alice = app.chats.get(ALICE).unwrap().clone();
+    let pid = alice.photo_id.unwrap();
+    assert!(app.avatar(ALICE).is_none(), "nothing loaded yet");
+    // A chat without a photo id never has an avatar (initials fallback).
+    assert!(app.chats.get(ECHO_BOT).unwrap().photo_id.is_none());
+
+    let png = mock::mock_avatar_png(pid, 160).unwrap();
+    let _ = app.update(Message::Done(Done::Avatar {
+        chat: ALICE,
+        photo_id: pid,
+        result: Ok(AvatarImage::decode(&png).unwrap()),
+    }));
+    assert!(app.avatar(ALICE).is_some());
+
+    // The photo changed on the server: the stale image is not drawn.
+    let mut changed = mock::mock_chats();
+    for c in &mut changed {
+        if c.id == ALICE {
+            c.photo_id = Some(pid + 1);
+        }
+    }
+    let _ = app.update(Message::Done(Done::Dialogs(Ok(changed))));
+    assert!(app.avatar(ALICE).is_none());
+
+    // Failures are remembered and not retried; "not now" is retried.
+    let _ = app.update(Message::Done(Done::Avatar {
+        chat: ALICE,
+        photo_id: pid + 1,
+        result: Err(ferrogram::error::Error::Protocol("x".into())),
+    }));
+    assert!(app.avatar_failed.contains(&(ALICE, pid + 1)));
+    let _ = app.update(Message::Done(Done::Avatar {
+        chat: -301,
+        photo_id: 1,
+        result: Err(ferrogram::error::Error::Cancelled),
+    }));
+    assert!(!app.avatar_failed.contains(&(-301, 1)));
+    assert!(app.avatar_loading.len() <= ferrogram::app::AVATAR_CONCURRENCY);
+}
+
+#[test]
+fn avatar_cache_is_bounded_and_cleared_on_logout() {
+    let mut app = signed_in_app();
+    let png = mock::mock_avatar_png(1, 160).unwrap();
+    for chat in 0..500 {
+        let _ = app.update(Message::Done(Done::Avatar {
+            chat,
+            photo_id: 1,
+            result: Ok(AvatarImage::decode(&png).unwrap()),
+        }));
+    }
+    assert!(app.avatars.bytes() <= ferrogram::app::AVATAR_BUDGET);
+    assert!(app.avatars.len() < 500);
+    let _ = app.update(Message::Net(Event::SessionRevoked));
+    assert!(app.avatars.is_empty());
+}
+
+#[test]
+fn typing_and_presence_events_drive_the_ui_state() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let typing = |chat, user, action| Message::Net(Event::Typing { chat, user, action });
+    let _ = app.update(typing(ALICE, ALICE, Some(TypingAction::Typing)));
+    assert_eq!(app.typing_status(ALICE).as_deref(), Some("typing…"));
+    // Our own typing (from another device) is not shown.
+    let _ = app.update(typing(ALICE, mock::SELF_ID, Some(TypingAction::Typing)));
+    assert_eq!(app.typing.in_chat(ALICE).len(), 1);
+    // The peer sends the message: status ends.
+    let mut m = ChatMessage::text(ALICE, 700, false, 1, "done typing");
+    m.sender_id = Some(ALICE);
+    let _ = app.update(Message::Net(Event::NewMessage(m)));
+    assert_eq!(app.typing_status(ALICE), None);
+
+    // Group typing resolves the name from the group's last message.
+    let _ = app.update(typing(mock::RUST_GROUP, 311, Some(TypingAction::Typing)));
+    assert_eq!(
+        app.typing_status(mock::RUST_GROUP).as_deref(),
+        Some("Ana is typing…")
+    );
+    let _ = app.update(typing(mock::RUST_GROUP, 311, None));
+    assert_eq!(app.typing_status(mock::RUST_GROUP), None);
+
+    // Expiry.
+    let _ = app.update(typing(ALICE, ALICE, Some(TypingAction::Typing)));
+    assert!(app.typing_status(ALICE).is_some());
+    app.typing.expire(i64::MAX);
+    assert!(app.typing_status(ALICE).is_none());
+
+    // Presence.
+    let _ = app.update(Message::Net(Event::UserStatus {
+        user: ALICE,
+        presence: Presence::Recently,
+    }));
+    assert_eq!(app.chats.get(ALICE).unwrap().presence, Presence::Recently);
+}
+
+#[tokio::test]
+async fn composing_sends_a_throttled_typing_action() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    assert!(app.typing_throttle.chat.is_none());
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("h".into())));
+    assert_eq!(app.typing_throttle.chat, Some(ALICE));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("he".into())));
+    assert_eq!(app.typing_throttle.chat, Some(ALICE));
+    // Emptying the box ends our typing action.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(String::new())));
+    assert!(app.typing_throttle.chat.is_none());
+    // Sending a message resets it too.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("hello".into())));
+    assert!(app.typing_throttle.chat.is_some());
+    let _ = app.update(Message::Ui(Ui::Send));
+    assert!(app.typing_throttle.chat.is_none());
+    // No typing in Saved Messages or while editing.
+    let _ = app.update(Message::Ui(Ui::SelectChat(mock::SELF_ID)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("note".into())));
+    assert!(app.typing_throttle.chat.is_none());
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: ALICE,
+        before: None,
+        result: Ok(mock::mock_history(ALICE)),
+    }));
+    let _ = app.update(Message::Ui(Ui::Edit(149)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("edited".into())));
+    assert!(app.typing_throttle.chat.is_none());
+}
+
+#[tokio::test]
+async fn fake_backend_records_typing_calls() {
+    let api = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        ..Default::default()
+    });
+    api.set_typing(ALICE, true).await.unwrap();
+    api.set_typing(ALICE, false).await.unwrap();
+    let calls = api.calls();
+    assert!(calls.contains(&"set_typing:on".to_owned()));
+    assert!(calls.contains(&"set_typing:off".to_owned()));
+}
+
+#[test]
+fn executable_files_are_save_only_and_never_opened() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let mut exe = ChatMessage::text(ALICE, 800, false, 1, "");
+    exe.media = Some(Media::File {
+        name: "invoice.pdf.exe".into(),
+        size: 10,
+        mime: "application/octet-stream".into(),
+    });
+    let mut pdf = ChatMessage::text(ALICE, 801, false, 2, "");
+    pdf.media = Some(Media::File {
+        name: "trail-map.pdf".into(),
+        size: 10,
+        mime: "application/pdf".into(),
+    });
+    let mut huge = ChatMessage::text(ALICE, 802, false, 3, "");
+    huge.media = Some(Media::File {
+        name: "disk.iso".into(),
+        size: ferrogram::media::MAX_OPEN_BYTES + 1,
+        mime: String::new(),
+    });
+    let _ = app.update(Message::Net(Event::NewMessage(exe)));
+    let _ = app.update(Message::Net(Event::NewMessage(pdf)));
+    let _ = app.update(Message::Net(Event::NewMessage(huge)));
+
+    let _ = app.update(Message::Ui(Ui::OpenFile(ALICE, 800)));
+    assert!(
+        app.toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not opened automatically"),
+        "{:?}",
+        app.toast
+    );
+    app.toast = None;
+    // A safe type starts the download silently.
+    let _ = app.update(Message::Ui(Ui::OpenFile(ALICE, 801)));
+    assert!(app.toast.is_none());
+    // Oversized files are refused with an explanation.
+    let _ = app.update(Message::Ui(Ui::OpenFile(ALICE, 802)));
+    assert!(
+        app.toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("too large")
+    );
+}
+
+#[test]
+fn desktop_open_refuses_save_only_names() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("run.sh");
+    std::fs::write(&p, "#!/bin/sh\n").unwrap();
+    assert!(ferrogram::desktop::open_file(&p).is_err());
+    let p = d.path().join("setup.EXE");
+    std::fs::write(&p, "x").unwrap();
+    assert!(ferrogram::desktop::open_file(&p).is_err());
+}
+
+#[tokio::test]
+async fn fake_dialog_paging_walks_the_whole_list() {
+    let api = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        extra_chats: 250,
+        ..Default::default()
+    });
+    let first = api.dialogs(100).await.unwrap();
+    assert_eq!(first.len(), 100);
+    let mut all = first;
+    loop {
+        let page = api.more_dialogs(100).await.unwrap();
+        let n = page.len();
+        all.extend(page);
+        if n < 100 {
+            break;
+        }
+    }
+    let mut ids: Vec<_> = all.iter().map(|c| c.id).collect();
+    let total = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), total, "no duplicates across pages");
+    assert_eq!(total, mock::mock_chats().len() + 250);
+    // Restarting begins again from the top.
+    assert_eq!(api.dialogs(5).await.unwrap().len(), 5);
+}
+
+#[test]
+fn chat_list_pages_in_on_demand_and_prunes_only_when_complete() {
+    use ferrogram::app::DIALOGS_PAGE;
+    let mut app = signed_in_app();
+    // The mock list is shorter than a page: exhausted, nothing more to load.
+    assert!(app.dialogs_exhausted);
+
+    // A full first page: more is available.
+    let page: Vec<_> = (0..DIALOGS_PAGE as i64)
+        .map(|i| {
+            let mut c = ferrogram::model::Chat::new(
+                5_000 + i,
+                ferrogram::model::ChatKind::User,
+                format!("c{i}"),
+            );
+            c.last_date = 10_000 - i;
+            c
+        })
+        .collect();
+    let _ = app.update(Message::Done(Done::Dialogs(Ok(page))));
+    assert!(!app.dialogs_exhausted);
+    assert_eq!(app.chats.all().len(), DIALOGS_PAGE);
+
+    // The next, short page is appended and ends paging.
+    let more: Vec<_> = (0..7_i64)
+        .map(|i| {
+            let mut c = ferrogram::model::Chat::new(
+                9_000 + i,
+                ferrogram::model::ChatKind::User,
+                format!("old{i}"),
+            );
+            c.last_date = 100 - i;
+            c
+        })
+        .collect();
+    let _ = app.update(Message::Done(Done::MoreDialogs(Ok(more))));
+    assert!(app.dialogs_exhausted);
+    assert_eq!(app.chats.all().len(), DIALOGS_PAGE + 7);
+    assert_eq!(
+        app.chats.all().last().unwrap().id,
+        9_006,
+        "older chats last"
+    );
+
+    // A failed page load leaves the list alone and allows a retry.
+    let _ = app.update(Message::Done(Done::MoreDialogs(Err(
+        ferrogram::error::Error::Net("x".into()),
+    ))));
+    assert!(!app.dialogs_loading);
+    assert_eq!(app.chats.all().len(), DIALOGS_PAGE + 7);
+}
+
+// ------------------------------------------------- global search + jump
+
+#[tokio::test]
+async fn fake_global_search_spans_chats_newest_first() {
+    let api = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        ..Default::default()
+    });
+    let hits = api.search_global("hike".into(), 30).await.unwrap();
+    assert!(!hits.is_empty());
+    assert!(
+        hits.iter()
+            .all(|h| h.message.text.to_lowercase().contains("hike"))
+    );
+    assert!(
+        hits.windows(2)
+            .all(|w| w[0].message.date >= w[1].message.date)
+    );
+    assert!(hits.iter().any(|h| h.chat_title == "Alice Johnson"));
+    assert!(
+        api.search_global("zzzz-no-match".into(), 30)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(api.search_global("hike".into(), 1).await.unwrap().len() <= 1);
+}
+
+#[tokio::test]
+async fn sidebar_global_search_debounces_dedupes_and_ignores_stale_answers() {
+    use ferrogram::model::GlobalHit;
+    let mut app = signed_in_app();
+    let hit = |chat, id, text: &str| GlobalHit {
+        message: ChatMessage::text(chat, id, false, 50, text),
+        chat_title: "Far Away".into(),
+        chat_kind: ferrogram::model::ChatKind::Group,
+        photo_id: None,
+    };
+    let _ = app.update(Message::Ui(Ui::SidebarSearch("hik".into())));
+    // The debounce fires for the settled query only.
+    let _ = app.update(Message::Ui(Ui::GlobalSearchDue("hi".into())));
+    assert!(!app.global_searching, "stale debounce ignored");
+    let _ = app.update(Message::Ui(Ui::GlobalSearchDue("hik".into())));
+    assert!(app.global_searching);
+
+    // An answer for an older query is dropped.
+    let _ = app.update(Message::Done(Done::GlobalResults {
+        query: "hi".into(),
+        result: Ok(vec![hit(-777, 5, "old")]),
+    }));
+    assert!(app.sidebar_global.is_empty());
+
+    // A local (cache) match is not repeated in the global section.
+    app.sidebar_messages = vec![ChatMessage::text(ALICE, 144, false, 1, "hike")];
+    let _ = app.update(Message::Done(Done::GlobalResults {
+        query: "hik".into(),
+        result: Ok(vec![hit(ALICE, 144, "hike"), hit(-777, 5, "hike far away")]),
+    }));
+    assert!(!app.global_searching);
+    assert_eq!(app.sidebar_global.len(), 1);
+    assert_eq!(app.sidebar_global[0].message.chat_id, -777);
+
+    // Failures keep the local results and show no toast.
+    let _ = app.update(Message::Ui(Ui::SidebarSearch("hike".into())));
+    let _ = app.update(Message::Done(Done::GlobalResults {
+        query: "hike".into(),
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    assert!(app.toast.is_none());
+
+    // Clearing the field clears everything.
+    let _ = app.update(Message::Ui(Ui::ClearSidebarSearch));
+    assert!(app.sidebar_global.is_empty() && !app.global_searching);
+}
+
+#[tokio::test]
+async fn opening_a_search_hit_loads_its_window_and_detaches() {
+    use ferrogram::model::GlobalHit;
+    let mut app = signed_in_app();
+    // A hit in a chat that is not in the loaded list.
+    let far = -777;
+    let target = 40;
+    let hit = GlobalHit {
+        message: ChatMessage::text(far, target, false, 5, "needle"),
+        chat_title: "Far Away".into(),
+        chat_kind: ferrogram::model::ChatKind::Group,
+        photo_id: Some(3),
+    };
+    app.sidebar_global = vec![hit];
+    assert!(app.chats.get(far).is_none());
+    let _ = app.update(Message::Ui(Ui::OpenResult(far, target)));
+    assert_eq!(app.selected, Some(far));
+    assert_eq!(app.chats.get(far).unwrap().title, "Far Away");
+    assert_eq!(app.highlight, Some(target));
+    let conv = app.conversation.as_ref().unwrap();
+    assert!(conv.detached && conv.jump_to == Some(target));
+
+    // A late "newest page" answer (before = None) must not pollute the window.
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: far,
+        before: None,
+        result: Ok(vec![ChatMessage::text(far, 500, false, 9, "newest")]),
+    }));
+    assert!(app.conversation.as_ref().unwrap().get(500).is_none());
+
+    // The window around the hit arrives: the jump target is consumed.
+    let window: Vec<_> = (20..=65)
+        .map(|i| ChatMessage::text(far, i, false, i64::from(i), "m"))
+        .collect();
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: far,
+        before: Some(target + ferrogram::app::state::JUMP_NEWER),
+        result: Ok(window),
+    }));
+    let conv = app.conversation.as_ref().unwrap();
+    assert!(conv.jump_to.is_none() && conv.detached);
+    assert!(conv.get(target).is_some());
+    assert!(!app.at_bottom);
+
+    // Live messages do not append to the detached window...
+    let _ = app.update(Message::Net(Event::NewMessage(ChatMessage::text(
+        far, 900, false, 99, "live",
+    ))));
+    assert!(app.conversation.as_ref().unwrap().get(900).is_none());
+    // ...and "jump to latest" reattaches to the newest history.
+    let _ = app.update(Message::Ui(Ui::ScrollToBottom));
+    let conv = app.conversation.as_ref().unwrap();
+    assert!(!conv.detached);
+    assert!(app.at_bottom);
+
+    // A hit that vanished server-side falls back to the latest messages.
+    let _ = app.update(Message::Ui(Ui::OpenResult(far, 41)));
+    assert!(app.conversation.as_ref().unwrap().detached);
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: far,
+        before: Some(41 + ferrogram::app::state::JUMP_NEWER),
+        result: Ok(vec![ChatMessage::text(far, 10, false, 1, "other")]),
+    }));
+    assert!(!app.conversation.as_ref().unwrap().detached);
+    assert!(
+        app.toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no longer available")
+    );
+}
+
+#[tokio::test]
+async fn jumping_inside_the_loaded_window_does_not_refetch() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: ALICE,
+        before: None,
+        result: Ok(mock::mock_history(ALICE)),
+    }));
+    let _ = app.update(Message::Ui(Ui::OpenResult(ALICE, 148)));
+    let conv = app.conversation.as_ref().unwrap();
+    assert!(
+        !conv.detached,
+        "target already loaded: stay on the live window"
+    );
+    assert_eq!(app.highlight, Some(148));
+}
+
+// -------------------------------------------------------------- drafts
+
+#[tokio::test]
+async fn fake_backend_saves_and_clears_drafts() {
+    let api = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        ..Default::default()
+    });
+    api.save_draft(ALICE, "later".into(), Some(3))
+        .await
+        .unwrap();
+    let chats = api.dialogs(50).await.unwrap();
+    let d = chats
+        .iter()
+        .find(|c| c.id == ALICE)
+        .unwrap()
+        .draft
+        .clone()
+        .unwrap();
+    assert_eq!((d.text.as_str(), d.reply_to), ("later", Some(3)));
+    api.save_draft(ALICE, String::new(), None).await.unwrap();
+    let chats = api.dialogs(50).await.unwrap();
+    assert!(
+        chats
+            .iter()
+            .find(|c| c.id == ALICE)
+            .unwrap()
+            .draft
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn drafts_follow_the_user_between_chats() {
+    let mut app = signed_in_app();
+    // The mock account already has a draft in "Book Club" (-304).
+    assert_eq!(
+        app.chats.get(-304).unwrap().draft.as_ref().unwrap().text,
+        "I'll bring the cookies"
+    );
+    let _ = app.update(Message::Ui(Ui::SelectChat(-304)));
+    assert_eq!(app.composer, "I'll bring the cookies", "restored on open");
+
+    // Type something in Alice's chat, leave, and come back.
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    assert_eq!(app.composer, "", "no draft there: a clean composer");
+    let _ = app.update(Message::Ui(Ui::Reply(148)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("on my way".into())));
+    let _ = app.update(Message::Ui(Ui::SelectChat(-304)));
+    let d = app.chats.get(ALICE).unwrap().draft.clone().unwrap();
+    assert_eq!(d.text, "on my way");
+    assert_eq!(d.reply_to, Some(148));
+    assert_eq!(app.composer, "I'll bring the cookies");
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    assert_eq!(app.composer, "on my way");
+    assert_eq!(app.compose_mode, ComposeMode::Reply(148));
+
+    // Emptying the box deletes the draft when leaving.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(String::new())));
+    let _ = app.update(Message::Ui(Ui::CancelCompose));
+    let _ = app.update(Message::Ui(Ui::SelectChat(-304)));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_none());
+}
+
+#[tokio::test]
+async fn draft_sync_waits_for_a_pause_in_typing() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("a".into())));
+    let first = app.draft_version;
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("ab".into())));
+    assert!(app.draft_version > first);
+    // The timer from the first keystroke is stale: nothing saved yet.
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, first)));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_none());
+    // The latest timer saves it.
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, app.draft_version)));
+    assert_eq!(
+        app.chats.get(ALICE).unwrap().draft.as_ref().unwrap().text,
+        "ab"
+    );
+    // A timer for a chat that is no longer open does nothing.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("abc".into())));
+    let v = app.draft_version;
+    let _ = app.update(Message::Ui(Ui::SelectChat(-304)));
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, v)));
+    assert_eq!(app.composer, "I'll bring the cookies");
+}
+
+#[tokio::test]
+async fn sending_consumes_the_draft_and_edits_keep_it() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: ALICE,
+        before: None,
+        result: Ok(mock::mock_history(ALICE)),
+    }));
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("draft text".into())));
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, app.draft_version)));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_some());
+
+    // Editing a message stashes the draft and gets it back afterwards.
+    let _ = app.update(Message::Ui(Ui::Edit(149)));
+    assert_eq!(app.composer, "You're the best!");
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("You're the best!!".into())));
+    let _ = app.update(Message::Ui(Ui::DraftDue(ALICE, app.draft_version)));
+    assert_eq!(
+        app.chats.get(ALICE).unwrap().draft.as_ref().unwrap().text,
+        "draft text",
+        "edit text is never saved as the draft"
+    );
+    let _ = app.update(Message::Ui(Ui::CancelCompose));
+    assert_eq!(app.composer, "draft text");
+    assert_eq!(app.compose_mode, ComposeMode::Normal);
+
+    let _ = app.update(Message::Ui(Ui::Send));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_none());
+    assert!(app.composer.is_empty());
+}
+
+#[tokio::test]
+async fn drafts_from_other_devices_do_not_clobber_typing() {
+    use ferrogram::model::Draft;
+    let mut app = signed_in_app();
+    let remote = |text: &str| {
+        Message::Net(Event::Draft {
+            chat: ALICE,
+            draft: Some(Draft {
+                text: text.into(),
+                reply_to: None,
+                date: 10,
+            }),
+        })
+    };
+    // Not the open chat: only the list changes.
+    let _ = app.update(remote("from phone"));
+    assert_eq!(
+        app.chats.get(ALICE).unwrap().draft.as_ref().unwrap().text,
+        "from phone"
+    );
+    // Open chat with an empty composer: the draft appears (like the official client).
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    assert_eq!(app.composer, "from phone");
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(String::new())));
+    let _ = app.update(remote("newer from phone"));
+    assert_eq!(app.composer, "newer from phone");
+    // While the user is typing it is left alone.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged("mine".into())));
+    let _ = app.update(remote("another"));
+    assert_eq!(app.composer, "mine");
+    // Cleared remotely.
+    let _ = app.update(Message::Ui(Ui::ComposerChanged(String::new())));
+    let _ = app.update(Message::Net(Event::Draft {
+        chat: ALICE,
+        draft: None,
+    }));
+    assert!(app.chats.get(ALICE).unwrap().draft.is_none());
+}

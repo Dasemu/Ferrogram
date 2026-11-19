@@ -61,6 +61,60 @@ pub struct Chat {
     pub last_message: Option<Message>,
     /// Sort key for the list (unix seconds of the last activity).
     pub last_date: i64,
+    /// Telegram's id of the current profile photo, `None` when the chat has
+    /// none (the avatar then falls back to the initials).
+    pub photo_id: Option<i64>,
+    /// Last-seen status of the other side of a private chat (not persisted).
+    pub presence: Presence,
+    /// Unsent text for this chat (synced with the server).
+    pub draft: Option<Draft>,
+}
+
+/// A draft message. The body is private: `Debug` only prints its length.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub text: String,
+    pub reply_to: Option<MessageId>,
+    /// Unix seconds of the last change.
+    pub date: i64,
+}
+
+impl fmt::Debug for Draft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Draft")
+            .field(
+                "text",
+                &format_args!("MessageBody(len={})", self.text.len()),
+            )
+            .field("reply_to", &self.reply_to)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Draft {
+    /// Same content (ignoring the timestamp)?
+    pub fn same_content(&self, other: &Draft) -> bool {
+        self.text == other.text && self.reply_to == other.reply_to
+    }
+}
+
+/// A user's online status as Telegram reports it (privacy settings can
+/// blur the exact time into the coarse buckets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Presence {
+    #[default]
+    Unknown,
+    /// Online until the given unix time (the client must go offline then).
+    Online {
+        until: i64,
+    },
+    Offline {
+        was_online: i64,
+    },
+    Recently,
+    LastWeek,
+    LastMonth,
+    LongAgo,
 }
 
 impl fmt::Debug for Chat {
@@ -87,6 +141,9 @@ impl Chat {
             read_inbox_max_id: 0,
             last_message: None,
             last_date: 0,
+            photo_id: None,
+            presence: Presence::Unknown,
+            draft: None,
         }
     }
 
@@ -118,6 +175,80 @@ pub fn avatar_color_index(id: i64) -> usize {
         id.abs()
     };
     (bare % 7) as usize
+}
+
+/// A message found by the server-side (global) search, with enough chat
+/// information to show and open a chat that is not in the loaded list.
+#[derive(Clone, PartialEq)]
+pub struct GlobalHit {
+    pub message: Message,
+    pub chat_title: String,
+    pub chat_kind: ChatKind,
+    pub photo_id: Option<i64>,
+}
+
+impl fmt::Debug for GlobalHit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GlobalHit")
+            .field("chat", &self.message.chat_id)
+            .field("id", &self.message.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GlobalHit {
+    /// A list entry for the hit's chat (used when opening it).
+    pub fn to_chat(&self) -> Chat {
+        let mut c = Chat::new(
+            self.message.chat_id,
+            self.chat_kind,
+            self.chat_title.clone(),
+        );
+        c.photo_id = self.photo_id;
+        c.last_date = self.message.date;
+        c
+    }
+}
+
+/// What someone is doing in a chat (the "typing…" family of statuses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypingAction {
+    Typing,
+    RecordingVoice,
+    RecordingVideo,
+    UploadingPhoto,
+    UploadingVideo,
+    UploadingFile,
+    ChoosingSticker,
+    Other,
+}
+
+impl TypingAction {
+    /// Phrase for a private chat header / chat list row.
+    pub fn private_text(self) -> &'static str {
+        match self {
+            Self::Typing | Self::Other => "typing…",
+            Self::RecordingVoice => "recording voice message…",
+            Self::RecordingVideo => "recording video…",
+            Self::UploadingPhoto => "sending photo…",
+            Self::UploadingVideo => "sending video…",
+            Self::UploadingFile => "sending file…",
+            Self::ChoosingSticker => "choosing sticker…",
+        }
+    }
+
+    /// Verb phrase used after a name in groups ("Ana is typing…").
+    pub fn group_verb(self) -> &'static str {
+        match self {
+            Self::Typing | Self::Other => "typing",
+            Self::RecordingVoice => "recording voice message",
+            Self::RecordingVideo => "recording video",
+            Self::UploadingPhoto => "sending photo",
+            Self::UploadingVideo => "sending video",
+            Self::UploadingFile => "sending file",
+            Self::ChoosingSticker => "choosing sticker",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

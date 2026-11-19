@@ -6,9 +6,9 @@ use iced::{Alignment, Element, Length};
 use super::format;
 use super::icons::Icon;
 use super::theme::{self, FONT_SEMIBOLD};
-use super::widgets::{avatar, badge, emoji_line, icon};
+use super::widgets::{avatar, avatar_photo, badge, emoji_line, icon};
 use crate::app::{App, Message, Ui};
-use crate::model::{Chat, ChatKind, ConnState, Message as ChatMessage, SendState};
+use crate::model::{Chat, ChatKind, ConnState, GlobalHit, Message as ChatMessage, SendState};
 use iced::widget::text::Wrapping;
 
 pub fn view(app: &App) -> Element<'_, Message> {
@@ -80,6 +80,25 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 }
             }
         }
+        if !app.sidebar_global.is_empty() {
+            list = list.push(section(app, "Global search results"));
+            for hit in &app.sidebar_global {
+                list = list.push(global_result_row(app, hit));
+            }
+        } else if app.global_searching {
+            list = list.push(
+                container(text("Searching…").size(m.font_s).color(p.text_muted)).padding([10, 16]),
+            );
+        }
+    }
+
+    if app.dialogs_loading && app.sidebar_query.trim().is_empty() {
+        list = list.push(
+            container(text("Loading…").size(m.font_s).color(p.text_muted))
+                .width(Length::Fill)
+                .align_x(Alignment::Center)
+                .padding([10, 16]),
+        );
     }
 
     let banner: Element<'_, Message> = match app.conn {
@@ -133,6 +152,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         menu,
         banner,
         scrollable(list)
+            .on_scroll(|vp| Message::Ui(Ui::SidebarScrolled(vp)))
             .height(Length::Fill)
             .style(theme::scroll(p))
     ])
@@ -213,7 +233,35 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
     }
 
     let mut preview_row = row![].spacing(0).align_y(Alignment::Center);
-    if let Some(last) = &c.last_message {
+    if let Some(status) = app.typing_status(c.id) {
+        // Like Telegram Desktop: the preview becomes the live status.
+        preview_row = preview_row.push(
+            container(
+                text(status)
+                    .size(m.font_m)
+                    .wrapping(Wrapping::None)
+                    .color(if selected { fg } else { p.link }),
+            )
+            .width(Length::Fill)
+            .clip(true),
+        );
+    } else if let Some(draft) = &c.draft {
+        // Like Telegram Desktop: a red "Draft:" label before the text.
+        preview_row = preview_row.push(text("Draft: ").size(m.font_m).color(if selected {
+            fg
+        } else {
+            p.danger
+        }));
+        preview_row = preview_row.push(
+            container(emoji_line(
+                format::ellipsize(&draft.text, 30),
+                m.font_m,
+                if selected { fg } else { sec },
+            ))
+            .width(Length::Fill)
+            .clip(true),
+        );
+    } else if let Some(last) = &c.last_message {
         let prefix =
             if last.outgoing && c.kind != ChatKind::SavedMessages && c.kind != ChatKind::Channel {
                 Some("You".to_owned())
@@ -259,7 +307,13 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
     }
 
     let content = row![
-        avatar(c.id, &c.title, Some(c.kind), m.avatar_list),
+        avatar_photo(
+            app.avatar(c.id),
+            c.id,
+            &c.title,
+            Some(c.kind),
+            m.avatar_list
+        ),
         column![title_row, preview_row]
             .spacing(4)
             .width(Length::Fill),
@@ -276,12 +330,63 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
         .into()
 }
 
+fn global_result_row<'a>(app: &'a App, hit: &'a GlobalHit) -> Element<'a, Message> {
+    let t = &app.theme;
+    let p = t.palette;
+    let m = t.metrics;
+    let msg = &hit.message;
+    let content = row![
+        avatar_photo(
+            app.avatar(msg.chat_id),
+            msg.chat_id,
+            &hit.chat_title,
+            Some(hit.chat_kind),
+            m.avatar_list
+        ),
+        column![
+            row![
+                text(format::ellipsize(&hit.chat_title, 24))
+                    .size(m.font_m)
+                    .font(FONT_SEMIBOLD)
+                    .color(p.text_primary),
+                Space::new().width(Length::Fill),
+                text(format::list_time(msg.date, app.now, app.tz_offset))
+                    .size(m.font_xs)
+                    .color(p.text_secondary),
+            ],
+            container(emoji_line(
+                format::ellipsize(&msg.preview(), 36),
+                m.font_m,
+                p.text_secondary
+            ))
+            .width(Length::Fill)
+            .clip(true),
+        ]
+        .spacing(4),
+    ]
+    .spacing(11)
+    .align_y(Alignment::Center);
+    button(content)
+        .padding([6, 10])
+        .height(m.chat_row_height)
+        .width(Length::Fill)
+        .on_press(Message::Ui(Ui::OpenResult(msg.chat_id, msg.id)))
+        .style(theme::chat_row(p, false))
+        .into()
+}
+
 fn message_result_row<'a>(app: &'a App, c: &'a Chat, msg: &'a ChatMessage) -> Element<'a, Message> {
     let t = &app.theme;
     let p = t.palette;
     let m = t.metrics;
     let content = row![
-        avatar(c.id, &c.title, Some(c.kind), m.avatar_list),
+        avatar_photo(
+            app.avatar(c.id),
+            c.id,
+            &c.title,
+            Some(c.kind),
+            m.avatar_list
+        ),
         column![
             row![
                 text(format::ellipsize(&c.title, 24))

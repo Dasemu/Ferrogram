@@ -1,6 +1,6 @@
 //! Small shared view helpers (avatars, icons, badges).
 
-use iced::widget::{container, svg, text};
+use iced::widget::{container, image, svg, text};
 use iced::{Alignment, Color, Element, Length};
 
 use super::icons::Icon;
@@ -17,6 +17,29 @@ pub fn icon<'a>(i: Icon, size: f32, color: Color) -> Element<'a, Message> {
 }
 
 pub fn avatar<'a>(id: i64, title: &str, kind: Option<ChatKind>, size: f32) -> Element<'a, Message> {
+    avatar_photo(None, id, title, kind, size)
+}
+
+/// Avatar with the downloaded profile photo when there is one; the initials
+/// on a gradient circle otherwise (no photo, still loading, or failed).
+pub fn avatar_photo<'a>(
+    photo: Option<&image::Handle>,
+    id: i64,
+    title: &str,
+    kind: Option<ChatKind>,
+    size: f32,
+) -> Element<'a, Message> {
+    if let Some(h) = photo {
+        return container(
+            image(h.clone())
+                .width(size)
+                .height(size)
+                .content_fit(iced::ContentFit::Cover),
+        )
+        .width(size)
+        .height(size)
+        .into();
+    }
     let inner: Element<'a, Message> = if kind == Some(ChatKind::SavedMessages) {
         icon(Icon::Bookmark, size * 0.45, Color::WHITE)
     } else {

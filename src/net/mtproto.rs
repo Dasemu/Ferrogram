@@ -19,13 +19,15 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::session::EncryptedSession;
-use super::types::{self, dialog_info, event_from_update, message_from_tl};
+use super::types::{self, dialog_info, event_from_update, message_from_tl, presence_from_tl};
 use super::{Event, EventHub, TelegramApi, UploadKind, backoff};
 use crate::auth::SignInOutcome;
 use crate::auth::vault::Vault;
 use crate::config::ApiCredentials;
 use crate::error::{AuthError, Error, Phone, Result};
-use crate::model::{Chat, ChatId, ChatKind, ConnState, Message, MessageId, User};
+use crate::model::{
+    Chat, ChatId, ChatKind, ConnState, GlobalHit, Message, MessageId, Presence, User,
+};
 
 type UpdatesRx = mpsc::Receiver<grammers_session::updates::UpdatesLike>;
 
@@ -37,6 +39,9 @@ pub struct GrammersApi {
     login_token: Mutex<Option<LoginToken>>,
     password_token: Mutex<Option<PasswordToken>>,
     peers: Mutex<HashMap<ChatId, PeerRef>>,
+    /// The dialog iterator survives between calls so "load more" continues
+    /// from the offset instead of re-reading the list.
+    dialogs_iter: tokio::sync::Mutex<Option<grammers_client::client::DialogIter>>,
     self_id: AtomicI64,
     events: EventHub,
     /// Set when the stored session was unreadable and had to be discarded.
@@ -89,6 +94,29 @@ fn chat_kind(peer: &Peer, self_id: i64) -> ChatKind {
     }
 }
 
+/// Id of the peer's current profile photo (`None` = no photo).
+fn peer_photo_id(peer: &Peer) -> Option<i64> {
+    match peer {
+        Peer::User(u) => u.photo().map(|p| p.photo_id),
+        Peer::Group(g) => g.photo().map(|p| p.photo_id),
+        Peer::Channel(c) => c.photo().map(|p| p.photo_id),
+        Peer::Community(c) => c.photo().map(|p| p.photo_id),
+    }
+}
+
+fn peer_presence(peer: &Peer, now: i64) -> Presence {
+    match peer {
+        Peer::User(u) => match &u.raw {
+            grammers_client::tl::enums::User::User(x) => x
+                .status
+                .as_ref()
+                .map_or(Presence::Unknown, |s| presence_from_tl(s, now)),
+            _ => Presence::Unknown,
+        },
+        _ => Presence::Unknown,
+    }
+}
+
 impl GrammersApi {
     /// Create the client and spawn the sender pool. Must run inside a tokio
     /// runtime (it does: iced tasks run on the tokio executor). The keyring
@@ -114,6 +142,7 @@ impl GrammersApi {
             login_token: Mutex::new(None),
             password_token: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
+            dialogs_iter: tokio::sync::Mutex::new(None),
             self_id: AtomicI64::new(0),
             events: EventHub::new(),
             session_reset: std::sync::atomic::AtomicBool::new(reset),
@@ -132,6 +161,46 @@ impl GrammersApi {
             }
         });
         Ok(api)
+    }
+
+    /// Pull up to `limit` dialogs from the persistent iterator.
+    async fn take_dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
+        let self_id = self.self_id.load(Ordering::Acquire);
+        let now = chrono::Utc::now().timestamp();
+        let mut guard = self.dialogs_iter.lock().await;
+        let iter = guard.get_or_insert_with(|| self.client.iter_dialogs());
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(d) = iter.next().await.map_err(map_err)? else {
+                break;
+            };
+            let Some(chat_id) = d.peer_id().bot_api_dialog_id() else {
+                continue;
+            };
+            if let Ok(Some(r)) = d.peer().to_ref().await {
+                lock(&self.peers)?.insert(chat_id, r);
+            }
+            let kind = chat_kind(d.peer(), self_id);
+            let title = if kind == ChatKind::SavedMessages {
+                "Saved Messages".to_owned()
+            } else {
+                d.peer().name().unwrap_or("Deleted Account").to_owned()
+            };
+            let info = dialog_info(&d.raw, now);
+            let mut chat = Chat::new(chat_id, kind, title);
+            chat.unread_count = info.unread;
+            chat.pinned = info.pinned;
+            chat.muted = info.muted;
+            chat.read_inbox_max_id = info.read_inbox;
+            chat.read_outbox_max_id = info.read_outbox;
+            chat.photo_id = peer_photo_id(d.peer());
+            chat.presence = peer_presence(d.peer(), now);
+            chat.draft = info.draft;
+            chat.last_message = d.last_message.as_ref().and_then(|m| self.convert(m));
+            chat.last_date = chat.last_message.as_ref().map_or(0, |m| m.date);
+            out.push(chat);
+        }
+        Ok(out)
     }
 
     fn emit(&self, ev: Event) {
@@ -339,38 +408,12 @@ impl TelegramApi for Grammers {
 
     async fn dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
         let api = &self.0;
-        let self_id = api.self_id.load(Ordering::Acquire);
-        let now = chrono::Utc::now().timestamp();
-        let mut iter = api.client.iter_dialogs();
-        let mut out = Vec::new();
-        while out.len() < limit {
-            let Some(d) = iter.next().await.map_err(map_err)? else {
-                break;
-            };
-            let Some(chat_id) = d.peer_id().bot_api_dialog_id() else {
-                continue;
-            };
-            if let Ok(Some(r)) = d.peer().to_ref().await {
-                lock(&api.peers)?.insert(chat_id, r);
-            }
-            let kind = chat_kind(d.peer(), self_id);
-            let title = if kind == ChatKind::SavedMessages {
-                "Saved Messages".to_owned()
-            } else {
-                d.peer().name().unwrap_or("Deleted Account").to_owned()
-            };
-            let info = dialog_info(&d.raw, now);
-            let mut chat = Chat::new(chat_id, kind, title);
-            chat.unread_count = info.unread;
-            chat.pinned = info.pinned;
-            chat.muted = info.muted;
-            chat.read_inbox_max_id = info.read_inbox;
-            chat.read_outbox_max_id = info.read_outbox;
-            chat.last_message = d.last_message.as_ref().and_then(|m| api.convert(m));
-            chat.last_date = chat.last_message.as_ref().map_or(0, |m| m.date);
-            out.push(chat);
-        }
-        Ok(out)
+        *api.dialogs_iter.lock().await = Some(api.client.iter_dialogs());
+        api.take_dialogs(limit).await
+    }
+
+    async fn more_dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
+        self.0.take_dialogs(limit).await
     }
 
     async fn history(
@@ -522,6 +565,117 @@ impl TelegramApi for Grammers {
             }
         }
         Ok(bytes)
+    }
+
+    async fn search_global(&self, query: String, limit: usize) -> Result<Vec<GlobalHit>> {
+        let api = &self.0;
+        let self_id = api.self_id.load(Ordering::Acquire);
+        let mut iter = api.client.search_all_messages().query(&query).limit(limit);
+        let mut out = Vec::new();
+        while let Some(m) = iter.next().await.map_err(map_err)? {
+            let Some(message) = api.convert(&m) else {
+                continue;
+            };
+            let Some(peer) = m.peer() else {
+                continue;
+            };
+            // Remember the peer so the chat can be opened from the hit.
+            if let Ok(Some(r)) = m.peer_ref().await {
+                lock(&api.peers)?.insert(message.chat_id, r);
+            }
+            let kind = chat_kind(peer, self_id);
+            let chat_title = if kind == ChatKind::SavedMessages {
+                "Saved Messages".to_owned()
+            } else {
+                peer.name().unwrap_or("Deleted Account").to_owned()
+            };
+            out.push(GlobalHit {
+                message,
+                chat_title,
+                chat_kind: kind,
+                photo_id: peer_photo_id(peer),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn download_avatar(&self, chat: ChatId, photo_id: i64) -> Result<Vec<u8>> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        let photo = grammers_client::media::ChatPhoto {
+            raw: tl::enums::InputFileLocation::InputPeerPhotoFileLocation(
+                tl::types::InputPeerPhotoFileLocation {
+                    big: false,
+                    peer: peer.into(),
+                    photo_id,
+                },
+            ),
+        };
+        let mut dl = api.client.iter_download(&photo);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = dl.next().await.map_err(map_err)? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > crate::store::avatars::MAX_AVATAR_BYTES {
+                return Err(Error::Protocol("avatar too large".into()));
+            }
+        }
+        Ok(bytes)
+    }
+
+    async fn save_draft(
+        &self,
+        chat: ChatId,
+        text: String,
+        reply_to: Option<MessageId>,
+    ) -> Result<()> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        api.client
+            .invoke(&tl::functions::messages::SaveDraft {
+                no_webpage: false,
+                invert_media: false,
+                reply_to: reply_to.map(|id| {
+                    tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+                        reply_to_msg_id: id,
+                        top_msg_id: None,
+                        reply_to_peer_id: None,
+                        quote_text: None,
+                        quote_entities: None,
+                        quote_offset: None,
+                        monoforum_peer_id: None,
+                        todo_item_id: None,
+                        poll_option: None,
+                        quote_rich: None,
+                    })
+                }),
+                peer: peer.into(),
+                message: text,
+                entities: None,
+                media: None,
+                effect: None,
+                suggested_post: None,
+                rich_message: None,
+            })
+            .await
+            .map(drop)
+            .map_err(map_err)
+    }
+
+    async fn set_typing(&self, chat: ChatId, active: bool) -> Result<()> {
+        use grammers_client::tl::enums::SendMessageAction;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        let sender = api.client.action(peer);
+        if active {
+            sender
+                .oneshot(SendMessageAction::SendMessageTypingAction)
+                .await
+        } else {
+            sender.cancel().await
+        }
+        .map_err(map_err)
     }
 
     async fn download_media(&self, chat: ChatId, id: MessageId, path: PathBuf) -> Result<()> {
