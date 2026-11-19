@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogram"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "chacha20poly1305",
