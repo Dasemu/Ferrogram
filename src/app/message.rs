@@ -34,6 +34,8 @@ pub enum Ui {
     // sidebar
     SelectChat(ChatId),
     SidebarSearch(String),
+    /// The chat list scrolled: load the next page near its end.
+    SidebarScrolled(Viewport),
     ClearSidebarSearch,
     /// Open a chat at a specific message from global/in-chat search.
     OpenResult(ChatId, MessageId),
@@ -89,6 +91,8 @@ pub enum Done {
     SignIn(Result<SignInOutcome, Error>),
     Persisted(Result<(), Error>),
     Dialogs(Result<Vec<Chat>, Error>),
+    /// The next page of dialogs (appended to the list).
+    MoreDialogs(Result<Vec<Chat>, Error>),
     CacheHistory {
         chat: ChatId,
         before: Option<MessageId>,

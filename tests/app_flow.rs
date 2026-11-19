@@ -972,3 +972,83 @@ fn desktop_open_refuses_save_only_names() {
     std::fs::write(&p, "x").unwrap();
     assert!(ferrogram::desktop::open_file(&p).is_err());
 }
+
+#[tokio::test]
+async fn fake_dialog_paging_walks_the_whole_list() {
+    let api = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        extra_chats: 250,
+        ..Default::default()
+    });
+    let first = api.dialogs(100).await.unwrap();
+    assert_eq!(first.len(), 100);
+    let mut all = first;
+    loop {
+        let page = api.more_dialogs(100).await.unwrap();
+        let n = page.len();
+        all.extend(page);
+        if n < 100 {
+            break;
+        }
+    }
+    let mut ids: Vec<_> = all.iter().map(|c| c.id).collect();
+    let total = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), total, "no duplicates across pages");
+    assert_eq!(total, mock::mock_chats().len() + 250);
+    // Restarting begins again from the top.
+    assert_eq!(api.dialogs(5).await.unwrap().len(), 5);
+}
+
+#[test]
+fn chat_list_pages_in_on_demand_and_prunes_only_when_complete() {
+    use ferrogram::app::DIALOGS_PAGE;
+    let mut app = signed_in_app();
+    // The mock list is shorter than a page: exhausted, nothing more to load.
+    assert!(app.dialogs_exhausted);
+
+    // A full first page: more is available.
+    let page: Vec<_> = (0..DIALOGS_PAGE as i64)
+        .map(|i| {
+            let mut c = ferrogram::model::Chat::new(
+                5_000 + i,
+                ferrogram::model::ChatKind::User,
+                format!("c{i}"),
+            );
+            c.last_date = 10_000 - i;
+            c
+        })
+        .collect();
+    let _ = app.update(Message::Done(Done::Dialogs(Ok(page))));
+    assert!(!app.dialogs_exhausted);
+    assert_eq!(app.chats.all().len(), DIALOGS_PAGE);
+
+    // The next, short page is appended and ends paging.
+    let more: Vec<_> = (0..7_i64)
+        .map(|i| {
+            let mut c = ferrogram::model::Chat::new(
+                9_000 + i,
+                ferrogram::model::ChatKind::User,
+                format!("old{i}"),
+            );
+            c.last_date = 100 - i;
+            c
+        })
+        .collect();
+    let _ = app.update(Message::Done(Done::MoreDialogs(Ok(more))));
+    assert!(app.dialogs_exhausted);
+    assert_eq!(app.chats.all().len(), DIALOGS_PAGE + 7);
+    assert_eq!(
+        app.chats.all().last().unwrap().id,
+        9_006,
+        "older chats last"
+    );
+
+    // A failed page load leaves the list alone and allows a retry.
+    let _ = app.update(Message::Done(Done::MoreDialogs(Err(
+        ferrogram::error::Error::Net("x".into()),
+    ))));
+    assert!(!app.dialogs_loading);
+    assert_eq!(app.chats.all().len(), DIALOGS_PAGE + 7);
+}

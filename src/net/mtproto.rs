@@ -37,6 +37,9 @@ pub struct GrammersApi {
     login_token: Mutex<Option<LoginToken>>,
     password_token: Mutex<Option<PasswordToken>>,
     peers: Mutex<HashMap<ChatId, PeerRef>>,
+    /// The dialog iterator survives between calls so "load more" continues
+    /// from the offset instead of re-reading the list.
+    dialogs_iter: tokio::sync::Mutex<Option<grammers_client::client::DialogIter>>,
     self_id: AtomicI64,
     events: EventHub,
     /// Set when the stored session was unreadable and had to be discarded.
@@ -137,6 +140,7 @@ impl GrammersApi {
             login_token: Mutex::new(None),
             password_token: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
+            dialogs_iter: tokio::sync::Mutex::new(None),
             self_id: AtomicI64::new(0),
             events: EventHub::new(),
             session_reset: std::sync::atomic::AtomicBool::new(reset),
@@ -155,6 +159,45 @@ impl GrammersApi {
             }
         });
         Ok(api)
+    }
+
+    /// Pull up to `limit` dialogs from the persistent iterator.
+    async fn take_dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
+        let self_id = self.self_id.load(Ordering::Acquire);
+        let now = chrono::Utc::now().timestamp();
+        let mut guard = self.dialogs_iter.lock().await;
+        let iter = guard.get_or_insert_with(|| self.client.iter_dialogs());
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(d) = iter.next().await.map_err(map_err)? else {
+                break;
+            };
+            let Some(chat_id) = d.peer_id().bot_api_dialog_id() else {
+                continue;
+            };
+            if let Ok(Some(r)) = d.peer().to_ref().await {
+                lock(&self.peers)?.insert(chat_id, r);
+            }
+            let kind = chat_kind(d.peer(), self_id);
+            let title = if kind == ChatKind::SavedMessages {
+                "Saved Messages".to_owned()
+            } else {
+                d.peer().name().unwrap_or("Deleted Account").to_owned()
+            };
+            let info = dialog_info(&d.raw, now);
+            let mut chat = Chat::new(chat_id, kind, title);
+            chat.unread_count = info.unread;
+            chat.pinned = info.pinned;
+            chat.muted = info.muted;
+            chat.read_inbox_max_id = info.read_inbox;
+            chat.read_outbox_max_id = info.read_outbox;
+            chat.photo_id = peer_photo_id(d.peer());
+            chat.presence = peer_presence(d.peer(), now);
+            chat.last_message = d.last_message.as_ref().and_then(|m| self.convert(m));
+            chat.last_date = chat.last_message.as_ref().map_or(0, |m| m.date);
+            out.push(chat);
+        }
+        Ok(out)
     }
 
     fn emit(&self, ev: Event) {
@@ -362,40 +405,12 @@ impl TelegramApi for Grammers {
 
     async fn dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
         let api = &self.0;
-        let self_id = api.self_id.load(Ordering::Acquire);
-        let now = chrono::Utc::now().timestamp();
-        let mut iter = api.client.iter_dialogs();
-        let mut out = Vec::new();
-        while out.len() < limit {
-            let Some(d) = iter.next().await.map_err(map_err)? else {
-                break;
-            };
-            let Some(chat_id) = d.peer_id().bot_api_dialog_id() else {
-                continue;
-            };
-            if let Ok(Some(r)) = d.peer().to_ref().await {
-                lock(&api.peers)?.insert(chat_id, r);
-            }
-            let kind = chat_kind(d.peer(), self_id);
-            let title = if kind == ChatKind::SavedMessages {
-                "Saved Messages".to_owned()
-            } else {
-                d.peer().name().unwrap_or("Deleted Account").to_owned()
-            };
-            let info = dialog_info(&d.raw, now);
-            let mut chat = Chat::new(chat_id, kind, title);
-            chat.unread_count = info.unread;
-            chat.pinned = info.pinned;
-            chat.muted = info.muted;
-            chat.read_inbox_max_id = info.read_inbox;
-            chat.read_outbox_max_id = info.read_outbox;
-            chat.photo_id = peer_photo_id(d.peer());
-            chat.presence = peer_presence(d.peer(), now);
-            chat.last_message = d.last_message.as_ref().and_then(|m| api.convert(m));
-            chat.last_date = chat.last_message.as_ref().map_or(0, |m| m.date);
-            out.push(chat);
-        }
-        Ok(out)
+        *api.dialogs_iter.lock().await = Some(api.client.iter_dialogs());
+        api.take_dialogs(limit).await
+    }
+
+    async fn more_dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
+        self.0.take_dialogs(limit).await
     }
 
     async fn history(

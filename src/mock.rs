@@ -458,6 +458,9 @@ pub struct FakeOptions {
     /// Echo Bot answers and peers "read" our messages after a delay.
     pub live_simulation: bool,
     pub latency: Duration,
+    /// Extra filler contacts (older than every scripted chat), to exercise
+    /// chat-list paging.
+    pub extra_chats: usize,
 }
 
 impl Default for FakeOptions {
@@ -466,6 +469,7 @@ impl Default for FakeOptions {
             logged_in: false,
             live_simulation: true,
             latency: Duration::from_millis(0),
+            extra_chats: 0,
         }
     }
 }
@@ -478,6 +482,8 @@ struct State {
     history: BTreeMap<ChatId, Vec<Message>>,
     calls: Vec<String>,
     next_id: MessageId,
+    /// How many dialogs the paging cursor has handed out.
+    dialog_cursor: usize,
 }
 
 pub struct FakeTelegram {
@@ -488,7 +494,22 @@ pub struct FakeTelegram {
 
 impl FakeTelegram {
     pub fn new(opts: FakeOptions) -> Arc<Self> {
-        let (chats, history) = chats_and_history();
+        let (mut chats, mut history) = chats_and_history();
+        for i in 0..opts.extra_chats {
+            let id = 1_000 + i as i64;
+            let mut c = Chat::new(id, ChatKind::User, format!("Contact {i:03}"));
+            let m = msg(
+                id,
+                1,
+                false,
+                MOCK_NOW - 30 * DAY - i as i64 * MIN,
+                "Older conversation",
+            );
+            c.last_date = m.date;
+            c.last_message = Some(m.clone());
+            history.insert(id, vec![m]);
+            chats.push(c);
+        }
         Arc::new(Self {
             state: Mutex::new(State {
                 authorized: opts.logged_in,
@@ -498,6 +519,7 @@ impl FakeTelegram {
                 history,
                 calls: Vec::new(),
                 next_id: 10_000,
+                dialog_cursor: 0,
             }),
             opts,
             events: Arc::new(EventHub::new()),
@@ -539,6 +561,23 @@ impl FakeTelegram {
         } else {
             Err(Error::Auth(AuthError::SessionRevoked))
         }
+    }
+
+    /// The next `limit` dialogs in list order (pinned, then newest first).
+    fn dialog_slice(&self, limit: usize) -> Result<Vec<Chat>> {
+        let mut s = self.st()?;
+        let mut chats = s.chats.clone();
+        for c in &mut chats {
+            if let Some(last) = s.history.get(&c.id).and_then(|h| h.last()) {
+                c.last_date = last.date;
+                c.last_message = Some(last.clone());
+            }
+        }
+        crate::app::state::sort_chats(&mut chats);
+        let from = s.dialog_cursor.min(chats.len());
+        let page: Vec<Chat> = chats.into_iter().skip(from).take(limit).collect();
+        s.dialog_cursor = from + page.len();
+        Ok(page)
     }
 
     fn append_outgoing(&self, mut m: Message) -> Result<Message> {
@@ -649,16 +688,14 @@ impl TelegramApi for FakeTelegram {
     async fn dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
         self.call("dialogs").await?;
         self.require_auth()?;
-        let s = self.st()?;
-        let mut chats = s.chats.clone();
-        for c in &mut chats {
-            if let Some(last) = s.history.get(&c.id).and_then(|h| h.last()) {
-                c.last_date = last.date;
-                c.last_message = Some(last.clone());
-            }
-        }
-        chats.truncate(limit);
-        Ok(chats)
+        self.st()?.dialog_cursor = 0;
+        self.dialog_slice(limit)
+    }
+
+    async fn more_dialogs(&self, limit: usize) -> Result<Vec<Chat>> {
+        self.call("more_dialogs").await?;
+        self.require_auth()?;
+        self.dialog_slice(limit)
     }
 
     async fn history(

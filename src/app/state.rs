@@ -35,6 +35,17 @@ impl ChatList {
         self.chats.iter_mut().find(|c| c.id == id)
     }
 
+    /// Add `chats` (a later page), replacing entries with the same id.
+    pub fn merge(&mut self, chats: Vec<Chat>) {
+        for c in chats {
+            match self.chats.iter_mut().find(|x| x.id == c.id) {
+                Some(x) => *x = c,
+                None => self.chats.push(c),
+            }
+        }
+        sort_chats(&mut self.chats);
+    }
+
     pub fn replace(&mut self, chats: Vec<Chat>) {
         *self = Self::new(chats);
     }
@@ -747,6 +758,18 @@ mod tests {
         l.apply_event(&Event::NewMessage(M::text(1, 7, true, 32, "y")), None);
         assert_eq!(l.get(1).unwrap().unread_count, 1);
         assert_eq!(l.total_unread(), 1);
+    }
+
+    #[test]
+    fn merge_appends_a_page_and_updates_existing() {
+        let mut l = ChatList::new(vec![chat(1, 100), chat(2, 90)]);
+        let mut renamed = chat(2, 90);
+        renamed.title = "renamed".into();
+        l.merge(vec![renamed, chat(3, 10), chat(4, 5)]);
+        assert_eq!(l.all().len(), 4);
+        assert_eq!(l.get(2).unwrap().title, "renamed");
+        let ids: Vec<_> = l.all().iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
     }
 
     #[test]

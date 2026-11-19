@@ -46,6 +46,10 @@ pub const AVATAR_BUDGET: usize = 10 * 1024 * 1024;
 const AVATAR_COST: usize = 160 * 160 * 4;
 /// Chats (from the top of the list) whose avatars are fetched eagerly.
 pub const AVATAR_PREFETCH: usize = 80;
+/// Dialogs requested per page (first load and each "load more").
+pub const DIALOGS_PAGE: usize = 100;
+/// Start loading the next page this many px before the list's end.
+pub const DIALOGS_LOAD_THRESHOLD: f32 = 300.0;
 /// Avatar downloads in flight at once.
 pub const AVATAR_CONCURRENCY: usize = 6;
 
@@ -130,6 +134,9 @@ pub struct App {
     pub avatar_disk: Option<AvatarDisk>,
     /// Sender names seen in messages, for "Ana is typing…" (bounded).
     pub user_names: HashMap<i64, String>,
+    /// The server has no more dialogs after the ones loaded.
+    pub dialogs_exhausted: bool,
+    pub dialogs_loading: bool,
     pub typing: TypingTracker,
     pub typing_throttle: TypingThrottle,
     pub viewer: Option<(ChatId, MessageId)>,
@@ -217,6 +224,8 @@ impl App {
             avatar_failed: HashSet::new(),
             avatar_disk: (!config.mock).then(|| AvatarDisk::new(config.avatar_dir())),
             user_names: HashMap::new(),
+            dialogs_exhausted: false,
+            dialogs_loading: false,
             typing: TypingTracker::default(),
             typing_throttle: TypingThrottle::default(),
             viewer: None,
@@ -251,6 +260,10 @@ impl App {
                 } else {
                     150
                 }),
+                extra_chats: std::env::var("FERROGRAM_MOCK_EXTRA_CHATS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
             });
             Task::done(Message::Done(Done::ApiReady(Ok(ApiHandle(fake)))))
         } else if app.config.api_setup {
@@ -412,8 +425,22 @@ impl App {
         let Some(api) = self.api.clone() else {
             return Task::none();
         };
-        Task::perform(async move { api.dialogs(200).await }, |r| {
+        Task::perform(async move { api.dialogs(DIALOGS_PAGE).await }, |r| {
             Message::Done(Done::Dialogs(r))
+        })
+    }
+
+    /// Load the next page of dialogs once the user nears the list's end.
+    fn load_more_dialogs(&mut self) -> Task<Message> {
+        if self.dialogs_exhausted || self.dialogs_loading || !self.auth.is_signed_in() {
+            return Task::none();
+        }
+        let Some(api) = self.api.clone() else {
+            return Task::none();
+        };
+        self.dialogs_loading = true;
+        Task::perform(async move { api.more_dialogs(DIALOGS_PAGE).await }, |r| {
+            Message::Done(Done::MoreDialogs(r))
         })
     }
 
@@ -829,6 +856,16 @@ impl App {
                         })
                     },
                 )
+            }
+            Ui::SidebarScrolled(vp) => {
+                let bottom = vp.absolute_offset().y + vp.bounds().height;
+                if self.sidebar_query.trim().is_empty()
+                    && vp.content_bounds().height - bottom < DIALOGS_LOAD_THRESHOLD
+                {
+                    self.load_more_dialogs()
+                } else {
+                    Task::none()
+                }
             }
             Ui::ClearSidebarSearch => {
                 self.sidebar_query.clear();
@@ -1420,6 +1457,8 @@ impl App {
         self.avatar_failed.clear();
         self.typing.clear();
         self.typing_throttle.reset();
+        self.dialogs_exhausted = false;
+        self.dialogs_loading = false;
     }
 
     fn on_done(&mut self, done: Done) -> Task<Message> {
@@ -1553,13 +1592,36 @@ impl App {
             Done::Dialogs(Ok(chats)) => {
                 let to_store = chats.clone();
                 self.remember_names(chats.iter().filter_map(|c| c.last_message.as_ref()));
+                self.dialogs_exhausted = chats.len() < DIALOGS_PAGE;
+                self.dialogs_loading = false;
+                let exhausted = self.dialogs_exhausted;
                 self.chats.replace(chats);
+                // Pruning is only safe when the first page was the whole list.
+                let persist = self.store_bg(move |s| {
+                    if exhausted {
+                        s.replace_chats(&to_store).map(|_| ())
+                    } else {
+                        s.upsert_chats(&to_store)
+                    }
+                });
+                Task::batch([persist, self.fetch_avatars()])
+            }
+            Done::Dialogs(Err(e)) => self.on_error(e),
+            Done::MoreDialogs(Ok(chats)) => {
+                self.dialogs_loading = false;
+                self.dialogs_exhausted = chats.len() < DIALOGS_PAGE;
+                self.remember_names(chats.iter().filter_map(|c| c.last_message.as_ref()));
+                let to_store = chats.clone();
+                self.chats.merge(chats);
                 Task::batch([
-                    self.store_bg(move |s| s.replace_chats(&to_store).map(|_| ())),
+                    self.store_bg(move |s| s.upsert_chats(&to_store)),
                     self.fetch_avatars(),
                 ])
             }
-            Done::Dialogs(Err(e)) => self.on_error(e),
+            Done::MoreDialogs(Err(e)) => {
+                self.dialogs_loading = false;
+                self.on_error(e)
+            }
             Done::CacheHistory {
                 chat,
                 before,

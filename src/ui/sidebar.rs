@@ -82,6 +82,15 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
     }
 
+    if app.dialogs_loading && app.sidebar_query.trim().is_empty() {
+        list = list.push(
+            container(text("Loading…").size(m.font_s).color(p.text_muted))
+                .width(Length::Fill)
+                .align_x(Alignment::Center)
+                .padding([10, 16]),
+        );
+    }
+
     let banner: Element<'_, Message> = match app.conn {
         ConnState::Connected => Space::new().height(0).into(),
         c => container(
@@ -133,6 +142,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         menu,
         banner,
         scrollable(list)
+            .on_scroll(|vp| Message::Ui(Ui::SidebarScrolled(vp)))
             .height(Length::Fill)
             .style(theme::scroll(p))
     ])

@@ -100,7 +100,11 @@ pub trait TelegramApi: Send + Sync {
     async fn persist_session(&self) -> Result<()>;
     async fn log_out(&self) -> Result<()>;
 
+    /// The first `limit` dialogs (restarts paging).
     async fn dialogs(&self, limit: usize) -> Result<Vec<Chat>>;
+    /// The next `limit` dialogs after the previous `dialogs` / `more_dialogs`
+    /// call. Fewer than `limit` means the list is exhausted.
+    async fn more_dialogs(&self, limit: usize) -> Result<Vec<Chat>>;
     /// Messages older than `before` (exclusive), oldest first.
     async fn history(
         &self,
