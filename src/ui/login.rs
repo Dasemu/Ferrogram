@@ -9,6 +9,9 @@ use crate::app::{AUTH_INPUT_ID, App, Message, Ui};
 use crate::auth::AuthState;
 
 pub fn view(app: &App) -> Element<'_, Message> {
+    if let Some(form) = &app.setup {
+        return setup_view(app, form);
+    }
     let t = &app.theme;
     let p = t.palette;
     let m = t.metrics;
@@ -105,7 +108,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         let input = text_input(placeholder, &value)
             .id(AUTH_INPUT_ID)
             .secure(secure)
-            .on_input(|s| Message::Ui(Ui::AuthInput(s)))
+            .on_input(|s| Message::Ui(Ui::AuthInput(s.into())))
             .on_submit(Message::Ui(Ui::AuthSubmit))
             .padding([12, 14])
             .size(m.font_l)
@@ -172,4 +175,62 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill)
     .style(theme::fill(p.bg_sidebar))
     .into()
+}
+
+/// First-run screen asking for the Telegram API credentials. The api_hash
+/// goes to the OS keyring; only the numeric api_id is written to config.ini.
+fn setup_view<'a>(app: &'a App, form: &'a crate::app::SetupForm) -> Element<'a, Message> {
+    let t = &app.theme;
+    let (p, m) = (t.palette, t.metrics);
+    let field = |ph: &'a str, v: &'a str| {
+        text_input(ph, v)
+            .padding([12, 14])
+            .size(m.font_l)
+            .style(theme::input(p, p.bg_input, 8.0, true))
+    };
+    let form_col = column![
+        svg(svg::Handle::from_memory(LOGO)).width(110).height(110),
+        Space::new().height(22),
+        text("Telegram API credentials")
+            .size(m.font_xl)
+            .font(FONT_SEMIBOLD)
+            .color(p.text_primary),
+        Space::new().height(8),
+        text("Create an app at my.telegram.org → API development tools,\nthen paste its api_id and api_hash. The hash is kept in your keyring.")
+            .size(m.font_m)
+            .color(p.text_secondary)
+            .align_x(Alignment::Center),
+        Space::new().height(26),
+        field("api_id", &form.api_id)
+            .id(AUTH_INPUT_ID)
+            .on_input(|s| Message::Ui(Ui::SetupApiId(s))),
+        Space::new().height(10),
+        field("api_hash", &form.api_hash.0)
+            .secure(true)
+            .on_input(|s| Message::Ui(Ui::SetupApiHash(s.into())))
+            .on_submit(Message::Ui(Ui::SetupSubmit)),
+        container(text(form.error.clone().unwrap_or_default()).size(m.font_s).color(p.danger))
+            .width(Length::Fill)
+            .padding([6, 4])
+            .height(30),
+        button(
+            container(
+                text(if form.busy { "PLEASE WAIT…" } else { "SAVE" })
+                    .size(m.font_m)
+                    .font(FONT_SEMIBOLD)
+            )
+            .width(Length::Fill)
+            .align_x(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([12, 0])
+        .on_press_maybe((!form.busy).then_some(Message::Ui(Ui::SetupSubmit)))
+        .style(theme::primary_button(p)),
+    ]
+    .align_x(Alignment::Center)
+    .width(380);
+    container(form_col)
+        .center(Length::Fill)
+        .style(theme::fill(p.bg_sidebar))
+        .into()
 }

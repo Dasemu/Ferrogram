@@ -74,6 +74,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
     if app.compose_mode != ComposeMode::Normal {
         col = col.push(compose_bar(app));
     }
+    if let Some(f) = &app.pending_file {
+        col = col.push(pending_file_bar(app, f));
+    }
     col = col.push(composer(app));
 
     container(col)
@@ -452,9 +455,14 @@ fn message_row<'a>(
         .padding(pad)
         .max_width(m.bubble_max_width)
         .style(theme::bubble(p, m, out, tail));
-    let bubble = mouse_area(bubble)
-        .on_right_press(Message::Ui(Ui::MessageMenu(Some(msg.id))))
-        .on_double_click(Message::Ui(Ui::Reply(msg.id)));
+    // Messages still being sent (temporary negative ids) get no actions.
+    let bubble = if msg.id > 0 {
+        mouse_area(bubble)
+            .on_right_press(Message::Ui(Ui::MessageMenu(Some(msg.id))))
+            .on_double_click(Message::Ui(Ui::Reply(msg.id)))
+    } else {
+        mouse_area(bubble)
+    };
 
     let tail_el: Element<'a, Message> = if tail {
         svg(svg::Handle::from_memory(if out {
@@ -596,6 +604,12 @@ fn media_view<'a>(app: &'a App, msg: &'a ChatMessage, media: &'a Media) -> Eleme
                 .height(46)
                 .center(46)
                 .style(theme::pill(if out { p.time_out } else { p.accent }, 23.0));
+            let circle = button(circle)
+                .padding(0)
+                .on_press_maybe(
+                    (msg.id > 0).then_some(Message::Ui(Ui::SaveMedia(msg.chat_id, msg.id))),
+                )
+                .style(theme::link_button(p));
             row![
                 circle,
                 column![
@@ -767,6 +781,53 @@ fn compose_bar(app: &App) -> Element<'_, Message> {
             button(icon(Icon::X, 20.0, p.text_secondary))
                 .padding(6)
                 .on_press(Message::Ui(Ui::CancelCompose))
+                .style(theme::icon_button(p, true)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .padding([6, 16])
+    .width(Length::Fill)
+    .style(theme::fill(p.bg_sidebar))
+    .into()
+}
+
+fn pending_file_bar<'a>(app: &'a App, f: &'a crate::app::PendingFile) -> Element<'a, Message> {
+    let t = &app.theme;
+    let (p, m) = (t.palette, t.metrics);
+    let kind = match f.kind {
+        crate::net::UploadKind::Photo => "Send as photo",
+        crate::net::UploadKind::Document => "Send as file",
+    };
+    container(
+        row![
+            icon(
+                if f.kind == crate::net::UploadKind::Photo {
+                    Icon::Image
+                } else {
+                    Icon::File
+                },
+                22.0,
+                p.link
+            ),
+            column![
+                text(format!("{kind} · {}", format::file_size(f.size)))
+                    .size(m.font_s)
+                    .font(FONT_SEMIBOLD)
+                    .color(p.link),
+                text(format::ellipsize(&f.name, 70))
+                    .size(m.font_s)
+                    .color(p.text_primary),
+            ]
+            .spacing(1)
+            .width(Length::Fill),
+            button(text("Send").size(m.font_s).font(FONT_SEMIBOLD))
+                .padding([6, 14])
+                .on_press(Message::Ui(Ui::SendPendingFile))
+                .style(theme::primary_button(p)),
+            button(icon(Icon::X, 20.0, p.text_secondary))
+                .padding(6)
+                .on_press(Message::Ui(Ui::CancelPendingFile))
                 .style(theme::icon_button(p, true)),
         ]
         .spacing(12)

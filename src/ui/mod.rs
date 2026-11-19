@@ -14,7 +14,7 @@ use iced::{Element, Length};
 use crate::app::{App, Message};
 
 pub fn view(app: &App) -> Element<'_, Message> {
-    if !app.auth.is_signed_in() {
+    if !app.shows_main() {
         return login::view(app);
     }
     let p = app.theme.palette;

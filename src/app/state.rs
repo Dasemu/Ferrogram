@@ -358,13 +358,19 @@ pub enum ComposeMode {
 // ----------------------------------------------------------- notifications
 
 /// Whether a new message should raise a desktop notification.
+/// Messages older than this when they arrive are catch-up, not "new".
+pub const NOTIFY_MAX_AGE_SECS: i64 = 120;
+
+/// Whether a new message should raise a desktop notification. `now` is the
+/// wall clock (unix seconds): catch-up messages after a reconnect are skipped.
 pub fn should_notify(
     chat: Option<&Chat>,
     m: &Message,
     open: Option<ChatId>,
     focused: bool,
+    now: i64,
 ) -> bool {
-    if m.outgoing || m.service {
+    if m.outgoing || m.service || now - m.date > NOTIFY_MAX_AGE_SECS {
         return false;
     }
     if focused && open == Some(m.chat_id) {
@@ -450,6 +456,57 @@ impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+}
+
+// ----------------------------------------------------------- image limits
+
+/// Hard cap on downloaded photo bytes before we even try to decode.
+pub use crate::net::MAX_PHOTO_BYTES;
+/// Hard cap on decoded pixels (≈ 160 MB of RGBA at 40 MP).
+pub const MAX_PHOTO_PIXELS: u64 = 40_000_000;
+
+/// Width/height from a PNG or JPEG header without decoding the image.
+pub fn image_dimensions(b: &[u8]) -> Option<(u32, u32)> {
+    if b.len() >= 24 && b.starts_with(b"\x89PNG\r\n\x1a\n") && &b[12..16] == b"IHDR" {
+        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
+        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
+        return Some((w, h));
+    }
+    if b.len() >= 4 && b[0] == 0xFF && b[1] == 0xD8 {
+        let mut i = 2;
+        while i + 9 < b.len() {
+            if b[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = b[i + 1];
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let len = usize::from(u16::from_be_bytes([b[i + 2], b[i + 3]]));
+            // SOF0..SOF15 except DHT (C4), JPG (C8), DAC (CC).
+            if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
+                let h = u32::from(u16::from_be_bytes([b[i + 5], b[i + 6]]));
+                let w = u32::from(u16::from_be_bytes([b[i + 7], b[i + 8]]));
+                return Some((w, h));
+            }
+            i += 2 + len;
+        }
+    }
+    None
+}
+
+/// Whether downloaded photo bytes are safe to hand to the image decoder.
+pub fn photo_is_acceptable(b: &[u8]) -> bool {
+    if b.len() > MAX_PHOTO_BYTES {
+        return false;
+    }
+    match image_dimensions(b) {
+        Some((w, h)) => w > 0 && h > 0 && u64::from(w) * u64::from(h) <= MAX_PHOTO_PIXELS,
+        // Unknown format (e.g. WebP): only small blobs are allowed.
+        None => b.len() <= 2 * 1024 * 1024,
     }
 }
 
@@ -642,17 +699,20 @@ mod tests {
     fn notification_rules() {
         let mut ch = chat(1, 0);
         let m = M::text(1, 1, false, 0, "hello");
-        assert!(should_notify(Some(&ch), &m, None, true));
-        assert!(should_notify(Some(&ch), &m, Some(1), false));
-        assert!(!should_notify(Some(&ch), &m, Some(1), true));
+        assert!(should_notify(Some(&ch), &m, None, true, 5));
+        assert!(should_notify(Some(&ch), &m, Some(1), false, 5));
+        assert!(!should_notify(Some(&ch), &m, Some(1), true, 5));
         assert!(!should_notify(
             Some(&ch),
             &M::text(1, 1, true, 0, "x"),
             None,
-            false
+            false,
+            5
         ));
+        // Catch-up after a reconnect: old messages do not notify.
+        assert!(!should_notify(Some(&ch), &m, None, false, 10_000));
         ch.muted = true;
-        assert!(!should_notify(Some(&ch), &m, None, false));
+        assert!(!should_notify(Some(&ch), &m, None, false, 5));
         let (_, body) = notification_text(None, &m, false);
         assert_eq!(body, "New message");
         let (t, body) = notification_text(Some(&chat(1, 0)), &m, true);
@@ -671,6 +731,25 @@ mod tests {
         assert_eq!(l.bytes(), 80);
         l.insert(4, "huge", 500); // over budget alone: kept, others evicted
         assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn photo_limits() {
+        let png = crate::mock::mock_photo_png(1, 64, 32);
+        assert_eq!(image_dimensions(&png), Some((64, 32)));
+        assert!(photo_is_acceptable(&png));
+        // A forged PNG header claiming 100k x 100k pixels is rejected.
+        let mut bomb = png.clone();
+        bomb[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+        bomb[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+        assert!(!photo_is_acceptable(&bomb));
+        // Minimal JPEG: SOI, APP0 (len 16), SOF0 with 480x640.
+        let mut jpg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        jpg.extend_from_slice(&[0; 14]);
+        jpg.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x02, 0x80, 0x03]);
+        jpg.extend_from_slice(&[0; 12]);
+        assert_eq!(image_dimensions(&jpg), Some((640, 480)));
+        assert!(!photo_is_acceptable(&vec![0u8; MAX_PHOTO_BYTES + 1]));
     }
 
     #[test]
