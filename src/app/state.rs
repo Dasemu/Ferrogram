@@ -374,6 +374,12 @@ pub struct Conversation {
     pub loading_older: bool,
     /// The network said there is nothing older.
     pub reached_start: bool,
+    /// Opened at an older message (a search hit): the window is not the
+    /// newest history, so live messages are not appended to it and the
+    /// "jump to latest" button reloads the newest page.
+    pub detached: bool,
+    /// Message to scroll to once its page has arrived.
+    pub jump_to: Option<MessageId>,
     next_temp_id: MessageId,
 }
 
@@ -384,8 +390,23 @@ impl Conversation {
             messages: Vec::new(),
             loading_older: false,
             reached_start: false,
+            detached: false,
+            jump_to: None,
             next_temp_id: -1,
         }
+    }
+
+    /// A window opened around `target` instead of the newest messages.
+    pub fn new_at(chat_id: ChatId, target: MessageId) -> Self {
+        Self {
+            detached: true,
+            jump_to: Some(target),
+            ..Self::new(chat_id)
+        }
+    }
+
+    pub fn index_of(&self, id: MessageId) -> Option<usize> {
+        self.messages.iter().position(|m| m.id == id)
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -471,7 +492,11 @@ impl Conversation {
     pub fn apply_event(&mut self, ev: &Event) {
         match ev {
             Event::NewMessage(m) if m.chat_id == self.chat_id => {
-                self.merge(vec![m.clone()]);
+                // A detached window would get a gap; the chat list still
+                // shows the message and "jump to latest" reloads.
+                if !self.detached {
+                    self.merge(vec![m.clone()]);
+                }
             }
             Event::MessageEdited(m) if m.chat_id == self.chat_id => {
                 if let Some(x) = self.messages.iter_mut().find(|x| x.id == m.id) {
@@ -725,6 +750,19 @@ pub fn avatar_is_acceptable(b: &[u8]) -> bool {
 }
 
 // --------------------------------------------------------------- scrolling
+
+/// How many messages newer than the target a jump window includes.
+pub const JUMP_NEWER: i32 = (PAGE / 2) as i32;
+
+/// Scroll position (0 = newest/bottom, 1 = oldest/top, matching the
+/// bottom-anchored history) that brings message `index` of `len` into view.
+/// Bubble heights vary, so this is an estimate: the highlight marks the hit.
+pub fn jump_offset(index: usize, len: usize) -> f32 {
+    if len <= 1 {
+        return 0.0;
+    }
+    ((len - 1 - index.min(len - 1)) as f32 / (len - 1) as f32).clamp(0.0, 1.0)
+}
 
 /// With a bottom-anchored scrollable, how far (px) the viewport is from the
 /// oldest (top) content.
@@ -1127,6 +1165,39 @@ mod tests {
         assert!(!avatar_is_acceptable(&vec![0u8; 600 * 1024]));
         let big = crate::mock::mock_avatar_png(1, 2100).unwrap();
         assert!(!avatar_is_acceptable(&big));
+    }
+
+    #[test]
+    fn jump_offset_places_targets_between_bottom_and_top() {
+        assert_eq!(jump_offset(0, 1), 0.0);
+        assert_eq!(jump_offset(0, 0), 0.0);
+        assert_eq!(jump_offset(49, 50), 0.0, "newest message = bottom");
+        assert_eq!(jump_offset(0, 50), 1.0, "oldest message = top");
+        let mid = jump_offset(25, 50);
+        assert!(mid > 0.4 && mid < 0.6);
+        assert!(jump_offset(10_000, 5) >= 0.0, "out of range never panics");
+    }
+
+    #[test]
+    fn detached_window_does_not_take_live_messages() {
+        let mut c = Conversation::new_at(1, 20);
+        assert!(c.detached && c.jump_to == Some(20));
+        c.merge(vec![M::text(1, 20, false, 1, "hit")]);
+        c.apply_event(&Event::NewMessage(M::text(1, 99, false, 2, "live")));
+        assert!(c.get(99).is_none(), "no gap-forming appends");
+        // Edits and deletes still apply.
+        let mut e = M::text(1, 20, false, 1, "hit!");
+        e.edited = true;
+        c.apply_event(&Event::MessageEdited(e));
+        assert_eq!(c.get(20).unwrap().text, "hit!");
+        c.apply_event(&Event::MessagesDeleted {
+            chat: Some(1),
+            ids: vec![20],
+        });
+        assert!(c.index_of(20).is_none());
+        let mut live = Conversation::new(1);
+        live.apply_event(&Event::NewMessage(M::text(1, 5, false, 1, "x")));
+        assert!(live.get(5).is_some());
     }
 
     #[test]

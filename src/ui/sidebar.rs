@@ -8,7 +8,7 @@ use super::icons::Icon;
 use super::theme::{self, FONT_SEMIBOLD};
 use super::widgets::{avatar, avatar_photo, badge, emoji_line, icon};
 use crate::app::{App, Message, Ui};
-use crate::model::{Chat, ChatKind, ConnState, Message as ChatMessage, SendState};
+use crate::model::{Chat, ChatKind, ConnState, GlobalHit, Message as ChatMessage, SendState};
 use iced::widget::text::Wrapping;
 
 pub fn view(app: &App) -> Element<'_, Message> {
@@ -79,6 +79,16 @@ pub fn view(app: &App) -> Element<'_, Message> {
                     list = list.push(message_result_row(app, c, msg));
                 }
             }
+        }
+        if !app.sidebar_global.is_empty() {
+            list = list.push(section(app, "Global search results"));
+            for hit in &app.sidebar_global {
+                list = list.push(global_result_row(app, hit));
+            }
+        } else if app.global_searching {
+            list = list.push(
+                container(text("Searching…").size(m.font_s).color(p.text_muted)).padding([10, 16]),
+            );
         }
     }
 
@@ -301,6 +311,51 @@ fn chat_row<'a>(app: &'a App, c: &'a Chat) -> Element<'a, Message> {
         .width(Length::Fill)
         .on_press(Message::Ui(Ui::SelectChat(c.id)))
         .style(theme::chat_row(p, selected))
+        .into()
+}
+
+fn global_result_row<'a>(app: &'a App, hit: &'a GlobalHit) -> Element<'a, Message> {
+    let t = &app.theme;
+    let p = t.palette;
+    let m = t.metrics;
+    let msg = &hit.message;
+    let content = row![
+        avatar_photo(
+            app.avatar(msg.chat_id),
+            msg.chat_id,
+            &hit.chat_title,
+            Some(hit.chat_kind),
+            m.avatar_list
+        ),
+        column![
+            row![
+                text(format::ellipsize(&hit.chat_title, 24))
+                    .size(m.font_m)
+                    .font(FONT_SEMIBOLD)
+                    .color(p.text_primary),
+                Space::new().width(Length::Fill),
+                text(format::list_time(msg.date, app.now, app.tz_offset))
+                    .size(m.font_xs)
+                    .color(p.text_secondary),
+            ],
+            container(emoji_line(
+                format::ellipsize(&msg.preview(), 36),
+                m.font_m,
+                p.text_secondary
+            ))
+            .width(Length::Fill)
+            .clip(true),
+        ]
+        .spacing(4),
+    ]
+    .spacing(11)
+    .align_y(Alignment::Center);
+    button(content)
+        .padding([6, 10])
+        .height(m.chat_row_height)
+        .width(Length::Fill)
+        .on_press(Message::Ui(Ui::OpenResult(msg.chat_id, msg.id)))
+        .style(theme::chat_row(p, false))
         .into()
 }
 

@@ -17,8 +17,8 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::auth::SignInOutcome;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
-    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Media, Message, MessageId, Presence, Reaction,
-    TypingAction, User,
+    CHANNEL_OFFSET, Chat, ChatId, ChatKind, GlobalHit, Media, Message, MessageId, Presence,
+    Reaction, TypingAction, User,
 };
 use crate::net::{Event, EventHub, TelegramApi, UploadKind};
 
@@ -846,6 +846,29 @@ impl TelegramApi for FakeTelegram {
     async fn download_photo(&self, _chat: ChatId, id: MessageId) -> Result<Vec<u8>> {
         self.call("download_photo").await?;
         Ok(mock_photo_png(i64::from(id), 640, 427))
+    }
+
+    async fn search_global(&self, query: String, limit: usize) -> Result<Vec<GlobalHit>> {
+        self.call("search_global").await?;
+        self.require_auth()?;
+        let q = query.to_lowercase();
+        let s = self.st()?;
+        let mut hits: Vec<GlobalHit> = Vec::new();
+        for c in &s.chats {
+            for m in s.history.get(&c.id).into_iter().flatten() {
+                if !m.service && m.text.to_lowercase().contains(&q) {
+                    hits.push(GlobalHit {
+                        message: m.clone(),
+                        chat_title: c.title.clone(),
+                        chat_kind: c.kind,
+                        photo_id: c.photo_id,
+                    });
+                }
+            }
+        }
+        hits.sort_by_key(|h| std::cmp::Reverse(h.message.date));
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     async fn download_avatar(&self, _chat: ChatId, photo_id: i64) -> Result<Vec<u8>> {

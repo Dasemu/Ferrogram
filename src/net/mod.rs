@@ -19,7 +19,9 @@ use secrecy::SecretString;
 
 use crate::auth::SignInOutcome;
 use crate::error::{Phone, Result};
-use crate::model::{Chat, ChatId, ConnState, Message, MessageId, Presence, Reaction, TypingAction};
+use crate::model::{
+    Chat, ChatId, ConnState, GlobalHit, Message, MessageId, Presence, Reaction, TypingAction,
+};
 
 /// Hard cap on photo bytes downloaded for display.
 pub const MAX_PHOTO_BYTES: usize = 20 * 1024 * 1024;
@@ -134,6 +136,9 @@ pub trait TelegramApi: Send + Sync {
     async fn search(&self, chat: ChatId, query: String) -> Result<Vec<Message>>;
     /// Bytes of a photo (JPEG/PNG) for display (a thumbnail when available).
     async fn download_photo(&self, chat: ChatId, id: MessageId) -> Result<Vec<u8>>;
+    /// Server-side search over every chat (`messages.searchGlobal`), newest
+    /// first.
+    async fn search_global(&self, query: String, limit: usize) -> Result<Vec<GlobalHit>>;
     /// The small (160 px) profile photo `photo_id` of `chat` (JPEG).
     /// Capped at [`crate::store::avatars::MAX_AVATAR_BYTES`].
     async fn download_avatar(&self, chat: ChatId, photo_id: i64) -> Result<Vec<u8>>;

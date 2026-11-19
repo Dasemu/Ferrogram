@@ -25,7 +25,9 @@ use crate::auth::SignInOutcome;
 use crate::auth::vault::Vault;
 use crate::config::ApiCredentials;
 use crate::error::{AuthError, Error, Phone, Result};
-use crate::model::{Chat, ChatId, ChatKind, ConnState, Message, MessageId, Presence, User};
+use crate::model::{
+    Chat, ChatId, ChatKind, ConnState, GlobalHit, Message, MessageId, Presence, User,
+};
 
 type UpdatesRx = mpsc::Receiver<grammers_session::updates::UpdatesLike>;
 
@@ -562,6 +564,38 @@ impl TelegramApi for Grammers {
             }
         }
         Ok(bytes)
+    }
+
+    async fn search_global(&self, query: String, limit: usize) -> Result<Vec<GlobalHit>> {
+        let api = &self.0;
+        let self_id = api.self_id.load(Ordering::Acquire);
+        let mut iter = api.client.search_all_messages().query(&query).limit(limit);
+        let mut out = Vec::new();
+        while let Some(m) = iter.next().await.map_err(map_err)? {
+            let Some(message) = api.convert(&m) else {
+                continue;
+            };
+            let Some(peer) = m.peer() else {
+                continue;
+            };
+            // Remember the peer so the chat can be opened from the hit.
+            if let Ok(Some(r)) = m.peer_ref().await {
+                lock(&api.peers)?.insert(message.chat_id, r);
+            }
+            let kind = chat_kind(peer, self_id);
+            let chat_title = if kind == ChatKind::SavedMessages {
+                "Saved Messages".to_owned()
+            } else {
+                peer.name().unwrap_or("Deleted Account").to_owned()
+            };
+            out.push(GlobalHit {
+                message,
+                chat_title,
+                chat_kind: kind,
+                photo_id: peer_photo_id(peer),
+            });
+        }
+        Ok(out)
     }
 
     async fn download_avatar(&self, chat: ChatId, photo_id: i64) -> Result<Vec<u8>> {

@@ -26,7 +26,9 @@ use crate::auth::{AuthCommand, AuthEvent, AuthState, SignInOutcome};
 use crate::config::{Config, ScreenshotTarget};
 use crate::error::{AuthError, Error, Redacted};
 use crate::mock::{FakeOptions, FakeTelegram, MOCK_NOW};
-use crate::model::{ChatId, ConnState, Media, Message as ChatMessage, MessageId, SendState, User};
+use crate::model::{
+    ChatId, ConnState, GlobalHit, Media, Message as ChatMessage, MessageId, SendState, User,
+};
 use crate::net::{ApiHandle, Event, UploadKind, backoff};
 use crate::store::Store;
 use crate::store::avatars::AvatarDisk;
@@ -113,6 +115,9 @@ pub struct App {
     pub sidebar_query: String,
     /// Cached messages matching the sidebar query (all chats).
     pub sidebar_messages: Vec<ChatMessage>,
+    /// Server-side (global) search hits for the sidebar query.
+    pub sidebar_global: Vec<GlobalHit>,
+    pub global_searching: bool,
     pub composer: String,
     pub compose_mode: ComposeMode,
     pub pending_file: Option<PendingFile>,
@@ -207,6 +212,8 @@ impl App {
             conversation: None,
             sidebar_query: String::new(),
             sidebar_messages: Vec::new(),
+            sidebar_global: Vec::new(),
+            global_searching: false,
             composer: String::new(),
             compose_mode: ComposeMode::Normal,
             pending_file: None,
@@ -489,25 +496,52 @@ impl App {
     }
 
     fn open_chat(&mut self, chat: ChatId) -> Task<Message> {
-        if self.selected == Some(chat) && self.conversation.is_some() {
+        if self.selected == Some(chat) && self.conversation.as_ref().is_some_and(|c| !c.detached) {
             return Task::none();
         }
-        let stop_typing = match self.typing_throttle.reset() {
-            Some(old) => {
-                self.api_call(move |api| Box::pin(async move { api.set_typing(old, false).await }))
-            }
-            None => Task::none(),
+        let switch = self.switch_to(chat, Conversation::new(chat));
+        Task::batch([switch, self.load_newest(chat)])
+    }
+
+    /// Open `chat` on a window around message `id` (search hit, link). The
+    /// target's page is fetched from the network; the newest page is not
+    /// loaded until the user jumps back to the latest messages.
+    fn open_chat_at(&mut self, chat: ChatId, id: MessageId) -> Task<Message> {
+        self.highlight = Some(id);
+        if self.selected == Some(chat)
+            && let Some(conv) = &self.conversation
+            && let Some(i) = conv.index_of(id)
+        {
+            let y = state::jump_offset(i, conv.messages().len());
+            return operation::snap_to(
+                Id::new(HISTORY_ID),
+                operation::RelativeOffset { x: 0.0, y },
+            );
+        }
+        if id <= 0 {
+            return self.open_chat(chat);
+        }
+        let switch = self.switch_to(chat, Conversation::new_at(chat, id));
+        self.highlight = Some(id);
+        let before = id.saturating_add(state::JUMP_NEWER);
+        Task::batch([switch, self.net_history(chat, Some(before))])
+    }
+
+    /// Reload the newest messages after browsing an older window.
+    fn reattach(&mut self) -> Task<Message> {
+        let Some(chat) = self.selected else {
+            return Task::none();
         };
-        self.selected = Some(chat);
         self.conversation = Some(Conversation::new(chat));
-        self.compose_mode = ComposeMode::Normal;
-        self.pending_file = None;
-        self.menu_for = None;
-        self.chat_search = None;
         self.highlight = None;
-        self.emoji_open = false;
         self.at_bottom = true;
         self.chats.mark_read(chat);
+        self.load_newest(chat)
+    }
+
+    /// Load the newest page of `chat` (cache first, then network) and mark
+    /// it read.
+    fn load_newest(&self, chat: ChatId) -> Task<Message> {
         let store = self.store.clone();
         // The newest cached page is shown immediately; the network page that
         // is always requested alongside replaces/extends it.
@@ -525,11 +559,30 @@ impl App {
         let net = self.net_history(chat, None);
         let read = self.api_call(move |api| Box::pin(async move { api.mark_read(chat).await }));
         let unread = self.store_bg(move |s| s.set_unread(chat, 0, 0));
+        Task::batch([cache, net, read, unread])
+    }
+
+    /// Make `conversation` the open one and reset per-chat UI state.
+    fn switch_to(&mut self, chat: ChatId, conversation: Conversation) -> Task<Message> {
+        let stop_typing = match self.typing_throttle.reset() {
+            Some(old) => {
+                self.api_call(move |api| Box::pin(async move { api.set_typing(old, false).await }))
+            }
+            None => Task::none(),
+        };
+        self.selected = Some(chat);
+        self.conversation = Some(conversation);
+        self.compose_mode = ComposeMode::Normal;
+        self.pending_file = None;
+        self.menu_for = None;
+        self.chat_search = None;
+        self.highlight = None;
+        self.emoji_open = false;
+        self.at_bottom = true;
+        if !self.conversation.as_ref().is_some_and(|c| c.detached) {
+            self.chats.mark_read(chat);
+        }
         Task::batch([
-            cache,
-            net,
-            read,
-            unread,
             stop_typing,
             self.fetch_avatars(),
             operation::focus(Id::new(COMPOSER_ID)),
@@ -828,14 +881,25 @@ impl App {
             Ui::SelectChat(id) => self.open_chat(id),
             Ui::SidebarSearch(q) => {
                 self.sidebar_query = q.clone();
+                self.sidebar_global.clear();
+                self.global_searching = false;
                 if q.trim().chars().count() < 2 {
                     self.sidebar_messages.clear();
                     return Task::none();
                 }
+                // The server-side search waits until typing pauses.
+                let settled = q.trim().to_owned();
+                let debounce = Task::perform(
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(450)).await;
+                        settled
+                    },
+                    |q| Message::Ui(Ui::GlobalSearchDue(q)),
+                );
                 let ids: Vec<ChatId> = self.chats.all().iter().map(|c| c.id).collect();
                 let store = self.store.clone();
                 let tag = q.clone();
-                Task::perform(
+                let local = Task::perform(
                     async move {
                         store
                             .call(move |s| {
@@ -855,6 +919,27 @@ impl App {
                             result,
                         })
                     },
+                );
+                Task::batch([local, debounce])
+            }
+            Ui::GlobalSearchDue(q) => {
+                if q != self.sidebar_query.trim() || !self.auth.is_signed_in() {
+                    return Task::none();
+                }
+                let Some(api) = self.api.clone() else {
+                    return Task::none();
+                };
+                self.global_searching = true;
+                info!(query = %Redacted(&q), "global search");
+                let tag = q.clone();
+                Task::perform(
+                    async move { api.search_global(q, 30).await },
+                    move |result| {
+                        Message::Done(Done::GlobalResults {
+                            query: tag.clone(),
+                            result,
+                        })
+                    },
                 )
             }
             Ui::SidebarScrolled(vp) => {
@@ -870,12 +955,22 @@ impl App {
             Ui::ClearSidebarSearch => {
                 self.sidebar_query.clear();
                 self.sidebar_messages.clear();
+                self.sidebar_global.clear();
+                self.global_searching = false;
                 Task::none()
             }
             Ui::OpenResult(chat, id) => {
-                let open = self.open_chat(chat);
-                self.highlight = Some(id);
-                open
+                // A hit from a chat outside the loaded list: add it so the
+                // header, avatar and replies have something to show.
+                if self.chats.get(chat).is_none()
+                    && let Some(h) = self
+                        .sidebar_global
+                        .iter()
+                        .find(|h| h.message.chat_id == chat)
+                {
+                    self.chats.merge(vec![h.to_chat()]);
+                }
+                self.open_chat_at(chat, id)
             }
 
             Ui::HistoryScrolled(vp) => {
@@ -1089,6 +1184,9 @@ impl App {
                 Task::batch([local, remote])
             }
             Ui::ScrollToBottom => {
+                if self.conversation.as_ref().is_some_and(|c| c.detached) {
+                    return self.reattach();
+                }
                 self.at_bottom = true;
                 operation::snap_to(Id::new(HISTORY_ID), operation::RelativeOffset::START)
             }
@@ -1192,6 +1290,12 @@ impl App {
         self.composer.clear();
         self.typing_throttle.reset();
         self.emoji_open = false;
+        // Sending from an older window returns to the newest messages first.
+        let reattach = if self.conversation.as_ref().is_some_and(|c| c.detached) {
+            self.reattach()
+        } else {
+            Task::none()
+        };
         let mode = std::mem::replace(&mut self.compose_mode, ComposeMode::Normal);
         if let ComposeMode::Edit(id) = mode {
             let Some(conv) = &mut self.conversation else {
@@ -1228,6 +1332,7 @@ impl App {
             }));
         };
         Task::batch([
+            reattach,
             Task::perform(
                 async move { api.send_text(chat, text, reply_to).await },
                 move |result| Message::Done(Done::Sent { chat, temp, result }),
@@ -1450,6 +1555,8 @@ impl App {
         self.pending_file = None;
         self.chat_search = None;
         self.sidebar_messages.clear();
+        self.sidebar_global.clear();
+        self.global_searching = false;
         self.photos = Lru::new(IMAGE_BUDGET);
         self.photo_loading.clear();
         self.avatars = Lru::new(AVATAR_BUDGET);
@@ -1595,7 +1702,14 @@ impl App {
                 self.dialogs_exhausted = chats.len() < DIALOGS_PAGE;
                 self.dialogs_loading = false;
                 let exhausted = self.dialogs_exhausted;
+                // The open chat may come from a search hit outside the list.
+                let keep = self.selected.and_then(|id| self.chats.get(id).cloned());
                 self.chats.replace(chats);
+                if let Some(c) = keep
+                    && self.chats.get(c.id).is_none()
+                {
+                    self.chats.merge(vec![c]);
+                }
                 // Pruning is only safe when the first page was the whole list.
                 let persist = self.store_bg(move |s| {
                     if exhausted {
@@ -1634,6 +1748,11 @@ impl App {
                 let Some(conv) = self.conversation.as_mut().filter(|c| c.chat_id == chat) else {
                     return Task::none();
                 };
+                // The newest page must not land in a window opened at an older
+                // message (a late response from before the jump).
+                if conv.detached && before.is_none() {
+                    return Task::none();
+                }
                 let page = result.unwrap_or_default();
                 let short = page.len() < PAGE;
                 conv.merge(page);
@@ -1660,6 +1779,9 @@ impl App {
                 let Some(conv) = self.conversation.as_mut().filter(|c| c.chat_id == chat) else {
                     return Task::none();
                 };
+                if conv.detached && before.is_none() {
+                    return Task::none();
+                }
                 conv.loading_older = false;
                 match result {
                     Ok(page) => {
@@ -1668,12 +1790,34 @@ impl App {
                         }
                         let to_store = page.clone();
                         conv.merge(page);
-                        Task::batch([
+                        // Scroll to the search hit once its page is in.
+                        let mut scroll = Task::none();
+                        let mut missing = false;
+                        if let Some(target) = conv.jump_to.take() {
+                            match conv.index_of(target) {
+                                Some(i) => {
+                                    let y = state::jump_offset(i, conv.messages().len());
+                                    self.at_bottom = false;
+                                    scroll = operation::snap_to(
+                                        Id::new(HISTORY_ID),
+                                        operation::RelativeOffset { x: 0.0, y },
+                                    );
+                                }
+                                None => missing = true,
+                            }
+                        }
+                        let mut tasks = vec![
                             self.store_bg(move |s| {
                                 s.record_network_page(chat, before, &to_store, PAGE)
                             }),
                             self.fetch_photos(),
-                        ])
+                            scroll,
+                        ];
+                        if missing {
+                            tasks.push(self.toast("That message is no longer available.".into()));
+                            tasks.push(self.reattach());
+                        }
+                        Task::batch(tasks)
                     }
                     Err(e) => self.on_error(e),
                 }
@@ -1708,6 +1852,30 @@ impl App {
                 // Drop results for a query the user has already changed.
                 if query == self.sidebar_query {
                     self.sidebar_messages = result.unwrap_or_default();
+                }
+                Task::none()
+            }
+            Done::GlobalResults { query, result } => {
+                if query != self.sidebar_query.trim() {
+                    return Task::none();
+                }
+                self.global_searching = false;
+                match result {
+                    Ok(hits) => {
+                        self.remember_names(hits.iter().map(|h| &h.message));
+                        // The cache search already shows its own matches.
+                        let known: HashSet<(ChatId, MessageId)> = self
+                            .sidebar_messages
+                            .iter()
+                            .map(|m| (m.chat_id, m.id))
+                            .collect();
+                        self.sidebar_global = hits
+                            .into_iter()
+                            .filter(|h| !known.contains(&(h.message.chat_id, h.message.id)))
+                            .collect();
+                    }
+                    // Offline or flood-limited: the local results stay.
+                    Err(e) => warn!(error = %e, "global search failed"),
                 }
                 Task::none()
             }

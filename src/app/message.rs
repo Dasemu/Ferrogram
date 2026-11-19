@@ -6,7 +6,7 @@ use iced::widget::scrollable::Viewport;
 
 use crate::auth::{SecretInput, SignInOutcome};
 use crate::error::Error;
-use crate::model::{Chat, ChatId, Message as ChatMessage, MessageId, User};
+use crate::model::{Chat, ChatId, GlobalHit, Message as ChatMessage, MessageId, User};
 use crate::net::{ApiHandle, Event};
 
 #[derive(Debug, Clone)]
@@ -39,6 +39,8 @@ pub enum Ui {
     ClearSidebarSearch,
     /// Open a chat at a specific message from global/in-chat search.
     OpenResult(ChatId, MessageId),
+    /// The sidebar query settled (debounce): run the server-side search.
+    GlobalSearchDue(String),
     // chat pane
     HistoryScrolled(Viewport),
     ComposerChanged(String),
@@ -121,6 +123,10 @@ pub enum Done {
         chat: ChatId,
         query: String,
         result: Result<Vec<ChatMessage>, Error>,
+    },
+    GlobalResults {
+        query: String,
+        result: Result<Vec<GlobalHit>, Error>,
     },
     SidebarResults {
         query: String,

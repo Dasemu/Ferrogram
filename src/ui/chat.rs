@@ -45,7 +45,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let history = history(app, chat, conv.messages(), conv.loading_older);
     let mut layers = stack![history].width(Length::Fill).height(Length::Fill);
-    if !app.at_bottom {
+    if !app.at_bottom || conv.detached {
         layers = layers.push(
             container(
                 button(icon(Icon::ArrowDown, 22.0, p.text_secondary))

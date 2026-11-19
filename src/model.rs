@@ -146,6 +146,39 @@ pub fn avatar_color_index(id: i64) -> usize {
     (bare % 7) as usize
 }
 
+/// A message found by the server-side (global) search, with enough chat
+/// information to show and open a chat that is not in the loaded list.
+#[derive(Clone, PartialEq)]
+pub struct GlobalHit {
+    pub message: Message,
+    pub chat_title: String,
+    pub chat_kind: ChatKind,
+    pub photo_id: Option<i64>,
+}
+
+impl fmt::Debug for GlobalHit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GlobalHit")
+            .field("chat", &self.message.chat_id)
+            .field("id", &self.message.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GlobalHit {
+    /// A list entry for the hit's chat (used when opening it).
+    pub fn to_chat(&self) -> Chat {
+        let mut c = Chat::new(
+            self.message.chat_id,
+            self.chat_kind,
+            self.chat_title.clone(),
+        );
+        c.photo_id = self.photo_id;
+        c.last_date = self.message.date;
+        c
+    }
+}
+
 /// What someone is doing in a chat (the "typing…" family of statuses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypingAction {

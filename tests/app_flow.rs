@@ -1052,3 +1052,168 @@ fn chat_list_pages_in_on_demand_and_prunes_only_when_complete() {
     assert!(!app.dialogs_loading);
     assert_eq!(app.chats.all().len(), DIALOGS_PAGE + 7);
 }
+
+// ------------------------------------------------- global search + jump
+
+#[tokio::test]
+async fn fake_global_search_spans_chats_newest_first() {
+    let api = FakeTelegram::new(FakeOptions {
+        logged_in: true,
+        ..Default::default()
+    });
+    let hits = api.search_global("hike".into(), 30).await.unwrap();
+    assert!(!hits.is_empty());
+    assert!(
+        hits.iter()
+            .all(|h| h.message.text.to_lowercase().contains("hike"))
+    );
+    assert!(
+        hits.windows(2)
+            .all(|w| w[0].message.date >= w[1].message.date)
+    );
+    assert!(hits.iter().any(|h| h.chat_title == "Alice Johnson"));
+    assert!(
+        api.search_global("zzzz-no-match".into(), 30)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(api.search_global("hike".into(), 1).await.unwrap().len() <= 1);
+}
+
+#[tokio::test]
+async fn sidebar_global_search_debounces_dedupes_and_ignores_stale_answers() {
+    use ferrogram::model::GlobalHit;
+    let mut app = signed_in_app();
+    let hit = |chat, id, text: &str| GlobalHit {
+        message: ChatMessage::text(chat, id, false, 50, text),
+        chat_title: "Far Away".into(),
+        chat_kind: ferrogram::model::ChatKind::Group,
+        photo_id: None,
+    };
+    let _ = app.update(Message::Ui(Ui::SidebarSearch("hik".into())));
+    // The debounce fires for the settled query only.
+    let _ = app.update(Message::Ui(Ui::GlobalSearchDue("hi".into())));
+    assert!(!app.global_searching, "stale debounce ignored");
+    let _ = app.update(Message::Ui(Ui::GlobalSearchDue("hik".into())));
+    assert!(app.global_searching);
+
+    // An answer for an older query is dropped.
+    let _ = app.update(Message::Done(Done::GlobalResults {
+        query: "hi".into(),
+        result: Ok(vec![hit(-777, 5, "old")]),
+    }));
+    assert!(app.sidebar_global.is_empty());
+
+    // A local (cache) match is not repeated in the global section.
+    app.sidebar_messages = vec![ChatMessage::text(ALICE, 144, false, 1, "hike")];
+    let _ = app.update(Message::Done(Done::GlobalResults {
+        query: "hik".into(),
+        result: Ok(vec![hit(ALICE, 144, "hike"), hit(-777, 5, "hike far away")]),
+    }));
+    assert!(!app.global_searching);
+    assert_eq!(app.sidebar_global.len(), 1);
+    assert_eq!(app.sidebar_global[0].message.chat_id, -777);
+
+    // Failures keep the local results and show no toast.
+    let _ = app.update(Message::Ui(Ui::SidebarSearch("hike".into())));
+    let _ = app.update(Message::Done(Done::GlobalResults {
+        query: "hike".into(),
+        result: Err(ferrogram::error::Error::Net("x".into())),
+    }));
+    assert!(app.toast.is_none());
+
+    // Clearing the field clears everything.
+    let _ = app.update(Message::Ui(Ui::ClearSidebarSearch));
+    assert!(app.sidebar_global.is_empty() && !app.global_searching);
+}
+
+#[tokio::test]
+async fn opening_a_search_hit_loads_its_window_and_detaches() {
+    use ferrogram::model::GlobalHit;
+    let mut app = signed_in_app();
+    // A hit in a chat that is not in the loaded list.
+    let far = -777;
+    let target = 40;
+    let hit = GlobalHit {
+        message: ChatMessage::text(far, target, false, 5, "needle"),
+        chat_title: "Far Away".into(),
+        chat_kind: ferrogram::model::ChatKind::Group,
+        photo_id: Some(3),
+    };
+    app.sidebar_global = vec![hit];
+    assert!(app.chats.get(far).is_none());
+    let _ = app.update(Message::Ui(Ui::OpenResult(far, target)));
+    assert_eq!(app.selected, Some(far));
+    assert_eq!(app.chats.get(far).unwrap().title, "Far Away");
+    assert_eq!(app.highlight, Some(target));
+    let conv = app.conversation.as_ref().unwrap();
+    assert!(conv.detached && conv.jump_to == Some(target));
+
+    // A late "newest page" answer (before = None) must not pollute the window.
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: far,
+        before: None,
+        result: Ok(vec![ChatMessage::text(far, 500, false, 9, "newest")]),
+    }));
+    assert!(app.conversation.as_ref().unwrap().get(500).is_none());
+
+    // The window around the hit arrives: the jump target is consumed.
+    let window: Vec<_> = (20..=65)
+        .map(|i| ChatMessage::text(far, i, false, i64::from(i), "m"))
+        .collect();
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: far,
+        before: Some(target + ferrogram::app::state::JUMP_NEWER),
+        result: Ok(window),
+    }));
+    let conv = app.conversation.as_ref().unwrap();
+    assert!(conv.jump_to.is_none() && conv.detached);
+    assert!(conv.get(target).is_some());
+    assert!(!app.at_bottom);
+
+    // Live messages do not append to the detached window...
+    let _ = app.update(Message::Net(Event::NewMessage(ChatMessage::text(
+        far, 900, false, 99, "live",
+    ))));
+    assert!(app.conversation.as_ref().unwrap().get(900).is_none());
+    // ...and "jump to latest" reattaches to the newest history.
+    let _ = app.update(Message::Ui(Ui::ScrollToBottom));
+    let conv = app.conversation.as_ref().unwrap();
+    assert!(!conv.detached);
+    assert!(app.at_bottom);
+
+    // A hit that vanished server-side falls back to the latest messages.
+    let _ = app.update(Message::Ui(Ui::OpenResult(far, 41)));
+    assert!(app.conversation.as_ref().unwrap().detached);
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: far,
+        before: Some(41 + ferrogram::app::state::JUMP_NEWER),
+        result: Ok(vec![ChatMessage::text(far, 10, false, 1, "other")]),
+    }));
+    assert!(!app.conversation.as_ref().unwrap().detached);
+    assert!(
+        app.toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no longer available")
+    );
+}
+
+#[tokio::test]
+async fn jumping_inside_the_loaded_window_does_not_refetch() {
+    let mut app = signed_in_app();
+    let _ = app.update(Message::Ui(Ui::SelectChat(ALICE)));
+    let _ = app.update(Message::Done(Done::NetHistory {
+        chat: ALICE,
+        before: None,
+        result: Ok(mock::mock_history(ALICE)),
+    }));
+    let _ = app.update(Message::Ui(Ui::OpenResult(ALICE, 148)));
+    let conv = app.conversation.as_ref().unwrap();
+    assert!(
+        !conv.detached,
+        "target already loaded: stay on the live window"
+    );
+    assert_eq!(app.highlight, Some(148));
+}
