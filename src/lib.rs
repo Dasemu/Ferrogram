@@ -14,6 +14,7 @@ pub mod logging;
 pub mod media;
 pub mod memory;
 pub mod mock;
+pub mod mock_call;
 pub mod model;
 pub mod net;
 pub mod prefs;

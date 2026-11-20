@@ -542,10 +542,13 @@ pub struct FakeTelegram {
     state: Mutex<State>,
     opts: FakeOptions,
     events: Arc<EventHub>,
+    /// Fake call server + remote peer (real engine on loopback).
+    phone: crate::mock_call::FakeCalls,
 }
 
 impl FakeTelegram {
     pub fn new(opts: FakeOptions) -> Arc<Self> {
+        let events = Arc::new(EventHub::new());
         let (mut chats, mut history) = chats_and_history();
         for i in 0..opts.extra_chats {
             let id = 1_000 + i as i64;
@@ -575,8 +578,14 @@ impl FakeTelegram {
                 folders: mock_folders(),
             }),
             opts,
-            events: Arc::new(EventHub::new()),
+            phone: crate::mock_call::FakeCalls::new(me().id, Arc::clone(&events)),
+            events,
         })
+    }
+
+    /// The fake call server and peer (tests, screenshots).
+    pub fn phone(&self) -> &crate::mock_call::FakeCalls {
+        &self.phone
     }
 
     fn st(&self) -> Result<std::sync::MutexGuard<'_, State>> {
@@ -1074,6 +1083,61 @@ impl TelegramApi for FakeTelegram {
         drop(s);
         self.events.emit(Event::FoldersOrder(order));
         Ok(())
+    }
+
+    async fn dh_config(&self) -> Result<crate::net::calls::dh::DhConfig> {
+        self.call("dh_config").await?;
+        Ok(crate::mock_call::dh_config())
+    }
+
+    async fn request_call(
+        &self,
+        user: ChatId,
+        g_a_hash: Vec<u8>,
+    ) -> Result<crate::net::calls::PhoneCall> {
+        self.call("request_call").await?;
+        self.phone.request_call(user, g_a_hash).await
+    }
+
+    async fn received_call(&self, _call: crate::net::calls::CallRef) -> Result<()> {
+        self.call("received_call").await
+    }
+
+    async fn accept_call(
+        &self,
+        call: crate::net::calls::CallRef,
+        g_b: Vec<u8>,
+    ) -> Result<crate::net::calls::PhoneCall> {
+        self.call("accept_call").await?;
+        self.phone.accept_call(call, g_b).await
+    }
+
+    async fn confirm_call(
+        &self,
+        call: crate::net::calls::CallRef,
+        g_a: Vec<u8>,
+        key_fingerprint: i64,
+    ) -> Result<crate::net::calls::PhoneCall> {
+        self.call("confirm_call").await?;
+        self.phone.confirm_call(call, g_a, key_fingerprint).await
+    }
+
+    async fn discard_call(
+        &self,
+        call: crate::net::calls::CallRef,
+        duration: i32,
+        reason: crate::net::calls::DiscardReason,
+    ) -> Result<()> {
+        self.call("discard_call").await?;
+        self.phone.discard(call, duration, reason)
+    }
+
+    async fn send_call_signaling(
+        &self,
+        call: crate::net::calls::CallRef,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        self.phone.signaling(call, data)
     }
 
     fn events(&self) -> BoxStream<'static, Event> {
