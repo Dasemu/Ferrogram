@@ -5,6 +5,7 @@
 //! by [`mtproto::GrammersApi`] (grammers-client) for real accounts.
 
 pub mod backoff;
+pub mod calls;
 pub mod mtproto;
 pub mod session;
 pub mod types;
