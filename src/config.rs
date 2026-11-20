@@ -40,6 +40,14 @@ pub enum ScreenshotTarget {
     SearchFrom,
     /// The info panel (profile) with one shared-content tab selected.
     Info(crate::model::SharedKind),
+    /// An incoming call ringing.
+    CallIncoming,
+    /// An outgoing call ringing at the peer.
+    CallOutgoing,
+    /// A connected call (panel).
+    CallActive,
+    /// A connected call, minimised to the bar above the chat.
+    CallBar,
 }
 
 impl ScreenshotTarget {
@@ -71,6 +79,10 @@ impl ScreenshotTarget {
             "info-music" => Self::Info(crate::model::SharedKind::Music),
             "info-voice" => Self::Info(crate::model::SharedKind::Voice),
             "info-gifs" => Self::Info(crate::model::SharedKind::Gifs),
+            "call-incoming" => Self::CallIncoming,
+            "call-outgoing" => Self::CallOutgoing,
+            "call-active" => Self::CallActive,
+            "call-bar" => Self::CallBar,
             _ => return None,
         })
     }

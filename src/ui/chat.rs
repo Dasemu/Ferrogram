@@ -150,7 +150,11 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
             .interaction(iced::mouse::Interaction::Pointer),
             Space::new().width(Length::Fill),
             ib(Icon::Search, Some(Message::Ui(Ui::ToggleChatSearch))),
-            ib(Icon::Phone, None),
+            ib(
+                Icon::Phone,
+                chat.filter(|c| c.kind == ChatKind::User)
+                    .map(|c| Message::Ui(Ui::CallStart(c.id))),
+            ),
             ib(Icon::More, Some(Message::Ui(Ui::ToggleHeaderMenu))),
         ]
         .spacing(10)

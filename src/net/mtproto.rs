@@ -52,6 +52,8 @@ pub struct GrammersApi {
     /// The dialog iterator survives between calls so "load more" continues
     /// from the offset instead of re-reading the list.
     dialogs_iter: tokio::sync::Mutex<Option<grammers_client::client::DialogIter>>,
+    /// Last `messages.dhConfig` (for `dhConfigNotModified`).
+    dh: Mutex<Option<super::calls::dh::DhConfig>>,
     self_id: AtomicI64,
     events: EventHub,
     /// Set when the stored session was unreadable and had to be discarded.
@@ -167,6 +169,7 @@ impl GrammersApi {
             member_peers: Mutex::new(HashMap::new()),
             thumbs: Mutex::new(std::collections::VecDeque::new()),
             dialogs_iter: tokio::sync::Mutex::new(None),
+            dh: Mutex::new(None),
             self_id: AtomicI64::new(0),
             events: EventHub::new(),
             session_reset: std::sync::atomic::AtomicBool::new(reset),
@@ -1171,6 +1174,149 @@ impl TelegramApi for Grammers {
             .await
             .map(drop)
             .map_err(map_err)
+    }
+
+    async fn call_config(&self) -> Result<super::calls::CallConfig> {
+        use grammers_client::tl;
+        let r = self
+            .0
+            .client
+            .invoke(&tl::functions::phone::GetCallConfig {})
+            .await
+            .map_err(map_err)?;
+        let tl::enums::DataJson::Json(j) = r;
+        Ok(super::calls::CallConfig::from_json(&j.data))
+    }
+
+    async fn dh_config(&self) -> Result<super::calls::dh::DhConfig> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let cached = lock(&api.dh)?.clone();
+        let r = api
+            .client
+            .invoke(&tl::functions::messages::GetDhConfig {
+                version: cached.as_ref().map_or(0, |c| c.version),
+                random_length: 256,
+            })
+            .await
+            .map_err(map_err)?;
+        let cfg = types::dh_config_from_tl(&r, cached.as_ref())
+            .ok_or_else(|| Error::Protocol("dh config".into()))?;
+        *lock(&api.dh)? = Some(cfg.clone());
+        Ok(cfg)
+    }
+
+    async fn request_call(
+        &self,
+        user: ChatId,
+        g_a_hash: Vec<u8>,
+    ) -> Result<super::calls::PhoneCall> {
+        use grammers_client::tl;
+        use rand::Rng as _;
+        let api = &self.0;
+        if user <= 0 {
+            return Err(Error::Protocol("calls need a user".into()));
+        }
+        let random_id: i32 = rand::rng().random();
+        let peer = api.peer_ref(user).await?;
+        let r = api
+            .client
+            .invoke(&tl::functions::phone::RequestCall {
+                video: false,
+                user_id: peer.into(),
+                random_id,
+                g_a_hash,
+                protocol: types::protocol_to_tl(&super::calls::Protocol::ours()),
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(types::phone_call_from_response(&r))
+    }
+
+    async fn received_call(&self, call: super::calls::CallRef) -> Result<()> {
+        use grammers_client::tl;
+        self.0
+            .client
+            .invoke(&tl::functions::phone::ReceivedCall {
+                peer: types::input_phone_call(call),
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    async fn accept_call(
+        &self,
+        call: super::calls::CallRef,
+        g_b: Vec<u8>,
+    ) -> Result<super::calls::PhoneCall> {
+        use grammers_client::tl;
+        let r = self
+            .0
+            .client
+            .invoke(&tl::functions::phone::AcceptCall {
+                peer: types::input_phone_call(call),
+                g_b,
+                protocol: types::protocol_to_tl(&super::calls::Protocol::ours()),
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(types::phone_call_from_response(&r))
+    }
+
+    async fn confirm_call(
+        &self,
+        call: super::calls::CallRef,
+        g_a: Vec<u8>,
+        key_fingerprint: i64,
+    ) -> Result<super::calls::PhoneCall> {
+        use grammers_client::tl;
+        let r = self
+            .0
+            .client
+            .invoke(&tl::functions::phone::ConfirmCall {
+                peer: types::input_phone_call(call),
+                g_a,
+                key_fingerprint,
+                protocol: types::protocol_to_tl(&super::calls::Protocol::ours()),
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(types::phone_call_from_response(&r))
+    }
+
+    async fn discard_call(
+        &self,
+        call: super::calls::CallRef,
+        duration: i32,
+        reason: super::calls::DiscardReason,
+    ) -> Result<()> {
+        use grammers_client::tl;
+        self.0
+            .client
+            .invoke(&tl::functions::phone::DiscardCall {
+                video: false,
+                peer: types::input_phone_call(call),
+                duration,
+                reason: types::discard_reason_to_tl(reason),
+                connection_id: 0,
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    async fn send_call_signaling(&self, call: super::calls::CallRef, data: Vec<u8>) -> Result<()> {
+        use grammers_client::tl;
+        self.0
+            .client
+            .invoke(&tl::functions::phone::SendSignalingData {
+                peer: types::input_phone_call(call),
+                data,
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(())
     }
 
     fn take_notice(&self) -> Option<String> {

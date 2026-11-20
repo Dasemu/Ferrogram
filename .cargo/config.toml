@@ -1,0 +1,4 @@
+[env]
+# audiopus_sys builds the bundled libopus with CMake when no static system
+# libopus is found; its CMakeLists predates CMake 3.5, which CMake 4 rejects.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

@@ -244,6 +244,8 @@ impl ChatList {
             | Event::FolderChanged { .. }
             | Event::FoldersOrder(_)
             | Event::FoldersStale
+            | Event::PhoneCall(_)
+            | Event::CallSignaling { .. }
             | Event::SessionRevoked => {}
         }
     }

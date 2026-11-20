@@ -2,11 +2,13 @@
 //! side effect is a `Task` that calls `net`, `store` or `auth`.
 
 pub mod background;
+pub mod call;
 mod chat_actions;
 pub mod chatmenu;
 pub mod folders;
 pub mod info;
 pub mod message;
+pub mod phone;
 pub mod screenshot;
 pub mod state;
 
@@ -171,6 +173,10 @@ pub struct App {
     pub tz_offset: i32,
     pub started: Instant,
     pub first_frame_logged: bool,
+    // ---- one-to-one calls (app/call.rs, app/phone.rs)
+    pub calls: call::Calls,
+    pub call_media: Option<phone::CallMedia>,
+    pub call_ui: phone::CallUi,
     // ---- background mode (docs/architecture.md section 11.4)
     pub prefs: Prefs,
     /// Window / tray state machine; decides close-to-tray vs quit.
@@ -326,6 +332,9 @@ impl App {
             tz_offset: if config.mock { 0 } else { tz_offset },
             started: Instant::now(),
             first_frame_logged: !config.trace_startup,
+            calls: call::Calls::default(),
+            call_media: None,
+            call_ui: phone::CallUi::default(),
             prefs,
             window: WindowState::new(prefs.close_to_tray),
             window_id: None,
@@ -529,6 +538,7 @@ impl App {
                 0
             },
             window_open: self.window.open,
+            ringing: self.calls.is_ringing_in(),
             muted: self.prefs.mute.describe(Self::real_now(), self.tz_offset),
             start_minimized: self.prefs.start_minimized,
         }
@@ -690,6 +700,7 @@ impl App {
         if !self.first_frame_logged {
             subs.push(window::frames().map(|_| Message::Ui(Ui::Tick)));
         }
+        self.call_subscriptions(&mut subs);
         Subscription::batch(subs)
     }
 
@@ -1408,6 +1419,15 @@ impl App {
 
     fn update_ui(&mut self, ui: Ui) -> Task<Message> {
         match ui {
+            Ui::CallStart(_)
+            | Ui::CallAccept
+            | Ui::CallHangUp
+            | Ui::CallToggleMute
+            | Ui::CallExpand(_)
+            | Ui::CallDevices(_)
+            | Ui::CallPickDevice(..)
+            | Ui::CallTick
+            | Ui::CallEngine(_) => self.on_call_ui(ui),
             Ui::SetupApiId(s) => {
                 if let Some(f) = &mut self.setup {
                     f.api_id = s.chars().filter(char::is_ascii_digit).take(12).collect();
@@ -2520,6 +2540,7 @@ impl App {
                 self.conn = *c;
                 return Task::none();
             }
+            Event::PhoneCall(_) | Event::CallSignaling { .. } => return self.on_call_event(&ev),
             Event::SessionRevoked => return self.session_revoked(),
             Event::FolderChanged { id, folder } => {
                 self.folders.apply_changed(*id, folder.clone());
@@ -2703,6 +2724,14 @@ impl App {
 
     fn on_done(&mut self, done: Done) -> Task<Message> {
         match done {
+            Done::CallConfig(_)
+            | Done::CallPlaced(_)
+            | Done::CallAccepted(_)
+            | Done::CallConfirmed(_)
+            | Done::CallKey(_)
+            | Done::CallMedia(_)
+            | Done::CallDevicesListed(..)
+            | Done::CallSent(_) => self.on_call_done(done),
             Done::ApiReady(Ok(api)) => {
                 self.api = Some(api.clone());
                 self.api_gen += 1;
