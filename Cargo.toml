@@ -47,6 +47,7 @@ webrtc-dtls = "0.12"
 opus = "0.3"
 cpal = "0.16"
 webrtc-util = { version = "0.11", default-features = false, features = ["conn"] }
+audiopus_sys = { version = "0.2", features = ["static"] }
 
 [dev-dependencies]
 tempfile = "3"
