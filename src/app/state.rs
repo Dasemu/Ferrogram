@@ -3,7 +3,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::model::{
-    Chat, ChatId, ChatKind, Draft, Message, MessageId, Reaction, SendState, TypingAction,
+    Chat, ChatId, ChatKind, Draft, EffectiveNotify, Message, MessageId, NotifyDefaults,
+    NotifySettings, NotifyTarget, Reaction, SendState, TypingAction,
 };
 use crate::net::Event;
 
@@ -17,12 +18,79 @@ pub const PAGE: usize = 50;
 #[derive(Debug, Default, Clone)]
 pub struct ChatList {
     chats: Vec<Chat>,
+    /// Account-wide notification defaults (muted channels by default, ...).
+    defaults: NotifyDefaults,
+}
+
+/// Wall clock in unix seconds (notification settings expire).
+fn wall_now() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 impl ChatList {
     pub fn new(mut chats: Vec<Chat>) -> Self {
         sort_chats(&mut chats);
-        Self { chats }
+        let mut list = Self {
+            chats,
+            defaults: NotifyDefaults::default(),
+        };
+        list.refresh_notify(wall_now());
+        list
+    }
+
+    pub fn defaults(&self) -> &NotifyDefaults {
+        &self.defaults
+    }
+
+    /// Replace the account defaults and re-derive every chat's mute state.
+    pub fn set_defaults(&mut self, defaults: NotifyDefaults, now: i64) {
+        self.defaults = defaults;
+        self.refresh_notify(now);
+    }
+
+    /// Re-derive `Chat::muted` for every chat (defaults changed, a timed
+    /// mute ran out, a page arrived).
+    pub fn refresh_notify(&mut self, now: i64) {
+        for c in &mut self.chats {
+            c.muted = self.defaults.resolve(c, now).muted;
+        }
+    }
+
+    /// Set a chat's own settings (the user, another device or the server).
+    pub fn set_notify(&mut self, id: ChatId, n: NotifySettings, now: i64) {
+        let defaults = self.defaults;
+        if let Some(c) = self.get_mut(id) {
+            c.notify = n;
+            c.muted = defaults.resolve(c, now).muted;
+        }
+    }
+
+    /// What applies to `id` once the account defaults are taken into
+    /// account. Unknown chats get the plain defaults for a private chat.
+    pub fn effective(&self, id: ChatId, now: i64) -> Option<EffectiveNotify> {
+        self.get(id).map(|c| self.defaults.resolve(c, now))
+    }
+
+    /// Forget a chat (deleted or left).
+    pub fn remove(&mut self, id: ChatId) {
+        self.chats.retain(|c| c.id != id);
+    }
+
+    /// The history of a chat was cleared: it stays in the list, empty.
+    pub fn cleared(&mut self, id: ChatId) {
+        if let Some(c) = self.get_mut(id) {
+            c.last_message = None;
+            c.unread_count = 0;
+        }
+    }
+
+    /// The soonest time (unix s) a timed mute of any chat ends, if any.
+    pub fn next_unmute(&self, now: i64) -> Option<i64> {
+        self.chats
+            .iter()
+            .filter_map(|c| c.notify.mute_until)
+            .filter(|t| *t > now && *t < i64::from(i32::MAX))
+            .min()
     }
 
     pub fn all(&self) -> &[Chat] {
@@ -46,10 +114,13 @@ impl ChatList {
             }
         }
         sort_chats(&mut self.chats);
+        self.refresh_notify(wall_now());
     }
 
     pub fn replace(&mut self, chats: Vec<Chat>) {
+        let defaults = self.defaults;
         *self = Self::new(chats);
+        self.set_defaults(defaults, wall_now());
     }
 
     pub fn total_unread(&self) -> u32 {
@@ -70,12 +141,6 @@ impl ChatList {
             .iter()
             .filter(|c| c.title.to_lowercase().contains(&q))
             .collect()
-    }
-
-    pub fn set_muted(&mut self, id: ChatId, muted: bool) {
-        if let Some(c) = self.get_mut(id) {
-            c.muted = muted;
-        }
     }
 
     pub fn mark_read(&mut self, id: ChatId) {
@@ -114,6 +179,7 @@ impl ChatList {
                     c.last_date = m.date;
                     c.unread_count = u32::from(!m.outgoing && open != Some(m.chat_id));
                     c.last_message = Some(m.clone());
+                    c.muted = self.defaults.resolve(&c, wall_now()).muted;
                     self.chats.push(c);
                 }
                 sort_chats(&mut self.chats);
@@ -164,11 +230,14 @@ impl ChatList {
                     c.presence = *presence;
                 }
             }
-            Event::Muted { chat, muted } => {
-                if let Some(c) = self.get_mut(*chat) {
-                    c.muted = *muted;
+            Event::Notify { target, settings } => match target {
+                NotifyTarget::Chat(id) => self.set_notify(*id, *settings, wall_now()),
+                NotifyTarget::Scope(scope) => {
+                    let mut d = self.defaults;
+                    d.set(*scope, *settings);
+                    self.set_defaults(d, wall_now());
                 }
-            }
+            },
             Event::Reactions { .. }
             | Event::Typing { .. }
             | Event::Connection(_)
@@ -825,6 +894,84 @@ pub const LOAD_THRESHOLD: f32 = 400.0;
 
 #[cfg(test)]
 mod tests {
+    use crate::model::{MUTE_FOREVER, NotifyScope};
+
+    #[test]
+    fn chat_list_derives_muted_from_defaults_and_follows_events() {
+        let mut ch = Chat::new(-1_000_000_000_050, ChatKind::Channel, "news");
+        ch.unread_count = 4;
+        let mut list = ChatList::new(vec![ch, Chat::new(5, ChatKind::User, "u")]);
+        assert_eq!(list.total_unread(), 4);
+        let channels_muted = NotifySettings {
+            mute_until: Some(MUTE_FOREVER),
+            ..NotifySettings::default()
+        };
+        list.apply_event(
+            &Event::Notify {
+                target: NotifyTarget::Scope(NotifyScope::Broadcasts),
+                settings: channels_muted,
+            },
+            None,
+        );
+        assert!(list.get(-1_000_000_000_050).unwrap().muted);
+        assert!(!list.get(5).unwrap().muted);
+        assert_eq!(
+            list.total_unread(),
+            0,
+            "muted channels leave the tray count"
+        );
+        // The defaults survive a refresh of the list from the server.
+        list.replace(vec![Chat::new(
+            -1_000_000_000_051,
+            ChatKind::Channel,
+            "other",
+        )]);
+        assert!(list.get(-1_000_000_000_051).unwrap().muted);
+        // A chat we first hear of through a message gets the default too.
+        let m = Message::text(-1_000_000_000_052, 1, false, 5, "hi");
+        list.apply_event(&Event::NewMessage(m), None);
+        assert!(list.get(-1_000_000_000_052).is_some());
+        // Explicit unmute on one chat.
+        list.apply_event(
+            &Event::Notify {
+                target: NotifyTarget::Chat(-1_000_000_000_051),
+                settings: NotifySettings {
+                    mute_until: Some(0),
+                    ..NotifySettings::default()
+                },
+            },
+            None,
+        );
+        assert!(!list.get(-1_000_000_000_051).unwrap().muted);
+    }
+
+    #[test]
+    fn next_unmute_is_the_soonest_timed_mute() {
+        let mut a = Chat::new(1, ChatKind::User, "a");
+        a.notify.mute_until = Some(900);
+        let mut b = Chat::new(2, ChatKind::User, "b");
+        b.notify.mute_until = Some(500);
+        let mut c = Chat::new(3, ChatKind::User, "c");
+        c.notify.mute_until = Some(MUTE_FOREVER);
+        let list = ChatList::new(vec![a, b, c]);
+        assert_eq!(list.next_unmute(100), Some(500));
+        assert_eq!(list.next_unmute(600), Some(900));
+        assert_eq!(list.next_unmute(1000), None, "forever is not a timer");
+    }
+
+    #[test]
+    fn removed_and_cleared_chats() {
+        let mut ch = Chat::new(1, ChatKind::User, "a");
+        ch.unread_count = 3;
+        ch.last_message = Some(Message::text(1, 1, false, 1, "x"));
+        let mut list = ChatList::new(vec![ch, Chat::new(2, ChatKind::User, "b")]);
+        list.cleared(1);
+        let c = list.get(1).unwrap();
+        assert!(c.last_message.is_none() && c.unread_count == 0);
+        list.remove(1);
+        assert!(list.get(1).is_none() && list.get(2).is_some());
+    }
+
     use super::*;
     use crate::model::Message as M;
 
