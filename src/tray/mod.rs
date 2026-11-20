@@ -33,6 +33,8 @@ pub struct TrayModel {
     pub unread: u32,
     /// The window is currently shown.
     pub window_open: bool,
+    /// An incoming call is ringing.
+    pub ringing: bool,
     /// Notifications are muted globally; text for the tooltip ("until 15:30").
     pub muted: Option<String>,
     pub start_minimized: bool,
@@ -56,12 +58,14 @@ pub enum Entry {
 impl TrayModel {
     /// Unread messages in unmuted chats turn the icon to "needs attention".
     pub fn needs_attention(&self) -> bool {
-        self.unread > 0
+        self.unread > 0 || self.ringing
     }
 
     /// `Ferrogram — 3 unread` (just `Ferrogram` when nothing is unread).
     pub fn tooltip_title(&self) -> String {
-        if self.unread == 0 {
+        if self.ringing {
+            format!("{APP_NAME} — incoming call")
+        } else if self.unread == 0 {
             APP_NAME.to_owned()
         } else {
             format!("{APP_NAME} — {} unread", self.unread)

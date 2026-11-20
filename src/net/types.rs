@@ -61,7 +61,14 @@ pub fn message_from_tl(raw: &tl::enums::Message) -> Option<Message> {
             sender_name: None,
             outgoing: m.out,
             date: i64::from(m.date),
-            text: service_text(&m.action),
+            text: match &m.action {
+                tl::enums::MessageAction::PhoneCall(c) => call_label(
+                    m.out,
+                    c.reason.as_ref().map(discard_reason_from_tl),
+                    c.duration,
+                ),
+                other => service_text(other),
+            },
             media: None,
             reply_to: m.reply_to.as_ref().and_then(reply_to_id),
             edited: false,
@@ -90,7 +97,11 @@ pub fn service_text(action: &tl::enums::MessageAction) -> String {
         A::ChatDeleteUser(_) => "A member left the group".into(),
         A::ChatJoinedByLink(_) | A::ChatJoinedByRequest => "A member joined via invite link".into(),
         A::PinMessage => "Message pinned".into(),
-        A::PhoneCall(_) => "Call".into(),
+        A::PhoneCall(c) => call_label(
+            false,
+            c.reason.as_ref().map(discard_reason_from_tl),
+            c.duration,
+        ),
         A::ContactSignUp => "Joined Telegram".into(),
         A::HistoryClear => "History cleared".into(),
         _ => "Service message".into(),
@@ -237,6 +248,11 @@ pub fn event_from_update(update: &tl::enums::Update) -> Option<Event> {
 pub fn event_from_update_as(update: &tl::enums::Update, self_id: i64) -> Option<Event> {
     use tl::enums::Update as U;
     match update {
+        U::PhoneCall(u) => Some(Event::PhoneCall(phone_call_from_tl(&u.phone_call))),
+        U::PhoneCallSignalingData(u) => Some(Event::CallSignaling {
+            call_id: u.phone_call_id,
+            data: u.data.clone(),
+        }),
         U::DialogFilter(u) => Some(Event::FolderChanged {
             id: u.id,
             folder: u
@@ -854,5 +870,182 @@ pub fn rpc_error(code: i32, name: &str, value: Option<u32>) -> crate::error::Err
         | "AUTH_KEY_DUPLICATED" => Error::Auth(AuthError::SessionRevoked),
         _ if code == 401 => Error::Auth(AuthError::SessionRevoked),
         _ => Error::Protocol(format!("{code} {name}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Calls
+
+use super::calls::{CallRef, Connection, DiscardReason, PhoneCall, Protocol};
+
+/// The history label of a call (`messageActionPhoneCall`), like the official
+/// apps: "Outgoing call (1:05)", "Missed call", "Cancelled call", ...
+pub fn call_label(out: bool, reason: Option<DiscardReason>, duration: Option<i32>) -> String {
+    let dur = duration.filter(|d| *d > 0).map(|d| {
+        let d = d.max(0);
+        if d >= 3600 {
+            format!("{}:{:02}:{:02}", d / 3600, d / 60 % 60, d % 60)
+        } else {
+            format!("{}:{:02}", d / 60, d % 60)
+        }
+    });
+    match (out, reason, dur) {
+        (true, Some(DiscardReason::Missed), None) => "Cancelled call".into(),
+        (true, Some(DiscardReason::Busy), None) => "Declined call".into(),
+        (false, Some(DiscardReason::Missed | DiscardReason::Busy), None) => "Missed call".into(),
+        (true, _, Some(d)) => format!("Outgoing call ({d})"),
+        (false, _, Some(d)) => format!("Incoming call ({d})"),
+        (true, _, None) => "Outgoing call".into(),
+        (false, _, None) => "Incoming call".into(),
+    }
+}
+
+pub fn discard_reason_from_tl(r: &tl::enums::PhoneCallDiscardReason) -> DiscardReason {
+    use tl::enums::PhoneCallDiscardReason as R;
+    match r {
+        R::Missed => DiscardReason::Missed,
+        R::Disconnect => DiscardReason::Disconnect,
+        R::Hangup => DiscardReason::Hangup,
+        R::Busy => DiscardReason::Busy,
+        _ => DiscardReason::Other,
+    }
+}
+
+pub fn discard_reason_to_tl(r: DiscardReason) -> tl::enums::PhoneCallDiscardReason {
+    use tl::enums::PhoneCallDiscardReason as R;
+    match r {
+        DiscardReason::Missed => R::Missed,
+        DiscardReason::Disconnect | DiscardReason::Other => R::Disconnect,
+        DiscardReason::Hangup => R::Hangup,
+        DiscardReason::Busy => R::Busy,
+    }
+}
+
+pub fn protocol_from_tl(p: &tl::enums::PhoneCallProtocol) -> Protocol {
+    let tl::enums::PhoneCallProtocol::Protocol(p) = p;
+    Protocol {
+        udp_p2p: p.udp_p2p,
+        udp_reflector: p.udp_reflector,
+        min_layer: p.min_layer,
+        max_layer: p.max_layer,
+        library_versions: p.library_versions.iter().take(32).cloned().collect(),
+    }
+}
+
+pub fn protocol_to_tl(p: &Protocol) -> tl::enums::PhoneCallProtocol {
+    tl::enums::PhoneCallProtocol::Protocol(tl::types::PhoneCallProtocol {
+        udp_p2p: p.udp_p2p,
+        udp_reflector: p.udp_reflector,
+        min_layer: p.min_layer,
+        max_layer: p.max_layer,
+        library_versions: p.library_versions.clone(),
+    })
+}
+
+pub fn input_phone_call(c: CallRef) -> tl::enums::InputPhoneCall {
+    tl::enums::InputPhoneCall::Call(tl::types::InputPhoneCall {
+        id: c.id,
+        access_hash: c.access_hash,
+    })
+}
+
+fn connection_from_tl(c: &tl::enums::PhoneConnection) -> Connection {
+    match c {
+        tl::enums::PhoneConnection::Connection(c) => Connection::Reflector {
+            id: c.id,
+            ip: c.ip.clone(),
+            ipv6: c.ipv6.clone(),
+            port: c.port,
+            peer_tag: c.peer_tag.clone(),
+            tcp: c.tcp,
+        },
+        tl::enums::PhoneConnection::Webrtc(c) => Connection::Webrtc {
+            id: c.id,
+            ip: c.ip.clone(),
+            ipv6: c.ipv6.clone(),
+            port: c.port,
+            turn: c.turn,
+            stun: c.stun,
+            username: c.username.clone(),
+            password: c.password.clone(),
+        },
+    }
+}
+
+pub fn phone_call_from_tl(c: &tl::enums::PhoneCall) -> PhoneCall {
+    use tl::enums::PhoneCall as P;
+    let r = |id, access_hash| CallRef { id, access_hash };
+    match c {
+        P::Empty(c) => PhoneCall::Empty { id: c.id },
+        P::Waiting(c) => PhoneCall::Waiting {
+            call: r(c.id, c.access_hash),
+            admin_id: c.admin_id,
+            participant_id: c.participant_id,
+            video: c.video,
+            receive_date: c.receive_date,
+        },
+        P::Requested(c) => PhoneCall::Requested {
+            call: r(c.id, c.access_hash),
+            admin_id: c.admin_id,
+            participant_id: c.participant_id,
+            video: c.video,
+            g_a_hash: c.g_a_hash.clone(),
+            protocol: protocol_from_tl(&c.protocol),
+        },
+        P::Accepted(c) => PhoneCall::Accepted {
+            call: r(c.id, c.access_hash),
+            admin_id: c.admin_id,
+            participant_id: c.participant_id,
+            g_b: c.g_b.clone(),
+            protocol: protocol_from_tl(&c.protocol),
+        },
+        P::Call(c) => PhoneCall::Active {
+            call: r(c.id, c.access_hash),
+            admin_id: c.admin_id,
+            participant_id: c.participant_id,
+            g_a_or_b: c.g_a_or_b.clone(),
+            key_fingerprint: c.key_fingerprint,
+            protocol: protocol_from_tl(&c.protocol),
+            connections: c.connections.iter().take(64).map(connection_from_tl).collect(),
+            p2p_allowed: c.p2p_allowed,
+            start_date: c.start_date,
+            custom_parameters: c.custom_parameters.as_ref().map(|d| {
+                let tl::enums::DataJson::Json(j) = d;
+                j.data.clone()
+            }),
+        },
+        P::Discarded(c) => PhoneCall::Discarded {
+            id: c.id,
+            reason: c.reason.as_ref().map(discard_reason_from_tl),
+            duration: c.duration,
+            need_rating: c.need_rating,
+        },
+    }
+}
+
+/// `phone.phoneCall` → the call (the users are cached by grammers).
+pub fn phone_call_from_response(r: &tl::enums::phone::PhoneCall) -> PhoneCall {
+    let tl::enums::phone::PhoneCall::Call(r) = r;
+    phone_call_from_tl(&r.phone_call)
+}
+
+/// `messages.dhConfig` → (g, p, version, random). `NotModified` reuses the
+/// cached g/p (passed in) with its fresh random.
+pub fn dh_config_from_tl(
+    r: &tl::enums::messages::DhConfig,
+    cached: Option<&crate::net::calls::dh::DhConfig>,
+) -> Option<crate::net::calls::dh::DhConfig> {
+    use crate::net::calls::dh::DhConfig;
+    match r {
+        tl::enums::messages::DhConfig::Config(c) => Some(DhConfig {
+            g: c.g,
+            p: c.p.clone(),
+            version: c.version,
+            random: c.random.clone(),
+        }),
+        tl::enums::messages::DhConfig::NotModified(c) => cached.map(|d| DhConfig {
+            random: c.random.clone(),
+            ..d.clone()
+        }),
     }
 }

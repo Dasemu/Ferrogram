@@ -31,6 +31,10 @@ pub const MAX_THUMB_BYTES: usize = 512 * 1024;
 /// Hard cap on photo bytes downloaded for display.
 pub const MAX_PHOTO_BYTES: usize = 20 * 1024 * 1024;
 
+fn calls_unsupported() -> crate::error::Error {
+    crate::error::Error::Protocol("calls are not supported by this client".into())
+}
+
 /// Events pushed by the protocol client (architecture §3, `Net(..)`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -92,6 +96,13 @@ pub enum Event {
     /// Something about the folders changed that the update does not say
     /// (`updateDialogFilters`): fetch them again.
     FoldersStale,
+    /// A call changed state (`updatePhoneCall`).
+    PhoneCall(calls::PhoneCall),
+    /// Signaling for a running call (`updatePhoneCallSignalingData`).
+    CallSignaling {
+        call_id: i64,
+        data: Vec<u8>,
+    },
     SessionRevoked,
 }
 
@@ -208,6 +219,53 @@ pub trait TelegramApi: Send + Sync {
     async fn delete_dialog_filter(&self, id: i32) -> Result<()>;
     /// Reorder folders (`messages.updateDialogFiltersOrder`).
     async fn reorder_dialog_filters(&self, order: Vec<i32>) -> Result<()>;
+
+    // ---- one-to-one calls (docs/calls-feasibility.md)
+
+    /// `phone.getCallConfig` (timeouts).
+    async fn call_config(&self) -> Result<calls::CallConfig> {
+        Ok(calls::CallConfig::default())
+    }
+    /// `messages.getDhConfig` (256 random bytes included).
+    async fn dh_config(&self) -> Result<calls::dh::DhConfig> {
+        Err(calls_unsupported())
+    }
+    /// `phone.requestCall` with our protocol.
+    async fn request_call(&self, user: ChatId, g_a_hash: Vec<u8>) -> Result<calls::PhoneCall> {
+        let _ = (user, g_a_hash);
+        Err(calls_unsupported())
+    }
+    /// `phone.receivedCall`: our device is ringing.
+    async fn received_call(&self, call: calls::CallRef) -> Result<()> {
+        let _ = call;
+        Err(calls_unsupported())
+    }
+    async fn accept_call(&self, call: calls::CallRef, g_b: Vec<u8>) -> Result<calls::PhoneCall> {
+        let _ = (call, g_b);
+        Err(calls_unsupported())
+    }
+    async fn confirm_call(
+        &self,
+        call: calls::CallRef,
+        g_a: Vec<u8>,
+        key_fingerprint: i64,
+    ) -> Result<calls::PhoneCall> {
+        let _ = (call, g_a, key_fingerprint);
+        Err(calls_unsupported())
+    }
+    async fn discard_call(
+        &self,
+        call: calls::CallRef,
+        duration: i32,
+        reason: calls::DiscardReason,
+    ) -> Result<()> {
+        let _ = (call, duration, reason);
+        Err(calls_unsupported())
+    }
+    async fn send_call_signaling(&self, call: calls::CallRef, data: Vec<u8>) -> Result<()> {
+        let _ = (call, data);
+        Err(calls_unsupported())
+    }
     /// One-shot user-facing notice from the backend (e.g. session reset).
     fn take_notice(&self) -> Option<String> {
         None
