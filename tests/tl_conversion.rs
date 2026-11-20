@@ -1212,3 +1212,182 @@ fn pages_know_where_the_next_one_starts() {
     let page = shared_page_from_tl(&msgs, SharedKind::Files, 40);
     assert_eq!(page.next, None);
 }
+
+// ---------------------------------------------------------------- calls
+
+mod calls {
+    use super::wire;
+    use ferrogram::net::Event;
+    use ferrogram::net::calls::{CallRef, Connection, DiscardReason, PhoneCall, Protocol};
+    use ferrogram::net::types::{
+        call_label, discard_reason_to_tl, event_from_update, phone_call_from_tl, protocol_to_tl,
+    };
+    use grammers_client::tl;
+
+    fn protocol() -> tl::enums::PhoneCallProtocol {
+        protocol_to_tl(&Protocol::ours())
+    }
+
+    #[test]
+    fn protocol_round_trips() {
+        let p = wire(protocol());
+        let tl::enums::PhoneCallProtocol::Protocol(p) = &p;
+        assert!(p.udp_p2p && p.udp_reflector);
+        assert_eq!((p.min_layer, p.max_layer), (65, 92));
+        assert_eq!(p.library_versions, vec!["9.0.0", "8.0.0"]);
+    }
+
+    #[test]
+    fn established_call_with_connections() {
+        let raw = wire(tl::enums::PhoneCall::Call(tl::types::PhoneCall {
+            p2p_allowed: true,
+            video: false,
+            conference_supported: false,
+            id: 77,
+            access_hash: -5,
+            date: 1,
+            admin_id: 10,
+            participant_id: 20,
+            g_a_or_b: vec![3; 256],
+            key_fingerprint: -42,
+            protocol: protocol(),
+            connections: vec![
+                tl::enums::PhoneConnection::Connection(tl::types::PhoneConnection {
+                    tcp: false,
+                    id: 9,
+                    ip: "149.154.167.1".into(),
+                    ipv6: String::new(),
+                    port: 599,
+                    peer_tag: vec![1; 16],
+                }),
+                tl::enums::PhoneConnection::Webrtc(tl::types::PhoneConnectionWebrtc {
+                    turn: true,
+                    stun: true,
+                    id: 11,
+                    ip: "1.2.3.4".into(),
+                    ipv6: String::new(),
+                    port: 3478,
+                    username: "user".into(),
+                    password: "secret-pass".into(),
+                }),
+            ],
+            start_date: 2,
+            custom_parameters: Some(tl::enums::DataJson::Json(tl::types::DataJson {
+                data: r#"{"network_standalone_reflectors":true}"#.into(),
+            })),
+        }));
+        let pc = phone_call_from_tl(&raw);
+        let PhoneCall::Active {
+            call,
+            key_fingerprint,
+            connections,
+            p2p_allowed,
+            custom_parameters,
+            ..
+        } = &pc
+        else {
+            panic!("{pc:?}")
+        };
+        assert_eq!(
+            *call,
+            CallRef {
+                id: 77,
+                access_hash: -5
+            }
+        );
+        assert_eq!(*key_fingerprint, -42);
+        assert!(*p2p_allowed);
+        assert_eq!(connections.len(), 2);
+        assert!(matches!(
+            connections[0],
+            Connection::Reflector {
+                id: 9,
+                port: 599,
+                ..
+            }
+        ));
+        assert!(custom_parameters.as_deref().unwrap().contains("standalone"));
+        // Debug output never shows TURN passwords or peer tags.
+        assert!(!format!("{pc:?}").contains("secret-pass"));
+    }
+
+    #[test]
+    fn updates_become_events() {
+        let up = wire(tl::enums::Update::PhoneCall(tl::types::UpdatePhoneCall {
+            phone_call: tl::enums::PhoneCall::Discarded(tl::types::PhoneCallDiscarded {
+                need_rating: true,
+                need_debug: false,
+                video: false,
+                id: 5,
+                reason: Some(discard_reason_to_tl(DiscardReason::Busy)),
+                duration: None,
+            }),
+        }));
+        assert_eq!(
+            event_from_update(&up),
+            Some(Event::PhoneCall(PhoneCall::Discarded {
+                id: 5,
+                reason: Some(DiscardReason::Busy),
+                duration: None,
+                need_rating: true,
+            }))
+        );
+        let sig = wire(tl::enums::Update::PhoneCallSignalingData(
+            tl::types::UpdatePhoneCallSignalingData {
+                phone_call_id: 5,
+                data: vec![1, 2, 3],
+            },
+        ));
+        assert_eq!(
+            event_from_update(&sig),
+            Some(Event::CallSignaling {
+                call_id: 5,
+                data: vec![1, 2, 3]
+            })
+        );
+        let req = wire(tl::enums::PhoneCall::Requested(
+            tl::types::PhoneCallRequested {
+                video: false,
+                id: 6,
+                access_hash: 7,
+                date: 0,
+                admin_id: 1,
+                participant_id: 2,
+                g_a_hash: vec![9; 32],
+                protocol: protocol(),
+            },
+        ));
+        assert!(matches!(
+            phone_call_from_tl(&req),
+            PhoneCall::Requested { admin_id: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn history_labels() {
+        assert_eq!(
+            call_label(true, Some(DiscardReason::Hangup), Some(65)),
+            "Outgoing call (1:05)"
+        );
+        assert_eq!(
+            call_label(false, Some(DiscardReason::Hangup), Some(3725)),
+            "Incoming call (1:02:05)"
+        );
+        assert_eq!(
+            call_label(false, Some(DiscardReason::Missed), None),
+            "Missed call"
+        );
+        assert_eq!(
+            call_label(false, Some(DiscardReason::Busy), None),
+            "Missed call"
+        );
+        assert_eq!(
+            call_label(true, Some(DiscardReason::Missed), None),
+            "Cancelled call"
+        );
+        assert_eq!(
+            call_label(true, Some(DiscardReason::Busy), None),
+            "Declined call"
+        );
+    }
+}
