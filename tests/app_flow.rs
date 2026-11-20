@@ -1912,8 +1912,11 @@ fn shared_tabs_page_lazily_and_queue_bounded_thumbnails() {
     let tab = app.info.as_ref().unwrap().tab(SharedKind::Media);
     assert_eq!(tab.items.len(), INFO_PAGE);
     assert!(tab.next.is_some() && !tab.loading());
-    // Thumbnails: only a few at a time, the rest wait in the queue.
-    assert_eq!(app.thumb_q.pending(), INFO_PAGE);
+    // Thumbnails: only the rows around the viewport are wanted (not the whole
+    // page), a few downloads at a time.
+    let wanted = app.info.as_ref().unwrap().wanted_thumbs().len();
+    assert!(wanted > 0 && wanted < INFO_PAGE, "{wanted} of {INFO_PAGE}");
+    assert_eq!(app.thumb_q.pending(), wanted);
 
     // Near the end of the panel the next page is requested (same path as scrolling).
     let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Media)));
@@ -1988,32 +1991,36 @@ fn failed_pages_show_retry_and_stale_pages_are_ignored() {
 
 #[test]
 fn thumbnail_cache_is_bounded_and_rejects_bad_images() {
+    use ferrogram::media::ThumbImage;
     let mut app = app_with_info(ALICE);
     let png = mock::mock_photo_png(1, 160, 120);
-    let _ = app.update(Message::Done(Done::Thumb {
+    let tile = || ThumbImage::decode(&png, 104).unwrap();
+    let _ = app.update(Message::Done(Done::ThumbReady {
         key: (ALICE, 5),
-        result: Ok(png.clone()),
+        result: Ok(tile()),
     }));
     assert!(app.thumbs.peek(&(ALICE, 5)).is_some());
-    // Garbage and another chat's thumbnail are not cached.
-    let _ = app.update(Message::Done(Done::Thumb {
+    // A failed decode and another chat's thumbnail are not cached.
+    let _ = app.update(Message::Done(Done::ThumbReady {
         key: (ALICE, 6),
-        result: Ok(vec![0u8; 3 * 1024 * 1024]),
+        result: Err(ferrogram::error::Error::Protocol("rejected".into())),
     }));
     assert!(app.thumbs.peek(&(ALICE, 6)).is_none());
-    let _ = app.update(Message::Done(Done::Thumb {
+    let _ = app.update(Message::Done(Done::ThumbReady {
         key: (mock::RUST_GROUP, 7),
-        result: Ok(png.clone()),
+        result: Ok(tile()),
     }));
     assert!(app.thumbs.peek(&(mock::RUST_GROUP, 7)).is_none());
-    // Many thumbnails never exceed the budget.
+    // Many thumbnails never exceed the (decoded) budget.
     for i in 0..3000 {
-        let _ = app.update(Message::Done(Done::Thumb {
+        let _ = app.update(Message::Done(Done::ThumbReady {
             key: (ALICE, 1000 + i),
-            result: Ok(png.clone()),
+            result: Ok(tile()),
         }));
     }
-    assert!(app.thumbs.bytes() <= ferrogram::app::info::THUMB_BUDGET + png.len());
+    let cost = tile().cost();
+    assert!(app.thumbs.bytes() <= ferrogram::app::info::THUMB_BUDGET + cost);
+    assert!(app.thumbs.len() > 100, "a few screens of tiles stay cached");
     // Closing the panel frees them.
     let _ = app.update(Message::Ui(Ui::ToggleInfo));
     assert!(app.thumbs.is_empty());

@@ -13,9 +13,9 @@ use super::widgets::{avatar_photo, emoji_plain, emoji_title, icon};
 use crate::app::{App, Message, Ui};
 use crate::model::{ChatKind, SharedBody, SharedItem, SharedKind};
 
+use crate::app::info::{CELL, COLUMNS, FOOTER_H, GAP, GRID_PAD, ROW_H, grid_rows};
+
 pub const PANEL_WIDTH: f32 = 340.0;
-const CELL: f32 = 104.0;
-const COLUMNS: usize = 3;
 
 pub fn view<'a>(app: &'a App) -> Option<Element<'a, Message>> {
     let panel = app.info.as_ref()?;
@@ -207,20 +207,33 @@ fn tab_content<'a>(app: &'a App, chat: i64, kind: SharedKind) -> Element<'a, Mes
         .unwrap_or_else(|| EMPTY.get_or_init(crate::app::info::SharedTab::default));
     let mut col = Column::new().width(Length::Fill);
     if kind.has_thumbs() {
-        let mut grid = Column::new().spacing(2).padding([2, 2]);
-        for chunk in tab.items.chunks(COLUMNS) {
-            let mut r = row![].spacing(2);
+        // Rows have a fixed height, so the ones outside the viewport (and a
+        // small margin) are replaced by two spacers of the exact height:
+        // layout, drawing and event handling stay constant however many
+        // items are loaded.
+        let total = grid_rows(tab.items.len());
+        let rows = panel.window(kind);
+        let mut grid = Column::new().width(Length::Fill);
+        grid = grid.push(Space::new().height(GRID_PAD + rows.start as f32 * ROW_H));
+        for chunk in tab.items.chunks(COLUMNS).skip(rows.start).take(rows.len()) {
+            let mut r = row![].spacing(GAP);
             for item in chunk {
                 r = r.push(thumb_cell(app, chat, item));
             }
-            grid = grid.push(r);
+            grid = grid.push(container(r).height(ROW_H).padding(iced::Padding {
+                left: GAP,
+                bottom: GAP,
+                ..iced::Padding::ZERO
+            }));
         }
+        grid = grid.push(Space::new().height((total - rows.end) as f32 * ROW_H));
         col = col.push(grid);
     } else {
         for item in &tab.items {
             col = col.push(list_row(app, chat, item));
         }
     }
+    let mut footer = Column::new().width(Length::Fill);
     let note = if tab.loading() {
         Some("Loading…".to_owned())
     } else if tab.failed {
@@ -231,7 +244,7 @@ fn tab_content<'a>(app: &'a App, chat: i64, kind: SharedKind) -> Element<'a, Mes
         None
     };
     if let Some(n) = note {
-        col = col.push(
+        footer = footer.push(
             container(text(n).size(m.font_s).color(p.text_muted))
                 .width(Length::Fill)
                 .align_x(Alignment::Center)
@@ -239,7 +252,7 @@ fn tab_content<'a>(app: &'a App, chat: i64, kind: SharedKind) -> Element<'a, Mes
         );
     }
     if tab.failed {
-        col = col.push(
+        footer = footer.push(
             container(
                 button(
                     text("Could not load. Try again")
@@ -255,6 +268,13 @@ fn tab_content<'a>(app: &'a App, chat: i64, kind: SharedKind) -> Element<'a, Mes
             .padding(8),
         );
     }
+    // Under a virtualised grid the footer has a fixed height, so the content
+    // height is exactly header + grid + footer (see `grid_top_from_content`).
+    col = col.push(if kind.has_thumbs() {
+        Element::from(container(footer).width(Length::Fill).height(FOOTER_H))
+    } else {
+        footer.into()
+    });
     col.into()
 }
 

@@ -160,6 +160,9 @@ pub enum Ui {
     CloseRequested,
     WindowResized(iced::Size),
     WindowMoved(iced::Point),
+    /// The window's scale factor (on open and when it changes): shared-media
+    /// thumbnails are made at the size they are drawn.
+    Rescaled(f32),
     OpenSettings,
     CloseSettings,
     SetCloseToTray(bool),
@@ -273,9 +276,15 @@ pub enum Done {
         offset: MessageId,
         result: Result<SharedPage, Error>,
     },
+    /// A shared-media preview was downloaded (encoded bytes).
     Thumb {
         key: (ChatId, MessageId),
         result: Result<Vec<u8>, Error>,
+    },
+    /// The same preview, decoded and cropped off the UI thread.
+    ThumbReady {
+        key: (ChatId, MessageId),
+        result: Result<crate::media::ThumbImage, Error>,
     },
     /// The mute call finished; on failure `previous` is restored.
     MuteDone {

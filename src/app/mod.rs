@@ -194,6 +194,8 @@ pub struct App {
     pub thumb_q: info::ThumbQueue,
     /// "Launch at login" as last read from / written to disk.
     pub autostart: bool,
+    /// The window's scale factor (1.0 until the window reports it).
+    pub scale: f32,
 }
 
 /// Requests from outside the window (see `remote`).
@@ -337,6 +339,7 @@ impl App {
             thumbs: Lru::new(info::THUMB_BUDGET),
             thumb_q: info::ThumbQueue::default(),
             autostart,
+            scale: 1.0,
             config,
         };
 
@@ -642,6 +645,7 @@ impl App {
                 Some(Message::Ui(Ui::WindowResized(size)))
             }
             iced::Event::Window(window::Event::Moved(p)) => Some(Message::Ui(Ui::WindowMoved(p))),
+            iced::Event::Window(window::Event::Rescaled(f)) => Some(Message::Ui(Ui::Rescaled(f))),
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 ..
@@ -826,6 +830,22 @@ impl App {
                 })
             },
         )
+    }
+
+    /// Queue the previews the visible grid rows (and a margin) still need,
+    /// dropping the ones scrolled away from, and start downloads.
+    fn request_thumbs(&mut self) -> Task<Message> {
+        let Some(panel) = &self.info else {
+            return Task::none();
+        };
+        let chat = panel.chat;
+        let wanted = panel.wanted_thumbs();
+        let thumbs = &self.thumbs;
+        self.thumb_q
+            .set_wanted(wanted.into_iter().map(|id| (chat, id)), |k| {
+                thumbs.peek(k).is_some()
+            });
+        self.pump_thumbs()
     }
 
     /// Start the queued thumbnail downloads that fit the concurrency limit.
@@ -1648,17 +1668,42 @@ impl App {
                     return Task::none();
                 };
                 panel.select(kind);
-                self.load_shared(kind)
+                Task::batch([self.load_shared(kind), self.request_thumbs()])
+            }
+            Ui::Rescaled(f) => {
+                let f = if f.is_finite() {
+                    f.clamp(0.5, 4.0)
+                } else {
+                    1.0
+                };
+                let changed = info::thumb_side(f) != info::thumb_side(self.scale);
+                self.scale = f;
+                if changed && self.info.is_some() {
+                    // Tiles of the old size are redone at the new one.
+                    self.reset_thumbs();
+                    return self.request_thumbs();
+                }
+                if changed {
+                    self.reset_thumbs();
+                }
+                Task::none()
             }
             Ui::InfoScrolled(vp) => {
+                // Remember where the panel is: the grid only builds (and
+                // fetches thumbnails for) the rows around the viewport.
+                if let Some(panel) = &mut self.info {
+                    let grid_top = panel.grid_top_from_content(vp.content_bounds().height);
+                    panel.set_view(vp.absolute_offset().y, vp.bounds().height, grid_top);
+                }
                 let bottom = vp.absolute_offset().y + vp.bounds().height;
-                if vp.content_bounds().height - bottom < INFO_LOAD_THRESHOLD
+                let more = if vp.content_bounds().height - bottom < INFO_LOAD_THRESHOLD
                     && let Some(kind) = self.info.as_ref().map(|p| p.tab)
                 {
                     self.load_shared(kind)
                 } else {
                     Task::none()
-                }
+                };
+                Task::batch([more, self.request_thumbs()])
             }
             Ui::SetNotifications(on) => self.chat_ui(Ui::SetMute(if on {
                 crate::model::MuteFor::Off
@@ -3068,13 +3113,8 @@ impl App {
                 };
                 match result {
                     Ok(page) => {
-                        let new = panel.tab_mut(kind).apply(offset, page);
-                        let thumbs = &self.thumbs;
-                        self.thumb_q
-                            .enqueue(new.into_iter().map(|id| (chat, id)), |k| {
-                                thumbs.peek(k).is_some()
-                            });
-                        self.pump_thumbs()
+                        panel.tab_mut(kind).apply(offset, page);
+                        self.request_thumbs()
                     }
                     Err(e) => {
                         if e.is_session_revoked() {
@@ -3086,20 +3126,48 @@ impl App {
                     }
                 }
             }
-            Done::Thumb { key, result } => {
+            Done::Thumb { key, result } => match result {
+                Ok(bytes) if state::photo_is_acceptable(&bytes) => {
+                    // Decode and crop to a fixed tile on a blocking thread:
+                    // the UI thread only ever sees small RGBA handles.
+                    let side = info::thumb_side(self.scale);
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                crate::media::ThumbImage::decode(&bytes, side)
+                                    .ok_or_else(|| Error::Protocol("thumbnail rejected".into()))
+                            })
+                            .await
+                            .map_err(|_| Error::Cancelled)?
+                        },
+                        move |result| Message::Done(Done::ThumbReady { key, result }),
+                    )
+                }
+                Ok(_) => {
+                    self.thumb_q.finish(key, false);
+                    self.pump_thumbs()
+                }
+                Err(e) => {
+                    warn!(error = %e, "thumbnail unavailable");
+                    self.thumb_q.finish(key, false);
+                    self.pump_thumbs()
+                }
+            },
+            Done::ThumbReady { key, result } => {
                 let ok = match result {
-                    Ok(bytes) if state::photo_is_acceptable(&bytes) => {
-                        let current = self.info.as_ref().is_some_and(|p| p.chat == key.0);
-                        if current {
-                            let cost = bytes.len().max(1024);
-                            self.thumbs
-                                .insert(key, image::Handle::from_bytes(bytes), cost);
+                    Ok(t) => {
+                        // Only while the panel still shows that chat.
+                        if self.info.as_ref().is_some_and(|p| p.chat == key.0) {
+                            let cost = t.cost();
+                            // One handle per thumbnail, kept until evicted:
+                            // `view` clones it, so its id never changes.
+                            let handle = image::Handle::from_rgba(t.width, t.height, t.rgba);
+                            self.thumbs.insert(key, handle, cost);
                         }
                         true
                     }
-                    Ok(_) => false,
                     Err(e) => {
-                        warn!(error = %e, "thumbnail unavailable");
+                        warn!(error = %e, "thumbnail not usable");
                         false
                     }
                 };
@@ -3239,7 +3307,9 @@ impl App {
                 let action = self.window.tray_ready(false);
                 self.apply_window(action)
             }
-            Done::WindowOpened(_) => Task::none(),
+            Done::WindowOpened(id) => {
+                window::scale_factor(id).map(|f| Message::Ui(Ui::Rescaled(f)))
+            }
             Done::AutostartSet(Ok(on)) => {
                 self.autostart = on;
                 Task::none()
