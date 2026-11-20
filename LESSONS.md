@@ -2,6 +2,18 @@
 
 Things learned while building Ferrogram, newest first.
 
+- **Check what the official apps register before choosing a call protocol.**
+  libtgvoip (2.4.4) is still the fallback string in Telegram Desktop but no
+  app registers it any more; the server picks one version from both lists,
+  so advertising only legacy versions fails silently. tgcalls V2
+  (8.0.0/9.0.0) is the common ground.
+- **Write protocol vectors with an independent tool.** STUN, SRTP and the
+  call KDF tests use values from Python hmac/hashlib and `openssl enc`, not
+  from memory: a remembered RFC 5769 MAC turned out to be wrong.
+- **`tokio::spawn` needs a runtime: start per-call engines inside a `Task`
+  future**, never in `update()`, and bring handles back through an
+  `Arc<Mutex<Option<_>>>` slot in the message.
+
 - **A modal backdrop must be `opaque`.** iced's `stack` only hides the cursor
   from the layers below when the top layer reports a mouse interaction, and a
   plain `mouse_area` reports none outside its content: the chat rows under

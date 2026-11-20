@@ -123,6 +123,16 @@ impl TrayModel {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ringing_call_needs_attention() {
+        let m = TrayModel {
+            ringing: true,
+            ..model()
+        };
+        assert!(m.needs_attention());
+        assert!(m.tooltip_title().contains("incoming call"));
+    }
+
     fn model() -> TrayModel {
         TrayModel::default()
     }

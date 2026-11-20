@@ -218,7 +218,10 @@ mod calls {
         let key = CallKey([7; 256]);
         let emoji = dh::emoji_fingerprint(&key, &[1; 256]);
         let mut s = outgoing();
-        s.push((800, Message::Done(Done::CallKey(Ok((key, emoji))))));
+        s.push((
+            800,
+            Message::Done(Done::CallKey(Ok(Box::new((key, emoji))))),
+        ));
         s.push((
             900,
             ui(Ui::CallEngine(EngineEvent::State(LinkState::Connected {

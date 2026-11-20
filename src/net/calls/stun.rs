@@ -113,7 +113,7 @@ impl Message {
             return None;
         }
         let len = usize::from(u16::from_be_bytes([b[2], b[3]]));
-        if len % 4 != 0 || 20 + len > b.len() {
+        if !len.is_multiple_of(4) || 20 + len > b.len() {
             return None;
         }
         let kind = u16::from_be_bytes([b[0], b[1]]);
@@ -143,7 +143,7 @@ fn write_attr(out: &mut Vec<u8>, t: u16, v: &[u8]) {
     out.extend_from_slice(&t.to_be_bytes());
     out.extend_from_slice(&u16::try_from(v.len()).unwrap_or(0).to_be_bytes());
     out.extend_from_slice(v);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }
@@ -333,7 +333,7 @@ mod tests {
             let mut p = base.clone();
             let i = (seed >> 8) as usize % p.len();
             p[i] = (seed >> 16) as u8;
-            if seed % 7 == 0 {
+            if seed.is_multiple_of(7) {
                 p.truncate((seed >> 4) as usize % p.len());
             }
             if let Some(m) = Message::decode(&p) {

@@ -425,7 +425,7 @@ impl Agent {
             .selected
             .and_then(|i| self.pairs.get(i))
             .map(|p| (p.local, p.target));
-        self.pairs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        self.pairs.sort_by_key(|p| std::cmp::Reverse(p.priority));
         self.selected = sel.and_then(|(l, t)| {
             self.pairs
                 .iter()
@@ -449,7 +449,7 @@ impl Agent {
                 out.extend_from_slice(&r.tag.to_le_bytes());
                 out.extend_from_slice(&u32::try_from(data.len()).ok()?.to_be_bytes());
                 out.extend_from_slice(&data);
-                while out.len() % 4 != 0 {
+                while !out.len().is_multiple_of(4) {
                     out.push(0);
                 }
                 Some(Transmit {
@@ -837,9 +837,7 @@ impl Agent {
                 if let Some(p) = self.pairs.get_mut(idx) {
                     p.state = PairState::Succeeded;
                 }
-                if self.controlling {
-                    self.select(idx);
-                } else if self.pairs.get(idx).is_some_and(|p| p.nominated) {
+                if self.controlling || self.pairs.get(idx).is_some_and(|p| p.nominated) {
                     self.select(idx);
                 }
             }

@@ -804,10 +804,10 @@ mod tests {
                 let at = rnd() as usize % p.len();
                 p[at] = rnd() as u8;
             }
-            if rnd() % 3 == 0 {
+            if rnd().is_multiple_of(3) {
                 p.truncate(rnd() as usize % (p.len() + 1));
             }
-            if rnd() % 5 == 0 {
+            if rnd().is_multiple_of(5) {
                 p.extend((0..rnd() % 40).map(|_| rnd() as u8));
             }
             if p.len() < 4 {

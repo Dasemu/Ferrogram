@@ -99,6 +99,9 @@ pub struct CallSession {
     pending_finish: Option<(Vec<u8>, i64)>,
 }
 
+/// What `confirm` yields: the key, its emoji and the final call.
+pub type Confirmed = (CallKey, [&'static str; 4], PhoneCall);
+
 /// Things the app must do; returned by the reducer, run as tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {

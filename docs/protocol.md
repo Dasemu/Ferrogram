@@ -28,6 +28,10 @@ app ──▶ net::TelegramApi (trait, async_trait)
 `send_text`, `send_file`, `edit_message`, `delete_messages`, `react`,
 `mark_read`, `search`, `download_photo`, `events`.
 
+Calls added: `call_config`, `dh_config`, `request_call`, `received_call`,
+`accept_call`, `confirm_call`, `discard_call`, `send_call_signaling`
+(defaults return "unsupported").
+
 Round 2 added: `more_dialogs` (continue the dialog iterator), `search_global`
 (`messages.searchGlobal`), `download_avatar`, `set_typing`, `save_draft`.
 
@@ -142,6 +146,81 @@ parsed back before conversion, so the deserialiser is exercised too.
   a bounded queue into a 12 MB LRU that is dropped when the panel closes or
   the chat changes. Photos open the viewer, other items jump to their
   message, links open in the browser (`desktop::open_url`: http(s) only).
+
+## Voice calls (one-to-one)
+
+Feasibility, evidence and the choice of protocol: `docs/calls-feasibility.md`.
+In short: the legacy libtgvoip protocol (2.4.4) is no longer registered by
+any official app, so Ferrogram speaks tgcalls V2 and advertises
+`library_versions = ["9.0.0", "8.0.0"]`, `min_layer 65`, `max_layer 92`,
+`udp_p2p`, `udp_reflector`. The server picks one version for both sides
+(`phoneCall.protocol.library_versions[0]`); anything else ends the call with
+"incompatible call version".
+
+**Signaling (`app/call.rs`, pure reducer).** Outgoing: `messages.getDhConfig`
+(random_length 256, `NotModified` reuses the cached p/g) → check p (2048-bit
+safe prime, Miller-Rabin on p and (p-1)/2, cached per process) and g (the
+quadratic-residue conditions) → `a` = random XOR server random, `g_a`
+checked to lie in `[2^1984, p - 2^1984]` → `phone.requestCall(g_a_hash =
+SHA-256(g_a))` → `phoneCallWaiting` (Ringing once `receive_date` is set) →
+`phoneCallAccepted(g_b)` → key `g_b^a mod p`, `key_fingerprint` = low 64
+bits of SHA-1(key) → `phone.confirmCall(g_a, fingerprint)` → `phoneCall`
+(connections). Incoming: `phoneCallRequested` → `phone.receivedCall`,
+notification, tray attention, window shown → Accept → `phone.acceptCall(g_b)`
+→ `phoneCall(g_a)`: check SHA-256(g_a) against the hash, derive the key and
+compare fingerprints. A second incoming call while busy is discarded with
+`Busy`. Hang-up reasons follow Telegram Desktop: cancelling an outgoing call
+before it is answered = `Missed`, declining = `Busy`, otherwise `Hangup` with
+the connected duration; the caller gives up after `call_ring_timeout_ms`
+(`phone.getCallConfig`, default 90 s). Updates that beat the RPC reply (an
+`Accepted` before `requestCall` returned) are kept until the DH half exists.
+
+**Key verification.** Four emoji from SHA-256(key || g_a): four big-endian
+64-bit chunks with the top bit cleared, each mod 333 into the protocol's
+emoji table (`net/calls/emoji.rs`), shown in the call panel with the
+official explanation.
+
+**Signaling channel (`net/calls/signaling.rs`).** JSON messages
+(`InitialSetup`, `NegotiateChannels`, `Candidates`, `MediaState`) inside the
+V2 framing (sequence numbers, acks, resend after 3 s), encrypted with the
+call key: `msg_key` = bytes 8..24 of SHA-256(key[88+x..120+x] || plaintext),
+MTProto 2.0 KDF, AES-256-CTR, x = 128 (+8 for packets from the callee).
+Sent with `phone.sendSignalingData`, received as
+`updatePhoneCallSignalingData`; early packets are buffered (64).
+
+**Transport (`net/calls/ice.rs`, `engine.rs`).** Own sans-IO ICE: host
+candidates on the default-route IPv4/IPv6 addresses (when `p2p_allowed`),
+relay candidates on Telegram reflectors (`phoneConnection`, UDP, 16-byte
+peer tag; numbered by their position among all reflector ids, sorted;
+announced as `reflector-<n>-<tag>.reflector`; "standalone" mode from
+`custom_parameters` supported). The caller is ICE-controlling with
+aggressive nomination and the DTLS client (`setup actpass`, callee
+`passive`); webrtc-dtls 0.12 with an ECDSA certificate whose SHA-256
+fingerprint is pinned through `InitialSetup`; SRTP `AES_CM_128_HMAC_SHA1_80`
+from the DTLS exporter (`net/calls/srtp.rs`). Content negotiation mirrors
+tgcalls: each side offers its audio stream (Opus PT 111, its SSRC), the
+other answers; on a race the caller wins.
+
+**Media (`net/calls/audio.rs`, `jitter.rs`).** Opus 48 kHz mono, 20 ms,
+32 kbit/s with in-band FEC; adaptive jitter buffer (2–10 frames, 50 max,
+FEC for single losses, PLC otherwise); cpal capture/playback on their own
+thread, linear resampling to the device rate; mute sends silence (the stream
+keeps running). Signal bars come from the loss rate per second. **No echo
+cancellation yet**: with loudspeakers the peer can hear itself; headphones
+avoid it.
+
+**Lifetime.** Nothing call-related exists until a call starts: the engine
+task, its sockets and the audio thread are created on `StartEngine` and
+dropped (off the UI thread) when the call ends. Engine events reach the app
+through a per-call `Subscription::run_with`.
+
+**Not done / limits.** No SCTP data channel (remote mute/battery state is not
+shown, and the peer does not see that we muted); no TURN/STUN from
+`phoneConnectionWebrtc` and no TCP reflectors (UDP-blocking networks will not
+connect); no video; no AEC/noise suppression; no `phone.setCallRating`;
+`network_use_mtproto` (an alternative media transport the server can ask
+for) is not implemented. Verified against our own engine and a fake
+reflector only; a call to an official app needs a real account.
 
 ## Not implemented (round 2)
 

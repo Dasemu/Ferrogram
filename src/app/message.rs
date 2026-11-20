@@ -284,19 +284,10 @@ pub enum Done {
     ScreenshotSaved,
     // one-to-one calls
     CallConfig(Result<crate::net::calls::CallConfig, Error>),
-    CallPlaced(Result<(crate::app::call::DhHalf, crate::net::calls::PhoneCall), Error>),
-    CallAccepted(Result<(crate::app::call::DhHalf, crate::net::calls::PhoneCall), Error>),
-    CallConfirmed(
-        Result<
-            (
-                crate::net::calls::dh::CallKey,
-                [&'static str; 4],
-                crate::net::calls::PhoneCall,
-            ),
-            Error,
-        >,
-    ),
-    CallKey(Result<(crate::net::calls::dh::CallKey, [&'static str; 4]), Error>),
+    CallPlaced(Result<Box<(crate::app::call::DhHalf, crate::net::calls::PhoneCall)>, Error>),
+    CallAccepted(Result<Box<(crate::app::call::DhHalf, crate::net::calls::PhoneCall)>, Error>),
+    CallConfirmed(Result<Box<crate::app::call::Confirmed>, Error>),
+    CallKey(Result<Box<(crate::net::calls::dh::CallKey, [&'static str; 4])>, Error>),
     CallMedia(crate::app::phone::MediaSlot),
     CallDevicesListed(Vec<String>, Vec<String>),
     /// A `phone.*` request without a result we need finished.

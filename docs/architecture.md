@@ -325,3 +325,16 @@ colours chosen by `id % 7`.
 * `app/info.rs` + `ui/info.rs`: right-hand panel (340 px), per-tab paging
   (`SharedTab`), bounded thumbnail queue and cache.
 * Layers: every dialog goes through `widgets::modal` (opaque backdrop).
+
+### 11.6 One-to-one calls
+
+* `net/calls/`: protocol and media (DH, signaling, STUN/ICE with reflectors,
+  SRTP, RTP, jitter buffer, Opus/cpal audio, the per-call engine task). Pure
+  pieces are sans-IO and unit-tested; `tests/call_loopback.rs` runs two
+  engines over loopback UDP, directly and through a fake reflector.
+* `app/call.rs`: pure reducer (`Calls`, `Phase`, `Cmd`) plus the async DH /
+  `phone.*` steps; `app/phone.rs` runs the commands, owns `CallMedia`
+  (engine + audio, dropped off the UI thread) and subscribes to engine events
+  per call. `ui/call.rs`: modal call panel and the in-call bar.
+* `mock_call.rs`: fake call server whose remote peer runs the real engine on
+  loopback with a test tone (`--mock` calls connect; `tests/call_flow.rs`).

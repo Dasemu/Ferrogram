@@ -3,6 +3,7 @@
 //! SRTP and Opus run for real. A sine tone goes in on each side and the other
 //! side must hear it. The second test blocks the direct path and routes
 //! everything through an in-process Telegram-style reflector.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

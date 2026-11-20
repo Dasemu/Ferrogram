@@ -251,20 +251,24 @@ impl App {
                 Task::none()
             }
             Done::CallConfig(Err(_)) | Done::CallSent(_) => Task::none(),
-            Done::CallPlaced(Ok((half, pc))) => {
+            Done::CallPlaced(Ok(b)) => {
+                let (half, pc) = *b;
                 let cmds = self.calls.placed(half, &pc, me, now());
                 self.run_call_cmds(cmds)
             }
-            Done::CallAccepted(Ok((half, pc))) => {
+            Done::CallAccepted(Ok(b)) => {
+                let (half, pc) = *b;
                 let cmds = self.calls.accepted(half, &pc, me, now());
                 self.run_call_cmds(cmds)
             }
-            Done::CallConfirmed(Ok((key, emoji, pc))) => {
+            Done::CallConfirmed(Ok(b)) => {
+                let (key, emoji, pc) = *b;
                 let mut cmds = self.calls.key_ready(key, emoji);
                 cmds.extend(self.calls.on_phone_call(&pc, me, now()));
                 self.run_call_cmds(cmds)
             }
-            Done::CallKey(Ok((key, emoji))) => {
+            Done::CallKey(Ok(b)) => {
+                let (key, emoji) = *b;
                 let cmds = self.calls.key_ready(key, emoji);
                 self.run_call_cmds(cmds)
             }
@@ -384,7 +388,7 @@ impl App {
         };
         match cmd {
             Cmd::Request { peer } => Task::perform(call::place(api, peer), |r| {
-                Message::Done(Done::CallPlaced(r))
+                Message::Done(Done::CallPlaced(r.map(Box::new)))
             }),
             Cmd::Received { call, peer } => {
                 let name = self
@@ -427,11 +431,11 @@ impl App {
                     return Task::none();
                 };
                 Task::perform(call::confirm(api, call, half, g_b), |r| {
-                    Message::Done(Done::CallConfirmed(r))
+                    Message::Done(Done::CallConfirmed(r.map(Box::new)))
                 })
             }
             Cmd::Accept { call } => Task::perform(call::accept(api, call), |r| {
-                Message::Done(Done::CallAccepted(r))
+                Message::Done(Done::CallAccepted(r.map(Box::new)))
             }),
             Cmd::Finish { g_a, fingerprint } => {
                 let Some(s) = self.calls.session.as_mut() else {
@@ -442,7 +446,7 @@ impl App {
                 };
                 s.g_a = Some(g_a.clone());
                 Task::perform(call::finish(half, hash, g_a, fingerprint), |r| {
-                    Message::Done(Done::CallKey(r))
+                    Message::Done(Done::CallKey(r.map(Box::new)))
                 })
             }
             Cmd::StartEngine => self.start_engine(),
