@@ -3,6 +3,8 @@
 
 pub mod background;
 pub mod call;
+mod chat_actions;
+pub mod chatmenu;
 pub mod folders;
 pub mod info;
 pub mod message;
@@ -21,6 +23,7 @@ use iced::{Subscription, Task, Theme, event, keyboard, window};
 use tracing::{info, warn};
 
 use background::{Action, Geometry, WindowState};
+pub use chatmenu::ChatSearch;
 pub use message::{Done, Message, Ui};
 use state::{
     ChatList, ComposeMode, Conversation, Lru, PAGE, TypingStep, TypingThrottle, TypingTracker,
@@ -67,14 +70,6 @@ pub const DIALOGS_LOAD_THRESHOLD: f32 = 300.0;
 pub const INFO_LOAD_THRESHOLD: f32 = 400.0;
 /// Avatar downloads in flight at once.
 pub const AVATAR_CONCURRENCY: usize = 6;
-
-#[derive(Debug, Clone, Default)]
-pub struct ChatSearch {
-    pub query: String,
-    pub results: Vec<ChatMessage>,
-    pub searching: bool,
-    pub submitted: bool,
-}
 
 /// First-run form for the Telegram API credentials.
 #[derive(Debug, Clone, Default)]
@@ -141,6 +136,14 @@ pub struct App {
     pub emoji_open: bool,
     pub menu_for: Option<MessageId>,
     pub chat_search: Option<ChatSearch>,
+    /// The chat header's ⋮ menu, when open.
+    pub header_menu: Option<chatmenu::HeaderMenu>,
+    /// A destructive action waiting for confirmation.
+    pub confirm: Option<chatmenu::Confirm>,
+    /// "Select messages" mode of the open chat.
+    pub selection: Option<chatmenu::Selection>,
+    /// Whether we blocked a user (from `users.getFullUser`), by chat id.
+    pub blocked: HashMap<ChatId, bool>,
     pub highlight: Option<MessageId>,
     pub conn: ConnState,
     pub focused: bool,
@@ -197,6 +200,8 @@ pub struct App {
     pub thumb_q: info::ThumbQueue,
     /// "Launch at login" as last read from / written to disk.
     pub autostart: bool,
+    /// The window's scale factor (1.0 until the window reports it).
+    pub scale: f32,
 }
 
 /// Requests from outside the window (see `remote`).
@@ -264,6 +269,7 @@ impl App {
 
         // First frame comes from the cache, never from the network.
         let cached = store.load_chats().unwrap_or_default();
+        let cached_defaults = store.load_notify_defaults().unwrap_or_default();
         let mut cached_folders = folders::FolderState::default();
         cached_folders.set_list(store.load_folders().unwrap_or_default());
         let mut app = Self {
@@ -277,7 +283,11 @@ impl App {
             auth: AuthState::Restoring,
             restore_attempt: 0,
             me: None,
-            chats: ChatList::new(cached),
+            chats: {
+                let mut list = ChatList::new(cached);
+                list.set_defaults(cached_defaults, chrono::Utc::now().timestamp());
+                list
+            },
             selected: None,
             conversation: None,
             sidebar_query: String::new(),
@@ -291,6 +301,10 @@ impl App {
             emoji_open: false,
             menu_for: None,
             chat_search: None,
+            header_menu: None,
+            confirm: None,
+            selection: None,
+            blocked: HashMap::new(),
             highlight: None,
             conn: ConnState::Connecting,
             focused: true,
@@ -334,6 +348,7 @@ impl App {
             thumbs: Lru::new(info::THUMB_BUDGET),
             thumb_q: info::ThumbQueue::default(),
             autostart,
+            scale: 1.0,
             config,
         };
 
@@ -640,10 +655,21 @@ impl App {
                 Some(Message::Ui(Ui::WindowResized(size)))
             }
             iced::Event::Window(window::Event::Moved(p)) => Some(Message::Ui(Ui::WindowMoved(p))),
+            iced::Event::Window(window::Event::Rescaled(f)) => Some(Message::Ui(Ui::Rescaled(f))),
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 ..
             }) => Some(Message::Ui(Ui::Escape)),
+            // Up / Down walk the in-chat search hits (ignored when no search
+            // is open, and when a widget used the key).
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::ArrowUp),
+                ..
+            }) => Some(Message::Ui(Ui::ChatSearchStep(chatmenu::Dir::Older))),
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                ..
+            }) => Some(Message::Ui(Ui::ChatSearchStep(chatmenu::Dir::Newer))),
             // Ctrl+V (any layout: the physical key). Delivered even when the
             // composer captured it for the text paste.
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
@@ -735,7 +761,11 @@ impl App {
     }
 
     fn on_signed_in(&mut self, user: Option<User>) -> Task<Message> {
-        let mut tasks = vec![self.fetch_dialogs(), self.fetch_folders()];
+        let mut tasks = vec![
+            self.fetch_dialogs(),
+            self.fetch_folders(),
+            self.fetch_notify_defaults(),
+        ];
         if let Some(u) = &user {
             let id = u.id.to_string();
             tasks.push(self.store_bg(move |s| s.set_kv("self_id", &id)));
@@ -811,6 +841,22 @@ impl App {
                 })
             },
         )
+    }
+
+    /// Queue the previews the visible grid rows (and a margin) still need,
+    /// dropping the ones scrolled away from, and start downloads.
+    fn request_thumbs(&mut self) -> Task<Message> {
+        let Some(panel) = &self.info else {
+            return Task::none();
+        };
+        let chat = panel.chat;
+        let wanted = panel.wanted_thumbs();
+        let thumbs = &self.thumbs;
+        self.thumb_q
+            .set_wanted(wanted.into_iter().map(|id| (chat, id)), |k| {
+                thumbs.peek(k).is_some()
+            });
+        self.pump_thumbs()
     }
 
     /// Start the queued thumbnail downloads that fit the concurrency limit.
@@ -1074,12 +1120,19 @@ impl App {
             Some(old) if old != chat => self.sync_draft(old),
             _ => Task::none(),
         };
+        // A search keeps running while it jumps around the same chat.
+        let same_chat = self.selected == Some(chat);
         self.selected = Some(chat);
         self.conversation = Some(conversation);
         self.compose_mode = ComposeMode::Normal;
         self.drop_pending();
         self.menu_for = None;
-        self.chat_search = None;
+        if !same_chat {
+            self.chat_search = None;
+        }
+        self.header_menu = None;
+        self.confirm = None;
+        self.selection = None;
         self.highlight = None;
         self.emoji_open = false;
         self.at_bottom = true;
@@ -1623,6 +1676,7 @@ impl App {
                 Task::none()
             }
             Ui::ToggleInfo => {
+                self.header_menu = None;
                 if self.close_info() {
                     Task::none()
                 } else {
@@ -1634,46 +1688,48 @@ impl App {
                     return Task::none();
                 };
                 panel.select(kind);
-                self.load_shared(kind)
+                Task::batch([self.load_shared(kind), self.request_thumbs()])
+            }
+            Ui::Rescaled(f) => {
+                let f = if f.is_finite() {
+                    f.clamp(0.5, 4.0)
+                } else {
+                    1.0
+                };
+                let changed = info::thumb_side(f) != info::thumb_side(self.scale);
+                self.scale = f;
+                if changed && self.info.is_some() {
+                    // Tiles of the old size are redone at the new one.
+                    self.reset_thumbs();
+                    return self.request_thumbs();
+                }
+                if changed {
+                    self.reset_thumbs();
+                }
+                Task::none()
             }
             Ui::InfoScrolled(vp) => {
+                // Remember where the panel is: the grid only builds (and
+                // fetches thumbnails for) the rows around the viewport.
+                if let Some(panel) = &mut self.info {
+                    let grid_top = panel.grid_top_from_content(vp.content_bounds().height);
+                    panel.set_view(vp.absolute_offset().y, vp.bounds().height, grid_top);
+                }
                 let bottom = vp.absolute_offset().y + vp.bounds().height;
-                if vp.content_bounds().height - bottom < INFO_LOAD_THRESHOLD
+                let more = if vp.content_bounds().height - bottom < INFO_LOAD_THRESHOLD
                     && let Some(kind) = self.info.as_ref().map(|p| p.tab)
                 {
                     self.load_shared(kind)
                 } else {
                     Task::none()
-                }
-            }
-            Ui::SetNotifications(on) => {
-                let Some(chat) = self.info.as_ref().map(|p| p.chat) else {
-                    return Task::none();
                 };
-                let previous = self.chats.get(chat).is_some_and(|c| c.muted);
-                let muted = !on;
-                if previous == muted {
-                    return Task::none();
-                }
-                self.chats.set_muted(chat, muted);
-                let persist = self.store_bg(move |s| s.set_muted(chat, muted));
-                let Some(api) = self.api.clone() else {
-                    return persist;
-                };
-                Task::batch([
-                    persist,
-                    Task::perform(
-                        async move { api.set_muted(chat, muted).await },
-                        move |result| {
-                            Message::Done(Done::MuteDone {
-                                chat,
-                                previous,
-                                result,
-                            })
-                        },
-                    ),
-                ])
+                Task::batch([more, self.request_thumbs()])
             }
+            Ui::SetNotifications(on) => self.chat_ui(Ui::SetMute(if on {
+                crate::model::MuteFor::Off
+            } else {
+                crate::model::MuteFor::Forever
+            })),
             Ui::OpenLink(url) => Task::perform(
                 async move {
                     tokio::task::spawn_blocking(move || crate::desktop::open_url(&url))
@@ -1708,6 +1764,7 @@ impl App {
             }
             Ui::ChatInFolder(chat, fid) => {
                 self.folders.chat_menu = None;
+                self.header_menu = None;
                 let (Some(c), Some(mut f)) = (
                     self.chats.get(chat).cloned(),
                     self.folders.get(fid).cloned(),
@@ -1783,6 +1840,7 @@ impl App {
                 ])
             }
             Ui::FolderNew(chat) => {
+                self.header_menu = None;
                 self.folders.chat_menu = None;
                 self.folders.tab_menu = None;
                 let mut ed = folders::FolderEditor::create(self.folders.next_id());
@@ -2013,59 +2071,31 @@ impl App {
                     None => Task::none(),
                 }
             }
-            Ui::ToggleChatSearch => {
-                if self.chat_search.take().is_none() {
-                    self.chat_search = Some(ChatSearch::default());
-                    return operation::focus(Id::new(CHAT_SEARCH_ID));
-                }
-                Task::none()
-            }
-            Ui::ChatSearchInput(q) => {
-                if let Some(s) = &mut self.chat_search {
-                    s.query = q;
-                    s.submitted = false;
-                }
-                Task::none()
-            }
-            Ui::ChatSearchSubmit => {
-                let (Some(s), Some(chat), Some(api)) =
-                    (&mut self.chat_search, self.selected, self.api.clone())
-                else {
-                    return Task::none();
-                };
-                let query = s.query.trim().to_owned();
-                if query.is_empty() {
-                    return Task::none();
-                }
-                s.searching = true;
-                s.submitted = true;
-                info!(query = %Redacted(&query), "in-chat search");
-                let store = self.store.clone();
-                let q2 = query.clone();
-                let local = Task::perform(
-                    async move { store.call(move |s| s.search_local(chat, &q2, 50)).await },
-                    {
-                        let query = query.clone();
-                        move |result| {
-                            Message::Done(Done::SearchResults {
-                                chat,
-                                query: format!("local:{query}"),
-                                result,
-                            })
-                        }
-                    },
-                );
-                let q3 = query.clone();
-                let remote =
-                    Task::perform(async move { api.search(chat, q3).await }, move |result| {
-                        Message::Done(Done::SearchResults {
-                            chat,
-                            query: query.clone(),
-                            result,
-                        })
-                    });
-                Task::batch([local, remote])
-            }
+            Ui::ToggleChatSearch
+            | Ui::OpenChatSearch
+            | Ui::ChatSearchInput(_)
+            | Ui::ChatSearchSubmit
+            | Ui::ChatSearchDue(_)
+            | Ui::ChatSearchStep(_)
+            | Ui::ChatSearchFrom(_)
+            | Ui::ChatSearchFromPicker
+            | Ui::ChatSearchFromQuery(_)
+            | Ui::ToggleHeaderMenu
+            | Ui::HeaderMenuPage(_)
+            | Ui::CloseHeaderMenu
+            | Ui::SetMute(_)
+            | Ui::AskClearHistory
+            | Ui::AskDeleteChat
+            | Ui::AskLeave
+            | Ui::ConfirmRevoke(_)
+            | Ui::ConfirmAccept
+            | Ui::ConfirmCancel
+            | Ui::ToggleBlock
+            | Ui::StartSelect
+            | Ui::ToggleSelect(_)
+            | Ui::CancelSelect
+            | Ui::AskDeleteSelected
+            | Ui::CopySelected => self.chat_ui(ui),
             Ui::ScrollToBottom => {
                 if self.conversation.as_ref().is_some_and(|c| c.detached) {
                     return self.reattach();
@@ -2180,7 +2210,9 @@ impl App {
                     }
                     return Task::none();
                 }
-                let closed = std::mem::take(&mut self.folders.manager_open)
+                let closed = self.confirm.take().is_some()
+                    || self.header_menu.take().is_some()
+                    || std::mem::take(&mut self.folders.manager_open)
                     || self.folders.chat_menu.take().is_some()
                     || self.folders.tab_menu.take().is_some()
                     || std::mem::take(&mut self.settings_open)
@@ -2194,7 +2226,10 @@ impl App {
                     Task::none()
                 } else if self.compose_mode != ComposeMode::Normal {
                     self.update_ui(Ui::CancelCompose)
+                } else if self.selection.take().is_some() {
+                    Task::none()
                 } else if self.chat_search.take().is_some() {
+                    self.highlight = None;
                     Task::none()
                 } else if !self.sidebar_query.is_empty() {
                     self.update_ui(Ui::ClearSidebarSearch)
@@ -2217,6 +2252,9 @@ impl App {
                 if !self.config.mock {
                     self.now = chrono::Utc::now().timestamp();
                 }
+                // Timed mutes run out: badges, tray count and notifications
+                // follow.
+                self.chats.refresh_notify(chrono::Utc::now().timestamp());
                 Task::none()
             }
         }
@@ -2526,15 +2564,19 @@ impl App {
                         chrono::Utc::now().timestamp(),
                     )
                 {
+                    let eff = self
+                        .chats
+                        .effective(m.chat_id, chrono::Utc::now().timestamp());
                     let (title, body) = state::notification_text(
                         self.chats.get(m.chat_id),
                         m,
-                        self.config.notification_preview,
+                        self.config.notification_preview && eff.is_none_or(|e| e.show_previews),
                     );
                     crate::desktop::notify(crate::desktop::Toast {
                         title,
                         body,
                         chat: Some(m.chat_id),
+                        silent: eff.is_some_and(|e| e.silent),
                     });
                 }
                 let m2 = m.clone();
@@ -2589,9 +2631,18 @@ impl App {
                     self.typing.apply(*chat, *user, *action, Self::now_ms());
                 }
             }
-            Event::Muted { chat, muted } => {
-                let (chat, muted) = (*chat, *muted);
-                tasks.push(self.store_bg(move |s| s.set_muted(chat, muted)));
+            Event::Notify { target, settings } => {
+                let settings = *settings;
+                match *target {
+                    crate::model::NotifyTarget::Chat(chat) => {
+                        tasks.push(self.store_bg(move |s| s.set_notify(chat, &settings)));
+                    }
+                    crate::model::NotifyTarget::Scope(scope) => {
+                        let mut d = *self.chats.defaults();
+                        d.set(scope, settings);
+                        tasks.push(self.store_bg(move |s| s.save_notify_defaults(&d)));
+                    }
+                }
             }
             Event::ReadInbox { .. } | Event::UserStatus { .. } => {}
         }
@@ -2649,6 +2700,10 @@ impl App {
         self.compose_mode = ComposeMode::Normal;
         self.drop_pending();
         self.chat_search = None;
+        self.header_menu = None;
+        self.confirm = None;
+        self.selection = None;
+        self.blocked.clear();
         self.sidebar_messages.clear();
         self.sidebar_global.clear();
         self.global_searching = false;
@@ -2987,32 +3042,39 @@ impl App {
                 }
                 Task::none()
             }
-            Done::SearchResults {
+            Done::SearchPage {
                 chat,
-                query,
+                version,
+                offset,
                 result,
-            } => {
-                let Some(s) = &mut self.chat_search else {
-                    return Task::none();
-                };
-                if self.selected != Some(chat) {
-                    return Task::none();
+            } => self.on_search_page(chat, version, offset, result),
+            Done::Members { chat, result } => self.on_members(chat, result),
+            Done::NotifyDefaults(result) => match result {
+                Ok(d) => {
+                    self.chats.set_defaults(d, chrono::Utc::now().timestamp());
+                    self.store_bg(move |s| s.save_notify_defaults(&d))
                 }
-                if let Some(local) = query.strip_prefix("local:") {
-                    // Instant results from the cache, replaced by the server's.
-                    if s.searching && local == s.query.trim() {
-                        s.results = result.unwrap_or_default();
-                    }
-                    return Task::none();
+                Err(e) => {
+                    // Defaults are best effort: the cached ones stay.
+                    warn!(error = %e, "could not load notification defaults");
+                    Task::none()
                 }
-                if query == s.query.trim() {
-                    s.searching = false;
-                    match result {
-                        Ok(r) => s.results = r,
-                        Err(e) => return self.on_error(e),
-                    }
+            },
+            Done::ChatActionDone { action, result } => self.on_chat_action_done(action, result),
+            Done::BlockDone {
+                chat,
+                blocked,
+                result,
+            } => self.on_block_done(chat, blocked, result),
+            Done::RollbackMany { old, error } => {
+                if let Some(conv) = self
+                    .conversation
+                    .as_mut()
+                    .filter(|c| old.first().is_some_and(|m| m.chat_id == c.chat_id))
+                {
+                    conv.merge(old);
                 }
-                Task::none()
+                self.on_error(error)
             }
             Done::FileStat { path, result } => match result {
                 Ok((_, true)) => self.toast("Folders can't be sent. Drop a file instead.".into()),
@@ -3052,6 +3114,10 @@ impl App {
             Done::ImageCopied(Ok(())) => self.toast("Image copied.".into()),
             Done::ImageCopied(Err(e)) => self.on_error(e),
             Done::PeerInfo { chat, result } => {
+                // The ⋮ menu needs `blocked` even when the panel is closed.
+                if let Ok(info) = &result {
+                    self.blocked.insert(chat, info.blocked);
+                }
                 let Some(panel) = self.info.as_mut().filter(|p| p.chat == chat) else {
                     return Task::none();
                 };
@@ -3076,13 +3142,8 @@ impl App {
                 };
                 match result {
                     Ok(page) => {
-                        let new = panel.tab_mut(kind).apply(offset, page);
-                        let thumbs = &self.thumbs;
-                        self.thumb_q
-                            .enqueue(new.into_iter().map(|id| (chat, id)), |k| {
-                                thumbs.peek(k).is_some()
-                            });
-                        self.pump_thumbs()
+                        panel.tab_mut(kind).apply(offset, page);
+                        self.request_thumbs()
                     }
                     Err(e) => {
                         if e.is_session_revoked() {
@@ -3094,20 +3155,48 @@ impl App {
                     }
                 }
             }
-            Done::Thumb { key, result } => {
+            Done::Thumb { key, result } => match result {
+                Ok(bytes) if state::photo_is_acceptable(&bytes) => {
+                    // Decode and crop to a fixed tile on a blocking thread:
+                    // the UI thread only ever sees small RGBA handles.
+                    let side = info::thumb_side(self.scale);
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                crate::media::ThumbImage::decode(&bytes, side)
+                                    .ok_or_else(|| Error::Protocol("thumbnail rejected".into()))
+                            })
+                            .await
+                            .map_err(|_| Error::Cancelled)?
+                        },
+                        move |result| Message::Done(Done::ThumbReady { key, result }),
+                    )
+                }
+                Ok(_) => {
+                    self.thumb_q.finish(key, false);
+                    self.pump_thumbs()
+                }
+                Err(e) => {
+                    warn!(error = %e, "thumbnail unavailable");
+                    self.thumb_q.finish(key, false);
+                    self.pump_thumbs()
+                }
+            },
+            Done::ThumbReady { key, result } => {
                 let ok = match result {
-                    Ok(bytes) if state::photo_is_acceptable(&bytes) => {
-                        let current = self.info.as_ref().is_some_and(|p| p.chat == key.0);
-                        if current {
-                            let cost = bytes.len().max(1024);
-                            self.thumbs
-                                .insert(key, image::Handle::from_bytes(bytes), cost);
+                    Ok(t) => {
+                        // Only while the panel still shows that chat.
+                        if self.info.as_ref().is_some_and(|p| p.chat == key.0) {
+                            let cost = t.cost();
+                            // One handle per thumbnail, kept until evicted:
+                            // `view` clones it, so its id never changes.
+                            let handle = image::Handle::from_rgba(t.width, t.height, t.rgba);
+                            self.thumbs.insert(key, handle, cost);
                         }
                         true
                     }
-                    Ok(_) => false,
                     Err(e) => {
-                        warn!(error = %e, "thumbnail unavailable");
+                        warn!(error = %e, "thumbnail not usable");
                         false
                     }
                 };
@@ -3121,8 +3210,9 @@ impl App {
             } => match result {
                 Ok(()) => Task::none(),
                 Err(e) => {
-                    self.chats.set_muted(chat, previous);
-                    let persist = self.store_bg(move |s| s.set_muted(chat, previous));
+                    self.chats
+                        .set_notify(chat, previous, chrono::Utc::now().timestamp());
+                    let persist = self.store_bg(move |s| s.set_notify(chat, &previous));
                     Task::batch([persist, self.on_error(e)])
                 }
             },
@@ -3246,7 +3336,9 @@ impl App {
                 let action = self.window.tray_ready(false);
                 self.apply_window(action)
             }
-            Done::WindowOpened(_) => Task::none(),
+            Done::WindowOpened(id) => {
+                window::scale_factor(id).map(|f| Message::Ui(Ui::Rescaled(f)))
+            }
             Done::AutostartSet(Ok(on)) => {
                 self.autostart = on;
                 Task::none()

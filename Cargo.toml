@@ -1,6 +1,6 @@
 [package]
 name = "ferrogram"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 license = "MIT"
 description = "Lightweight native Telegram desktop client written in Rust (unofficial)"
@@ -54,6 +54,8 @@ tempfile = "3"
 # Headless layout tests (cursor/hover behaviour of the real views); already in the iced tree.
 iced_tiny_skia = "0.14"
 iced_runtime = "0.14"
+# Rasterise the info panel on the CPU in the scroll benchmark; both are already in the iced tree.
+tiny-skia = "0.11"
 zbus = "5"
 
 [profile.release]

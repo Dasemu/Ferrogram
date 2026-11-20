@@ -13,6 +13,23 @@ Things learned while building Ferrogram, newest first.
 - **`tokio::spawn` needs a runtime: start per-call engines inside a `Task`
   future**, never in `update()`, and bring handles back through an
   `Arc<Mutex<Option<_>>>` slot in the message.
+- **On tiny-skia, an image is only cheap when it is drawn at its own size.**
+  Every `draw_image` whose destination differs from the source runs a
+  bilinear pipeline on the CPU, per frame, and the renderer drops decoded
+  images that were not drawn in the last frame, so a grid of 20 oversized
+  previews cost ~2.5x the frame time of 1:1 tiles (measured, debug build).
+  Decode and crop previews to the physical cell size off the UI thread, build
+  one `Handle::from_rgba` each, and keep a fixed row height so the view can
+  skip rows outside the viewport.
+- **A muted chat is not a boolean.** `mute_until` can be unset (use the
+  default of that kind of chat), in the past (unmuted) or in the future, and
+  the account defaults are a separate call. Derive `muted` in one place and
+  send an explicit `0` to unmute, or a "muted by default" setting wins again.
+- **Benchmarks that reuse one frame measure the cache, not the scroll.**
+  Feed wheel events through a persisted `UserInterface` cache and deliver the
+  `on_scroll` messages, or new rows never get drawn for the first time.
+- **`messages.deleteHistory` answers "more to do".** Repeat while
+  `offset > 0`, with a hard cap.
 
 - **A modal backdrop must be `opaque`.** iced's `stack` only hides the cursor
   from the layers below when the top layer reports a mouse interaction, and a

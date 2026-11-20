@@ -10,7 +10,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Draft, Media, Message, MessageId, Reaction, SendState,
+    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Draft, Media, Message, MessageId, NotifyDefaults,
+    NotifySettings, Reaction, SendState,
 };
 
 pub mod avatars;
@@ -21,6 +22,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migration_003.sql"),
     include_str!("migration_004.sql"),
     include_str!("migration_005.sql"),
+    include_str!("migration_006.sql"),
 ];
 
 /// Cheap-to-clone handle. Sync methods are for `boot()` and tests; the app
@@ -102,14 +104,16 @@ impl Store {
         for c in chats {
             tx.execute(
                 "INSERT INTO chats (id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id,
-                   draft_text, draft_reply, draft_date, contact)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                   draft_text, draft_reply, draft_date, contact,
+                   notify_mute_until, notify_silent, notify_previews)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                  ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, title=excluded.title, unread=excluded.unread,
                    muted=excluded.muted, pinned=excluded.pinned, read_outbox=excluded.read_outbox,
                    read_inbox=excluded.read_inbox, last_date=excluded.last_date, last_message_id=excluded.last_message_id,
                    photo_id=excluded.photo_id, draft_text=excluded.draft_text,
                    draft_reply=excluded.draft_reply, draft_date=excluded.draft_date,
-                   contact=excluded.contact",
+                   contact=excluded.contact, notify_mute_until=excluded.notify_mute_until,
+                   notify_silent=excluded.notify_silent, notify_previews=excluded.notify_previews",
                 params![
                     c.id,
                     c.kind.as_str(),
@@ -126,6 +130,9 @@ impl Store {
                     c.draft.as_ref().and_then(|d| d.reply_to),
                     c.draft.as_ref().map(|d| d.date),
                     c.contact,
+                    c.notify.mute_until,
+                    c.notify.silent,
+                    c.notify.show_previews,
                 ],
             )?;
             if let Some(m) = &c.last_message {
@@ -161,10 +168,12 @@ impl Store {
 
     /// Chats ordered like the official client: pinned first, then by activity.
     pub fn load_chats(&self) -> Result<Vec<Chat>> {
+        let now = chrono::Utc::now().timestamp();
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, kind, title, unread, muted, pinned, read_outbox, read_inbox, last_date, last_message_id, photo_id,
-                    draft_text, draft_reply, draft_date, contact
+                    draft_text, draft_reply, draft_date, contact,
+                    notify_mute_until, notify_silent, notify_previews
              FROM chats ORDER BY pinned DESC, last_date DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -174,7 +183,12 @@ impl Store {
                 r.get::<_, String>(2)?,
             );
             c.unread_count = r.get(3)?;
-            c.muted = r.get(4)?;
+            c.notify = NotifySettings {
+                mute_until: r.get(15)?,
+                silent: r.get(16)?,
+                show_previews: r.get(17)?,
+            };
+            c.muted = c.notify.muted_at(now).unwrap_or(false);
             c.pinned = r.get(5)?;
             c.read_outbox_max_id = r.get(6)?;
             c.read_inbox_max_id = r.get(7)?;
@@ -199,11 +213,51 @@ impl Store {
         Ok(out)
     }
 
-    pub fn set_muted(&self, chat: ChatId, muted: bool) -> Result<()> {
+    /// Cache a chat's own notification settings.
+    pub fn set_notify(&self, chat: ChatId, n: &NotifySettings) -> Result<()> {
         self.conn()?.execute(
-            "UPDATE chats SET muted = ?2 WHERE id = ?1",
-            params![chat, muted],
+            "UPDATE chats SET notify_mute_until = ?2, notify_silent = ?3, notify_previews = ?4 WHERE id = ?1",
+            params![chat, n.mute_until, n.silent, n.show_previews],
         )?;
+        Ok(())
+    }
+
+    /// Cache the account-wide notification defaults (JSON in `kv`).
+    pub fn save_notify_defaults(&self, d: &NotifyDefaults) -> Result<()> {
+        let json = serde_json::to_string(d).map_err(|e| Error::Store(e.to_string()))?;
+        self.set_kv("notify_defaults", &json)
+    }
+
+    /// The cached defaults; unset when missing or unreadable.
+    pub fn load_notify_defaults(&self) -> Result<NotifyDefaults> {
+        Ok(self
+            .get_kv("notify_defaults")?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default())
+    }
+
+    /// Forget a chat and its messages (deleted or left).
+    pub fn delete_chat(&self, chat: ChatId) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM chats WHERE id = ?1", [chat])?;
+        tx.execute("DELETE FROM messages WHERE chat_id = ?1", [chat])?;
+        tx.execute("DELETE FROM history_ranges WHERE chat_id = ?1", [chat])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop a chat's messages but keep the chat (history cleared).
+    pub fn clear_chat(&self, chat: ChatId) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM messages WHERE chat_id = ?1", [chat])?;
+        tx.execute("DELETE FROM history_ranges WHERE chat_id = ?1", [chat])?;
+        tx.execute(
+            "UPDATE chats SET unread = 0, last_message_id = NULL WHERE id = ?1",
+            [chat],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -526,6 +580,109 @@ mod tests {
         c.pinned = pinned;
         c.last_message = Some(Message::text(id, 10, false, date, "last"));
         c
+    }
+
+    #[test]
+    fn notify_settings_roundtrip_and_unset_stays_unset() {
+        let s = Store::open_in_memory().unwrap();
+        let mut c = chat(1, 5, false);
+        c.notify = NotifySettings {
+            mute_until: Some(1_900_000_000),
+            silent: Some(true),
+            show_previews: Some(false),
+        };
+        s.upsert_chats(&[c, chat(2, 4, false)]).unwrap();
+        let loaded = s.load_chats().unwrap();
+        let one = loaded.iter().find(|c| c.id == 1).unwrap();
+        assert_eq!(one.notify.mute_until, Some(1_900_000_000));
+        assert_eq!(one.notify.silent, Some(true));
+        assert_eq!(one.notify.show_previews, Some(false));
+        assert!(one.muted, "far in the future");
+        let two = loaded.iter().find(|c| c.id == 2).unwrap();
+        assert_eq!(two.notify, NotifySettings::default());
+        assert!(!two.muted);
+        // set_notify updates in place; an expired mute loads as unmuted.
+        s.set_notify(
+            1,
+            &NotifySettings {
+                mute_until: Some(10),
+                ..NotifySettings::default()
+            },
+        )
+        .unwrap();
+        let again = s.load_chats().unwrap();
+        let one = again.iter().find(|c| c.id == 1).unwrap();
+        assert_eq!(one.notify.mute_until, Some(10));
+        assert!(!one.muted);
+        assert_eq!(one.notify.silent, None);
+    }
+
+    #[test]
+    fn notify_defaults_are_cached_and_bad_json_is_ignored() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.load_notify_defaults().unwrap(), NotifyDefaults::default());
+        let d = NotifyDefaults {
+            broadcasts: NotifySettings {
+                mute_until: Some(crate::model::MUTE_FOREVER),
+                silent: None,
+                show_previews: Some(false),
+            },
+            ..NotifyDefaults::default()
+        };
+        s.save_notify_defaults(&d).unwrap();
+        assert_eq!(s.load_notify_defaults().unwrap(), d);
+        s.set_kv("notify_defaults", "{broken").unwrap();
+        assert_eq!(s.load_notify_defaults().unwrap(), NotifyDefaults::default());
+    }
+
+    #[test]
+    fn muted_chats_cached_before_migration_6_stay_muted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("old.sqlite3");
+        {
+            let conn = Connection::open(&p).unwrap();
+            for sql in &MIGRATIONS[..5] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 5).unwrap();
+            conn.execute(
+                "INSERT INTO chats (id, kind, title, muted) VALUES (7, 'group', 'G', 1), (8, 'user', 'U', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        let chats = s.load_chats().unwrap();
+        assert!(chats.iter().find(|c| c.id == 7).unwrap().muted);
+        assert!(!chats.iter().find(|c| c.id == 8).unwrap().muted);
+    }
+
+    #[test]
+    fn delete_and_clear_chat_drop_messages() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_chats(&[chat(1, 5, false), chat(2, 4, false)])
+            .unwrap();
+        s.upsert_messages(&[
+            Message::text(1, 1, false, 1, "a"),
+            Message::text(2, 1, false, 1, "b"),
+        ])
+        .unwrap();
+        s.clear_chat(1).unwrap();
+        assert!(s.get_message(1, 1).unwrap().is_none());
+        assert!(s.get_message(2, 1).unwrap().is_some());
+        let c1 = s
+            .load_chats()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == 1)
+            .unwrap();
+        assert!(
+            c1.last_message.is_none() && c1.unread_count == 0,
+            "chat stays, empty"
+        );
+        s.delete_chat(2).unwrap();
+        assert!(s.load_chats().unwrap().iter().all(|c| c.id != 2));
+        assert!(s.get_message(2, 1).unwrap().is_none());
     }
 
     #[test]

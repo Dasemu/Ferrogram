@@ -99,3 +99,75 @@ fn view_builds_the_same_icon_handles_every_frame() {
     );
     assert_ne!(Icon::Search.handle().id(), Icon::Menu.handle().id());
 }
+
+fn open_chat(app: &mut App, chat: i64) {
+    let _ = app.update(Message::Ui(Ui::SelectChat(chat)));
+}
+
+/// Lay the whole view out (no cursor): proves it builds without panicking.
+fn lays_out(app: &App) {
+    let mut renderer = renderer();
+    let _ = UserInterface::build(
+        ferrogram::ui::view(app),
+        WINDOW,
+        Cache::default(),
+        &mut renderer,
+    );
+}
+
+#[test]
+fn header_menu_backdrop_hides_the_cursor_from_the_chat_list() {
+    let mut app = signed_in_app();
+    open_chat(&mut app, mock::ALICE);
+    assert_eq!(interaction_at(&app, ROW), mouse::Interaction::Pointer);
+    let _ = app.update(Message::Ui(Ui::ToggleHeaderMenu));
+    assert!(app.header_menu.is_some());
+    assert_ne!(
+        interaction_at(&app, ROW),
+        mouse::Interaction::Pointer,
+        "the menu's backdrop must swallow hover from the rows below"
+    );
+    // Entries of the menu itself are buttons: pointer inside the card.
+    // (card is at the top right of the chat pane, under the header)
+    let inside = Point::new(WINDOW.width - 120.0, 90.0);
+    assert_eq!(interaction_at(&app, inside), mouse::Interaction::Pointer);
+}
+
+#[test]
+fn header_widgets_lay_out_for_every_state() {
+    use ferrogram::app::chatmenu::HeaderMenu;
+    let mut app = signed_in_app();
+    open_chat(&mut app, mock::RUST_GROUP);
+    for page in [HeaderMenu::Main, HeaderMenu::Mute, HeaderMenu::Folders] {
+        let _ = app.update(Message::Ui(Ui::CloseHeaderMenu));
+        let _ = app.update(Message::Ui(Ui::ToggleHeaderMenu));
+        let _ = app.update(Message::Ui(Ui::HeaderMenuPage(page)));
+        lays_out(&app);
+    }
+    let _ = app.update(Message::Ui(Ui::CloseHeaderMenu));
+    // Search with a member filter and the open picker.
+    let _ = app.update(Message::Ui(Ui::OpenChatSearch));
+    let _ = app.update(Message::Ui(Ui::ChatSearchInput("rust".into())));
+    let _ = app.update(Message::Ui(Ui::ChatSearchFromPicker));
+    lays_out(&app);
+    let _ = app.update(Message::Ui(Ui::ToggleChatSearch));
+    // Selection bar, and each confirmation dialog.
+    let _ = app.update(Message::Ui(Ui::StartSelect));
+    lays_out(&app);
+    let _ = app.update(Message::Ui(Ui::CancelSelect));
+    for ask in [Ui::AskClearHistory, Ui::AskDeleteChat, Ui::AskLeave] {
+        let _ = app.update(Message::Ui(ask));
+        assert!(app.confirm.is_some());
+        lays_out(&app);
+        let _ = app.update(Message::Ui(Ui::ConfirmCancel));
+    }
+}
+
+#[test]
+fn confirm_dialog_backdrop_hides_the_cursor() {
+    let mut app = signed_in_app();
+    open_chat(&mut app, mock::ALICE);
+    let _ = app.update(Message::Ui(Ui::AskClearHistory));
+    assert!(app.confirm.is_some());
+    assert_ne!(interaction_at(&app, ROW), mouse::Interaction::Pointer);
+}

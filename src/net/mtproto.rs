@@ -26,8 +26,8 @@ use crate::auth::vault::Vault;
 use crate::config::ApiCredentials;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
-    Chat, ChatId, ChatKind, ConnState, Folder, GlobalHit, Message, MessageId, PeerInfo, Presence,
-    User,
+    Chat, ChatId, ChatKind, ConnState, Folder, GlobalHit, Member, Message, MessageId,
+    NotifyDefaults, NotifyScope, PeerInfo, Presence, User,
 };
 
 type UpdatesRx = mpsc::Receiver<grammers_session::updates::UpdatesLike>;
@@ -43,6 +43,8 @@ pub struct GrammersApi {
     /// `InputPeer`s (with access hashes) named by the account's folders, so a
     /// folder can be saved again even for chats outside the loaded list.
     folder_peers: Mutex<HashMap<ChatId, grammers_client::tl::enums::InputPeer>>,
+    /// Access hashes of group members seen by `members`, for "from:" search.
+    member_peers: Mutex<HashMap<i64, grammers_client::tl::enums::InputPeer>>,
     /// Where to download the preview of the photos/videos a shared-media
     /// page listed (bounded FIFO), so no extra lookup per thumbnail.
     thumbs:
@@ -164,6 +166,7 @@ impl GrammersApi {
             password_token: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             folder_peers: Mutex::new(HashMap::new()),
+            member_peers: Mutex::new(HashMap::new()),
             thumbs: Mutex::new(std::collections::VecDeque::new()),
             dialogs_iter: tokio::sync::Mutex::new(None),
             dh: Mutex::new(None),
@@ -210,11 +213,14 @@ impl GrammersApi {
             } else {
                 d.peer().name().unwrap_or("Deleted Account").to_owned()
             };
-            let info = dialog_info(&d.raw, now);
+            let info = dialog_info(&d.raw);
             let mut chat = Chat::new(chat_id, kind, title);
             chat.unread_count = info.unread;
             chat.pinned = info.pinned;
-            chat.muted = info.muted;
+            chat.notify = info.notify;
+            // `muted` is derived later (`ChatList::refresh_notify`) because
+            // it needs the account defaults.
+            chat.muted = info.notify.muted_at(now).unwrap_or(false);
             chat.read_inbox_max_id = info.read_inbox;
             chat.read_outbox_max_id = info.read_outbox;
             chat.photo_id = peer_photo_id(d.peer());
@@ -281,6 +287,43 @@ impl GrammersApi {
             Ok(Some(p)) => Ok(p),
             _ => Err(Error::Protocol("unknown peer".into())),
         }
+    }
+
+    /// The `InputPeer` of a group member remembered by `members` (or the
+    /// session cache), for the "from:" filter.
+    async fn member_input_peer(&self, user: i64) -> Result<grammers_client::tl::enums::InputPeer> {
+        if user == self.self_id.load(Ordering::Acquire) {
+            return Ok(grammers_client::tl::enums::InputPeer::PeerSelf);
+        }
+        if let Some(p) = lock(&self.member_peers)?.get(&user).cloned() {
+            return Ok(p);
+        }
+        Ok(self.peer_ref(user).await?.into())
+    }
+
+    /// `messages.deleteHistory`, repeated while the server says there is more.
+    async fn delete_history(&self, peer: PeerRef, just_clear: bool, revoke: bool) -> Result<()> {
+        use grammers_client::tl;
+        // Each answer deletes a batch; a hard cap stops a misbehaving server.
+        for _ in 0..200 {
+            let r = self
+                .client
+                .invoke(&tl::functions::messages::DeleteHistory {
+                    just_clear,
+                    revoke,
+                    peer: peer.into(),
+                    max_id: 0,
+                    min_date: None,
+                    max_date: None,
+                })
+                .await
+                .map_err(map_err)?;
+            let tl::enums::messages::AffectedHistory::History(h) = r;
+            if h.offset <= 0 {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     fn convert(&self, m: &grammers_client::message::Message) -> Option<Message> {
@@ -609,17 +652,85 @@ impl TelegramApi for Grammers {
         api.client.mark_as_read(peer).await.map_err(map_err)
     }
 
-    async fn search(&self, chat: ChatId, query: String) -> Result<Vec<Message>> {
+    async fn search(
+        &self,
+        chat: ChatId,
+        query: String,
+        from: Option<i64>,
+        offset_id: MessageId,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        use grammers_client::tl;
         let api = &self.0;
         let peer = api.peer_ref(chat).await?;
-        let mut iter = api.client.search_messages(peer).query(&query).limit(50);
-        let mut out = Vec::new();
-        while let Some(m) = iter.next().await.map_err(map_err)? {
-            if let Some(m) = api.convert(&m) {
-                out.push(m);
-            }
+        let from_id = match from {
+            Some(id) => Some(api.member_input_peer(id).await?),
+            None => None,
+        };
+        let r = api
+            .client
+            .invoke(&tl::functions::messages::Search {
+                peer: peer.into(),
+                q: query,
+                from_id,
+                saved_peer_id: None,
+                saved_reaction: None,
+                top_msg_id: None,
+                filter: tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+                min_date: 0,
+                max_date: 0,
+                offset_id,
+                add_offset: 0,
+                limit: i32::try_from(limit.clamp(1, 100)).unwrap_or(50),
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(types::messages_from_tl(&r))
+    }
+
+    async fn members(&self, chat: ChatId, limit: usize) -> Result<Vec<Member>> {
+        use grammers_client::tl;
+        let api = &self.0;
+        if chat > 0 {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let peer = api.peer_ref(chat).await?;
+        let (members, users) = if chat > -crate::model::CHANNEL_OFFSET {
+            let r = api
+                .client
+                .invoke(&tl::functions::messages::GetFullChat { chat_id: -chat })
+                .await
+                .map_err(map_err)?;
+            let tl::enums::messages::ChatFull::Full(full) = &r;
+            (types::members_from_chat_full(&r), full.users.clone())
+        } else {
+            let r = api
+                .client
+                .invoke(&tl::functions::channels::GetParticipants {
+                    channel: peer.into(),
+                    filter: tl::enums::ChannelParticipantsFilter::ChannelParticipantsRecent,
+                    offset: 0,
+                    limit: i32::try_from(limit.clamp(1, 200)).unwrap_or(200),
+                    hash: 0,
+                })
+                .await
+                .map_err(map_err)?;
+            let users = match &r {
+                tl::enums::channels::ChannelParticipants::Participants(p) => p.users.clone(),
+                _ => Vec::new(),
+            };
+            (types::members_from_channel(&r), users)
+        };
+        let mut known = lock(&api.member_peers)?;
+        if known.len() > 4096 {
+            known.clear();
+        }
+        known.extend(types::user_input_peers(&users));
+        drop(known);
+        Ok(members.into_iter().take(limit).collect())
     }
 
     async fn download_photo(&self, chat: ChatId, id: MessageId) -> Result<Vec<u8>> {
@@ -836,7 +947,7 @@ impl TelegramApi for Grammers {
         }
     }
 
-    async fn set_muted(&self, chat: ChatId, muted: bool) -> Result<()> {
+    async fn set_mute(&self, chat: ChatId, until: i64) -> Result<()> {
         use grammers_client::tl;
         let api = &self.0;
         let peer = api.peer_ref(chat).await?;
@@ -849,9 +960,12 @@ impl TelegramApi for Grammers {
                     tl::types::InputPeerNotifySettings {
                         show_previews: None,
                         silent: None,
-                        // "Forever" is the largest timestamp, like the
-                        // official clients; 0 lifts the mute.
-                        mute_until: Some(if muted { i32::MAX } else { 0 }),
+                        // Forever is the largest timestamp, like the official
+                        // clients; 0 lifts the mute (and, unlike an unset
+                        // field, beats a "muted by default" setting).
+                        mute_until: Some(
+                            i32::try_from(until.clamp(0, i64::from(i32::MAX))).unwrap_or(i32::MAX),
+                        ),
                         sound: None,
                         stories_muted: None,
                         stories_hide_sender: None,
@@ -862,6 +976,88 @@ impl TelegramApi for Grammers {
             .await
             .map(drop)
             .map_err(map_err)
+    }
+
+    async fn notify_defaults(&self) -> Result<NotifyDefaults> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let mut out = NotifyDefaults::default();
+        for scope in NotifyScope::ALL {
+            let peer = match scope {
+                NotifyScope::Users => tl::enums::InputNotifyPeer::InputNotifyUsers,
+                NotifyScope::Chats => tl::enums::InputNotifyPeer::InputNotifyChats,
+                NotifyScope::Broadcasts => tl::enums::InputNotifyPeer::InputNotifyBroadcasts,
+            };
+            let r = api
+                .client
+                .invoke(&tl::functions::account::GetNotifySettings { peer })
+                .await
+                .map_err(map_err)?;
+            out.set(scope, types::notify_from_tl(&r));
+        }
+        Ok(out)
+    }
+
+    async fn clear_history(&self, chat: ChatId, revoke: bool) -> Result<()> {
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        api.delete_history(peer, true, revoke).await
+    }
+
+    async fn delete_chat(&self, chat: ChatId, revoke: bool) -> Result<()> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        if chat > 0 {
+            api.delete_history(peer, false, revoke).await
+        } else if chat > -crate::model::CHANNEL_OFFSET {
+            api.client
+                .invoke(&tl::functions::messages::DeleteChatUser {
+                    revoke_history: false,
+                    chat_id: -chat,
+                    user_id: tl::enums::InputUser::UserSelf,
+                })
+                .await
+                .map_err(map_err)?;
+            // Like the official client, also drop the dialog itself.
+            if let Err(e) = api.delete_history(peer, false, false).await {
+                debug!(error = %e, "history of the left group was not deleted");
+            }
+            Ok(())
+        } else {
+            api.client
+                .invoke(&tl::functions::channels::LeaveChannel {
+                    channel: peer.into(),
+                })
+                .await
+                .map(drop)
+                .map_err(map_err)
+        }
+    }
+
+    async fn set_blocked(&self, chat: ChatId, blocked: bool) -> Result<()> {
+        use grammers_client::tl;
+        let api = &self.0;
+        let peer = api.peer_ref(chat).await?;
+        if blocked {
+            api.client
+                .invoke(&tl::functions::contacts::Block {
+                    my_stories_from: false,
+                    id: peer.into(),
+                })
+                .await
+                .map(drop)
+                .map_err(map_err)
+        } else {
+            api.client
+                .invoke(&tl::functions::contacts::Unblock {
+                    my_stories_from: false,
+                    id: peer.into(),
+                })
+                .await
+                .map(drop)
+                .map_err(map_err)
+        }
     }
 
     async fn shared_media(

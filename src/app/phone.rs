@@ -397,11 +397,16 @@ impl App {
                     .map(|c| c.title.clone())
                     .or_else(|| self.user_names.get(&peer).cloned())
                     .unwrap_or_else(|| "Unknown".into());
+                // Like the official apps, a call rings even in a muted chat
+                // or while notifications are muted: mute settings cover
+                // messages; who may call is the server-side privacy setting
+                // (blocked callers never reach us).
                 if self.config.notifications {
                     crate::desktop::notify(crate::desktop::Toast {
                         title: name,
                         body: "Incoming call".into(),
                         chat: Some(peer),
+                        silent: false,
                     });
                 }
                 self.call_ui.expanded = true;

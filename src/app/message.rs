@@ -4,12 +4,13 @@ use std::path::PathBuf;
 
 use iced::widget::scrollable::Viewport;
 
+use crate::app::chatmenu::{Dir, HeaderMenu};
 use crate::app::folders::{EditorFlag, Picker};
 use crate::auth::{SecretInput, SignInOutcome};
 use crate::error::Error;
 use crate::model::{
-    Chat, ChatId, Folder, GlobalHit, Message as ChatMessage, MessageId, PeerInfo, SharedKind,
-    SharedPage, User,
+    Chat, ChatId, Folder, GlobalHit, Member, Message as ChatMessage, MessageId, MuteFor,
+    NotifyDefaults, NotifySettings, PeerInfo, SharedKind, SharedPage, User,
 };
 use crate::net::{ApiHandle, Event};
 
@@ -114,8 +115,39 @@ pub enum Ui {
     SaveMedia(ChatId, MessageId),
     CancelCompose,
     ToggleChatSearch,
+    /// Open (or keep open) the in-chat search and focus its field.
+    OpenChatSearch,
     ChatSearchInput(String),
+    /// Enter in the search field: search now, or go to the next hit.
     ChatSearchSubmit,
+    /// The query settled (debounce); only the latest version searches.
+    ChatSearchDue(u64),
+    ChatSearchStep(Dir),
+    /// Pick (`Some`) or clear (`None`) the "from:" member.
+    ChatSearchFrom(Option<Member>),
+    /// Show or hide the member picker.
+    ChatSearchFromPicker,
+    ChatSearchFromQuery(String),
+    // chat header menu
+    ToggleHeaderMenu,
+    HeaderMenuPage(HeaderMenu),
+    CloseHeaderMenu,
+    /// Mute the open chat (or `MuteFor::Off` to unmute).
+    SetMute(MuteFor),
+    AskClearHistory,
+    AskDeleteChat,
+    AskLeave,
+    /// The "also delete for the other side" checkbox of the open dialog.
+    ConfirmRevoke(bool),
+    ConfirmAccept,
+    ConfirmCancel,
+    ToggleBlock,
+    // message selection
+    StartSelect,
+    ToggleSelect(MessageId),
+    CancelSelect,
+    AskDeleteSelected,
+    CopySelected,
     ScrollToBottom,
     OpenMedia(ChatId, MessageId),
     CloseMedia,
@@ -142,6 +174,9 @@ pub enum Ui {
     CloseRequested,
     WindowResized(iced::Size),
     WindowMoved(iced::Point),
+    /// The window's scale factor (on open and when it changes): shared-media
+    /// thumbnails are made at the size they are drawn.
+    Rescaled(f32),
     OpenSettings,
     CloseSettings,
     SetCloseToTray(bool),
@@ -198,10 +233,34 @@ pub enum Done {
     },
     /// A fire-and-forget call (react, mark read, cache write) finished.
     Call(Result<(), Error>),
-    SearchResults {
+    /// One page of the in-chat search for query `version`.
+    SearchPage {
         chat: ChatId,
-        query: String,
+        version: u64,
+        offset: MessageId,
         result: Result<Vec<ChatMessage>, Error>,
+    },
+    /// Members for the search "from:" picker.
+    Members {
+        chat: ChatId,
+        result: Result<Vec<Member>, Error>,
+    },
+    /// The account-wide notification defaults.
+    NotifyDefaults(Result<NotifyDefaults, Error>),
+    /// A clear-history / delete / leave call finished.
+    ChatActionDone {
+        action: crate::app::chatmenu::Confirm,
+        result: Result<(), Error>,
+    },
+    BlockDone {
+        chat: ChatId,
+        blocked: bool,
+        result: Result<(), Error>,
+    },
+    /// Several optimistic deletes failed: restore `old`.
+    RollbackMany {
+        old: Vec<ChatMessage>,
+        error: Error,
     },
     GlobalResults {
         query: String,
@@ -231,14 +290,20 @@ pub enum Done {
         offset: MessageId,
         result: Result<SharedPage, Error>,
     },
+    /// A shared-media preview was downloaded (encoded bytes).
     Thumb {
         key: (ChatId, MessageId),
         result: Result<Vec<u8>, Error>,
     },
-    /// The mute switch finished; on failure `previous` is restored.
+    /// The same preview, decoded and cropped off the UI thread.
+    ThumbReady {
+        key: (ChatId, MessageId),
+        result: Result<crate::media::ThumbImage, Error>,
+    },
+    /// The mute call finished; on failure `previous` is restored.
     MuteDone {
         chat: ChatId,
-        previous: bool,
+        previous: NotifySettings,
         result: Result<(), Error>,
     },
     LinkOpened(Result<(), Error>),

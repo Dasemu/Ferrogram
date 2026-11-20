@@ -28,6 +28,8 @@ pub struct Toast {
     pub title: String,
     pub body: String,
     pub chat: Option<i64>,
+    /// Show it without playing the notification sound (chat set to "silent").
+    pub silent: bool,
 }
 
 /// Escape text for the freedesktop notification body (a subset of HTML
@@ -76,6 +78,7 @@ pub fn coalesce(batch: &[Toast]) -> Option<Toast> {
                     }
                 ),
                 chat,
+                silent: many.iter().all(|t| t.silent),
             })
         }
     }
@@ -116,7 +119,8 @@ fn show(toast: &Toast) {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         n.hint(notify_rust::Hint::DesktopEntry(APP_ID.into()))
-            .hint(notify_rust::Hint::Category("im.received".into()));
+            .hint(notify_rust::Hint::Category("im.received".into()))
+            .hint(notify_rust::Hint::SuppressSound(toast.silent));
         show_clickable(n, toast.chat);
     }
     #[cfg(not(all(unix, not(target_os = "macos"))))]
@@ -364,6 +368,7 @@ mod tests {
             title: t.into(),
             body: b.into(),
             chat: Some(chat),
+            silent: false,
         };
         assert!(coalesce(&[]).is_none());
         let one = vec![toast("Alice", "hi", 1)];
@@ -381,5 +386,18 @@ mod tests {
         let c = coalesce(&mixed).unwrap();
         assert_eq!(c.body, "3 new messages in 2 chats");
         assert_eq!(c.chat, None, "a click cannot pick one of several chats");
+    }
+
+    #[test]
+    fn a_batch_is_silent_only_when_every_toast_is() {
+        let t = |silent| Toast {
+            title: "A".into(),
+            body: "x".into(),
+            chat: Some(1),
+            silent,
+        };
+        assert!(coalesce(&[t(true)]).unwrap().silent);
+        assert!(coalesce(&[t(true), t(true)]).unwrap().silent);
+        assert!(!coalesce(&[t(true), t(false)]).unwrap().silent);
     }
 }

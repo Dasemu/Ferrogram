@@ -112,6 +112,30 @@ pub fn script(config: &Config) -> Task<Message> {
             (400, ui(Ui::SelectChat(ALICE))),
             (900, ui(Ui::ChatMenu(Some(RUST_GROUP)))),
         ],
+        ScreenshotTarget::HeaderMenu => vec![
+            (400, ui(Ui::SelectChat(RUST_GROUP))),
+            (900, ui(Ui::ToggleHeaderMenu)),
+        ],
+        ScreenshotTarget::HeaderMute => vec![
+            (400, ui(Ui::SelectChat(RUST_GROUP))),
+            (900, ui(Ui::ToggleHeaderMenu)),
+            (950, ui(Ui::HeaderMenuPage(crate::app::chatmenu::HeaderMenu::Mute))),
+        ],
+        ScreenshotTarget::HeaderConfirm => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (900, ui(Ui::AskClearHistory)),
+        ],
+        ScreenshotTarget::Select => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (900, ui(Ui::StartSelect)),
+            (950, ui(Ui::ToggleSelect(147))),
+            (960, ui(Ui::ToggleSelect(148))),
+        ],
+        ScreenshotTarget::SearchFrom => vec![
+            (400, ui(Ui::SelectChat(RUST_GROUP))),
+            (900, ui(Ui::OpenChatSearch)),
+            (950, ui(Ui::ChatSearchFromPicker)),
+        ],
         ScreenshotTarget::Info(kind) => vec![
             (400, ui(Ui::SelectChat(ALICE))),
             (700, ui(Ui::ToggleInfo)),

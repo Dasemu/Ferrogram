@@ -2,6 +2,7 @@
 
 pub mod call;
 pub mod chat;
+pub mod chatmenu;
 pub mod folders;
 pub mod format;
 pub mod icons;
@@ -49,6 +50,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     if let Some(viewer) = chat::media_viewer(app) {
         layers = layers.push(opaque(viewer));
+    }
+    if let Some(menu) = chatmenu::header_menu(app) {
+        layers = layers.push(menu);
+    }
+    if let Some(dialog) = chatmenu::confirm_dialog(app) {
+        layers = layers.push(dialog);
     }
     if app.settings_open {
         layers = layers.push(settings::view(app));

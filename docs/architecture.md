@@ -326,7 +326,23 @@ colours chosen by `id % 7`.
   (`SharedTab`), bounded thumbnail queue and cache.
 * Layers: every dialog goes through `widgets::modal` (opaque backdrop).
 
-### 11.6 One-to-one calls
+### 11.6 Chat header, notification settings and the media grid (round 4)
+
+* `app/chatmenu.rs`: pure state (`HeaderMenu`, `menu_items`, `Confirm`,
+  `Selection`, `ChatSearch`); `app/chat_actions.rs` turns it into `Task`s;
+  `ui/chatmenu.rs` draws the ⋮ menu, confirmation dialog, search row, member
+  picker and selection bar (all layers go through `opaque`/`widgets::modal`).
+* `model::NotifySettings/NotifyDefaults` + `ChatList::{set_defaults,
+  set_notify, refresh_notify}` derive `Chat::muted`; nothing else writes it.
+* `app/info.rs`: grid geometry (`ROW_H`, `row_window`), `ViewState` (from the
+  scrollable's `on_scroll`) and the demand-driven `ThumbQueue::set_wanted`.
+  `media::ThumbImage` decodes off the UI thread; `Done::ThumbReady` stores
+  one stable `image::Handle` per thumbnail.
+* `tests/chat_header.rs` runs the real `App::update` with its `Task`s against
+  `FakeTelegram`; `tests/media_scroll.rs` lays out and rasterises the info
+  panel on tiny-skia and compares 60 against 600 items.
+
+### 11.7 One-to-one calls
 
 * `net/calls/`: protocol and media (DH, signaling, STUN/ICE with reflectors,
   SRTP, RTP, jitter buffer, Opus/cpal audio, the per-call engine task). Pure

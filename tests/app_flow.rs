@@ -254,14 +254,18 @@ fn search_sidebar_and_in_chat() {
     let _ = app.update(Message::Ui(Ui::ChatSearchSubmit));
     assert!(app.chat_search.as_ref().unwrap().searching);
     let hit = ChatMessage::text(ALICE, 146, false, 0, "Here's the trail map");
-    let _ = app.update(Message::Done(Done::SearchResults {
+    let version = app.chat_search.as_ref().unwrap().version;
+    let _ = app.update(Message::Done(Done::SearchPage {
         chat: ALICE,
-        query: "trail".into(),
+        version,
+        offset: 0,
         result: Ok(vec![hit]),
     }));
     let s = app.chat_search.as_ref().unwrap();
     assert!(!s.searching);
     assert_eq!(s.results.len(), 1);
+    assert_eq!(s.index, Some(0), "the newest hit is selected");
+    assert_eq!(app.highlight, Some(146), "and highlighted");
     let _ = app.update(Message::Ui(Ui::Escape));
     assert!(app.chat_search.is_none());
 }
@@ -628,7 +632,10 @@ async fn fake_edit_delete_react_emit_events() {
     assert!(matches!(a, Event::MessageEdited(m) if m.text == "changed" && m.edited));
     assert!(matches!(b, Event::Reactions { reactions, .. } if reactions[0].chosen));
     assert!(matches!(c, Event::MessagesDeleted { chat: None, ids } if ids == vec![150]));
-    let found = api.search(ALICE, "TRAIL".into()).await.unwrap();
+    let found = api
+        .search(ALICE, "TRAIL".into(), None, 0, 50)
+        .await
+        .unwrap();
     assert!(!found.is_empty());
     let photo = api.download_photo(ALICE, 143).await.unwrap();
     assert_eq!(&photo[1..4], b"PNG");
@@ -1905,8 +1912,11 @@ fn shared_tabs_page_lazily_and_queue_bounded_thumbnails() {
     let tab = app.info.as_ref().unwrap().tab(SharedKind::Media);
     assert_eq!(tab.items.len(), INFO_PAGE);
     assert!(tab.next.is_some() && !tab.loading());
-    // Thumbnails: only a few at a time, the rest wait in the queue.
-    assert_eq!(app.thumb_q.pending(), INFO_PAGE);
+    // Thumbnails: only the rows around the viewport are wanted (not the whole
+    // page), a few downloads at a time.
+    let wanted = app.info.as_ref().unwrap().wanted_thumbs().len();
+    assert!(wanted > 0 && wanted < INFO_PAGE, "{wanted} of {INFO_PAGE}");
+    assert_eq!(app.thumb_q.pending(), wanted);
 
     // Near the end of the panel the next page is requested (same path as scrolling).
     let _ = app.update(Message::Ui(Ui::InfoTab(SharedKind::Media)));
@@ -1981,32 +1991,36 @@ fn failed_pages_show_retry_and_stale_pages_are_ignored() {
 
 #[test]
 fn thumbnail_cache_is_bounded_and_rejects_bad_images() {
+    use ferrogram::media::ThumbImage;
     let mut app = app_with_info(ALICE);
     let png = mock::mock_photo_png(1, 160, 120);
-    let _ = app.update(Message::Done(Done::Thumb {
+    let tile = || ThumbImage::decode(&png, 104).unwrap();
+    let _ = app.update(Message::Done(Done::ThumbReady {
         key: (ALICE, 5),
-        result: Ok(png.clone()),
+        result: Ok(tile()),
     }));
     assert!(app.thumbs.peek(&(ALICE, 5)).is_some());
-    // Garbage and another chat's thumbnail are not cached.
-    let _ = app.update(Message::Done(Done::Thumb {
+    // A failed decode and another chat's thumbnail are not cached.
+    let _ = app.update(Message::Done(Done::ThumbReady {
         key: (ALICE, 6),
-        result: Ok(vec![0u8; 3 * 1024 * 1024]),
+        result: Err(ferrogram::error::Error::Protocol("rejected".into())),
     }));
     assert!(app.thumbs.peek(&(ALICE, 6)).is_none());
-    let _ = app.update(Message::Done(Done::Thumb {
+    let _ = app.update(Message::Done(Done::ThumbReady {
         key: (mock::RUST_GROUP, 7),
-        result: Ok(png.clone()),
+        result: Ok(tile()),
     }));
     assert!(app.thumbs.peek(&(mock::RUST_GROUP, 7)).is_none());
-    // Many thumbnails never exceed the budget.
+    // Many thumbnails never exceed the (decoded) budget.
     for i in 0..3000 {
-        let _ = app.update(Message::Done(Done::Thumb {
+        let _ = app.update(Message::Done(Done::ThumbReady {
             key: (ALICE, 1000 + i),
-            result: Ok(png.clone()),
+            result: Ok(tile()),
         }));
     }
-    assert!(app.thumbs.bytes() <= ferrogram::app::info::THUMB_BUDGET + png.len());
+    let cost = tile().cost();
+    assert!(app.thumbs.bytes() <= ferrogram::app::info::THUMB_BUDGET + cost);
+    assert!(app.thumbs.len() > 100, "a few screens of tiles stay cached");
     // Closing the panel frees them.
     let _ = app.update(Message::Ui(Ui::ToggleInfo));
     assert!(app.thumbs.is_empty());
@@ -2020,7 +2034,7 @@ fn notifications_switch_is_optimistic_and_rolls_back() {
     assert!(app.chats.get(ALICE).unwrap().muted);
     let _ = app.update(Message::Done(Done::MuteDone {
         chat: ALICE,
-        previous: false,
+        previous: ferrogram::model::NotifySettings::default(),
         result: Err(ferrogram::error::Error::Net("x".into())),
     }));
     assert!(
@@ -2029,9 +2043,12 @@ fn notifications_switch_is_optimistic_and_rolls_back() {
     );
     assert!(app.toast.is_some());
     // Another device mutes: the switch follows.
-    let _ = app.update(Message::Net(Event::Muted {
-        chat: ALICE,
-        muted: true,
+    let _ = app.update(Message::Net(Event::Notify {
+        target: ferrogram::model::NotifyTarget::Chat(ALICE),
+        settings: ferrogram::model::NotifySettings {
+            mute_until: Some(ferrogram::model::MUTE_FOREVER),
+            ..Default::default()
+        },
     }));
     assert!(app.chats.get(ALICE).unwrap().muted);
     let _ = app.update(Message::Ui(Ui::SetNotifications(true)));
@@ -2097,13 +2114,15 @@ async fn fake_backend_serves_shared_media_info_and_mute() {
             > 100
     );
 
-    fake.set_muted(ALICE, true).await.unwrap();
+    fake.set_mute(ALICE, ferrogram::model::MUTE_FOREVER)
+        .await
+        .unwrap();
     assert!(matches!(
         events.next().await,
-        Some(Event::Muted {
-            chat: ALICE,
-            muted: true
-        })
+        Some(Event::Notify {
+            target: ferrogram::model::NotifyTarget::Chat(ALICE),
+            settings
+        }) if settings.mute_until == Some(ferrogram::model::MUTE_FOREVER)
     ));
     assert!(fake.calls().contains(&"mute".to_owned()));
 }

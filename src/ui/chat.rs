@@ -11,7 +11,7 @@ use super::icons::{Icon, tail_handle};
 use super::theme::{self, FONT_SEMIBOLD, NAME_COLORS};
 use super::widgets::{EMOJI_FONT, avatar_photo, emoji_plain, emoji_text, emoji_title, icon};
 use crate::app::state::ComposeMode;
-use crate::app::{App, CHAT_SEARCH_ID, COMPOSER_ID, HISTORY_ID, Message, Ui};
+use crate::app::{App, COMPOSER_ID, HISTORY_ID, Message, Ui};
 use crate::model::{Chat, ChatKind, Media, Message as ChatMessage, SendState, avatar_color_index};
 
 pub const QUICK_REACTIONS: [&str; 8] = ["👍", "❤️", "🔥", "😂", "😮", "😢", "🎉", "🙏"];
@@ -39,9 +39,6 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let chat = app.chats.get(chat_id);
 
     let mut col = Column::new().width(Length::Fill).push(header(app, chat));
-    if let Some(s) = &app.chat_search {
-        col = col.push(search_bar(app, s));
-    }
 
     let history = history(app, chat, conv.messages(), conv.loading_older);
     let mut layers = stack![history].width(Length::Fill).height(Length::Fill);
@@ -63,9 +60,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         );
     }
     if let Some(s) = &app.chat_search
-        && s.submitted
+        && let Some(picker) = super::chatmenu::from_picker(app, s)
     {
-        layers = layers.push(search_results(app, s));
+        layers = layers.push(picker);
     }
     if app.emoji_open {
         layers = layers.push(emoji_panel(app));
@@ -77,7 +74,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
     if let Some(f) = &app.pending_file {
         col = col.push(pending_file_bar(app, f));
     }
-    col = col.push(composer(app));
+    col = col.push(match super::chatmenu::select_bar(app) {
+        Some(bar) => bar,
+        None => composer(app),
+    });
 
     container(col)
         .width(Length::Fill)
@@ -113,6 +113,15 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
             .on_press_maybe(msg)
             .style(theme::icon_button(p, true))
     };
+    if let Some(s) = &app.chat_search {
+        return container(super::chatmenu::search_row(app, s))
+            .padding([0, 14])
+            .width(Length::Fill)
+            .height(m.header_height)
+            .align_y(Alignment::Center)
+            .style(theme::fill(p.bg_sidebar))
+            .into();
+    }
     container(
         row![
             mouse_area(
@@ -146,7 +155,7 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
                 chat.filter(|c| c.kind == ChatKind::User)
                     .map(|c| Message::Ui(Ui::CallStart(c.id))),
             ),
-            ib(Icon::More, None),
+            ib(Icon::More, Some(Message::Ui(Ui::ToggleHeaderMenu))),
         ]
         .spacing(10)
         .align_y(Alignment::Center),
@@ -156,112 +165,6 @@ fn header<'a>(app: &'a App, chat: Option<&'a Chat>) -> Element<'a, Message> {
     .height(m.header_height)
     .align_y(Alignment::Center)
     .style(theme::fill(p.bg_sidebar))
-    .into()
-}
-
-fn search_bar<'a>(app: &'a App, s: &'a crate::app::ChatSearch) -> Element<'a, Message> {
-    let t = &app.theme;
-    let (p, m) = (t.palette, t.metrics);
-    let count = if s.searching {
-        "Searching…".to_owned()
-    } else if s.submitted {
-        format!("{} results", s.results.len())
-    } else {
-        String::new()
-    };
-    container(
-        row![
-            icon(Icon::Search, 16.0, p.text_muted),
-            text_input("Search messages in this chat", &s.query)
-                .id(CHAT_SEARCH_ID)
-                .on_input(|q| Message::Ui(Ui::ChatSearchInput(q)))
-                .on_submit(Message::Ui(Ui::ChatSearchSubmit))
-                .padding([6, 4])
-                .size(m.font_m)
-                .style(theme::input(p, p.bg_sidebar, 0.0, false)),
-            text(count).size(m.font_s).color(p.text_secondary),
-            button(icon(Icon::X, 18.0, p.text_secondary))
-                .padding(6)
-                .on_press(Message::Ui(Ui::ToggleChatSearch))
-                .style(theme::icon_button(p, true)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .padding([4, 16])
-    .width(Length::Fill)
-    .style(move |_| container::Style {
-        background: Some(p.bg_sidebar.into()),
-        border: iced::Border {
-            width: 0.0,
-            ..Default::default()
-        },
-        shadow: iced::Shadow {
-            color: p.border,
-            offset: iced::Vector::new(0.0, -1.0),
-            blur_radius: 0.0,
-        },
-        ..Default::default()
-    })
-    .into()
-}
-
-fn search_results<'a>(app: &'a App, s: &'a crate::app::ChatSearch) -> Element<'a, Message> {
-    let t = &app.theme;
-    let (p, m) = (t.palette, t.metrics);
-    let mut list = Column::new();
-    for msg in s.results.iter().take(30) {
-        let who = if msg.outgoing {
-            "You".to_owned()
-        } else {
-            msg.sender_name
-                .clone()
-                .or_else(|| app.chats.get(msg.chat_id).map(|c| c.title.clone()))
-                .unwrap_or_default()
-        };
-        list = list.push(
-            button(
-                column![
-                    row![
-                        emoji_title(who.to_string(), m.font_s, p.text_primary),
-                        Space::new().width(Length::Fill),
-                        text(format::list_time(msg.date, app.now, app.tz_offset))
-                            .size(m.font_xs)
-                            .color(p.text_secondary),
-                    ],
-                    emoji_text(
-                        format::ellipsize(&msg.preview(), 60),
-                        m.font_s,
-                        p.text_secondary
-                    ),
-                ]
-                .spacing(2),
-            )
-            .width(Length::Fill)
-            .padding([8, 12])
-            .on_press(Message::Ui(Ui::OpenResult(msg.chat_id, msg.id)))
-            .style(theme::menu_item(p, false)),
-        );
-    }
-    if s.results.is_empty() && !s.searching {
-        list = list.push(
-            container(text("No messages found").size(m.font_s).color(p.text_muted)).padding(12),
-        );
-    }
-    container(opaque(
-        container(scrollable(list).style(theme::scroll(p)))
-            .width(360)
-            .max_height(300)
-            .padding(4)
-            .style(theme::elevated(p)),
-    ))
-    .align_right(Length::Fill)
-    .padding(Padding {
-        top: 6.0,
-        right: 12.0,
-        bottom: 0.0,
-        left: 0.0,
-    })
     .into()
 }
 
@@ -325,7 +228,11 @@ fn history<'a>(
         }
         let tail = !same_group(msg, msgs.get(i + 1), app.tz_offset);
         let first = i == 0 || !same_group(&msgs[i - 1], Some(msg), app.tz_offset);
-        col = col.push(message_row(app, chat, msg, tail, first && is_group));
+        let row_el = message_row(app, chat, msg, tail, first && is_group);
+        col = col.push(match &app.selection {
+            Some(sel) => selectable(app, msg.id, sel.contains(msg.id), row_el),
+            None => row_el,
+        });
         if tail {
             col = col.push(Space::new().height(6));
         }
@@ -342,6 +249,50 @@ fn history<'a>(
         .width(Length::Fill)
         .style(theme::scroll(p))
         .into()
+}
+
+/// A message row in "Select messages" mode: a check mark on the left, a
+/// tint when ticked, and a transparent layer that takes the click (so
+/// photos and links inside the bubble do not react).
+fn selectable<'a>(
+    app: &'a App,
+    id: i32,
+    checked: bool,
+    el: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let p = app.theme.palette;
+    let mark: Element<'a, Message> = container(if checked {
+        icon(Icon::Check, 14.0, Color::WHITE)
+    } else {
+        Space::new().into()
+    })
+    .width(22)
+    .height(22)
+    .center(22)
+    .style(theme::pill(
+        if checked { p.accent } else { p.bg_input },
+        11.0,
+    ))
+    .into();
+    let body = container(row![container(mark).padding([0, 8]), el].align_y(Alignment::Center))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: checked.then(|| {
+                Color {
+                    a: 0.18,
+                    ..p.accent
+                }
+                .into()
+            }),
+            ..container::Style::default()
+        });
+    stack![
+        body,
+        mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::Ui(Ui::ToggleSelect(id)))
+    ]
+    .width(Length::Fill)
+    .into()
 }
 
 fn pill<'a>(app: &'a App, label: String) -> Element<'a, Message> {

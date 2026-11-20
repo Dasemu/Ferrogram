@@ -21,8 +21,9 @@ use secrecy::SecretString;
 use crate::auth::SignInOutcome;
 use crate::error::{Phone, Result};
 use crate::model::{
-    Chat, ChatId, ConnState, Draft, Folder, GlobalHit, Message, MessageId, PeerInfo, Presence,
-    Reaction, SharedKind, SharedPage, TypingAction,
+    Chat, ChatId, ConnState, Draft, Folder, GlobalHit, Member, Message, MessageId, NotifyDefaults,
+    NotifySettings, NotifyTarget, PeerInfo, Presence, Reaction, SharedKind, SharedPage,
+    TypingAction,
 };
 
 /// Hard cap on a shared-content thumbnail.
@@ -79,11 +80,11 @@ pub enum Event {
         chat: ChatId,
         draft: Option<Draft>,
     },
-    /// A chat was muted or unmuted (`updateNotifySettings`), maybe on
-    /// another device.
-    Muted {
-        chat: ChatId,
-        muted: bool,
+    /// Notification settings of a chat, or the account default of a kind of
+    /// chat, changed (`updateNotifySettings`), maybe on another device.
+    Notify {
+        target: NotifyTarget,
+        settings: NotifySettings,
     },
     /// A folder was created, edited (`Some`) or deleted (`None`), maybe on
     /// another device (`updateDialogFilter`).
@@ -171,7 +172,19 @@ pub trait TelegramApi: Send + Sync {
     /// `None` removes our reaction.
     async fn react(&self, chat: ChatId, id: MessageId, emoji: Option<String>) -> Result<()>;
     async fn mark_read(&self, chat: ChatId) -> Result<()>;
-    async fn search(&self, chat: ChatId, query: String) -> Result<Vec<Message>>;
+    /// In-chat search (`messages.search` with the peer), newest first, older
+    /// than `offset_id` (0 = from the newest). `from` limits it to one
+    /// sender; the query may then be empty.
+    async fn search(
+        &self,
+        chat: ChatId,
+        query: String,
+        from: Option<i64>,
+        offset_id: MessageId,
+        limit: usize,
+    ) -> Result<Vec<Message>>;
+    /// Members of a group, for the search "from:" filter (at most `limit`).
+    async fn members(&self, chat: ChatId, limit: usize) -> Result<Vec<Member>>;
     /// Bytes of a photo (JPEG/PNG) for display (a thumbnail when available).
     async fn download_photo(&self, chat: ChatId, id: MessageId) -> Result<Vec<u8>>;
     /// Server-side search over every chat (`messages.searchGlobal`), newest
@@ -196,8 +209,22 @@ pub trait TelegramApi: Send + Sync {
     /// for the info panel (`users.getFullUser`, `messages.getFullChat`,
     /// `channels.getFullChannel`).
     async fn peer_info(&self, chat: ChatId) -> Result<PeerInfo>;
-    /// Mute (forever) or unmute a chat (`account.updateNotifySettings`).
-    async fn set_muted(&self, chat: ChatId, muted: bool) -> Result<()>;
+    /// Mute a chat until the unix time `until` (`crate::model::MUTE_FOREVER`
+    /// = forever, `0` = unmute) with `account.updateNotifySettings`. Other
+    /// fields of the chat's settings are left alone.
+    async fn set_mute(&self, chat: ChatId, until: i64) -> Result<()>;
+    /// The account-wide defaults for private chats, groups and channels
+    /// (`account.getNotifySettings`).
+    async fn notify_defaults(&self) -> Result<NotifyDefaults>;
+    /// Delete the messages of a chat but keep the chat
+    /// (`messages.deleteHistory` with `just_clear`). `revoke` also deletes
+    /// them for the other side of a private chat.
+    async fn clear_history(&self, chat: ChatId, revoke: bool) -> Result<()>;
+    /// Delete a private chat (`messages.deleteHistory`), or leave a group
+    /// (`messages.deleteChatUser`) or channel (`channels.leaveChannel`).
+    async fn delete_chat(&self, chat: ChatId, revoke: bool) -> Result<()>;
+    /// Block / unblock a user (`contacts.block` / `contacts.unblock`).
+    async fn set_blocked(&self, chat: ChatId, blocked: bool) -> Result<()>;
     /// One page of a shared-content tab (`messages.search` with the tab's
     /// filter), newest first, older than `offset_id` (0 = from the newest).
     async fn shared_media(
