@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogram"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "arboard",
  "async-trait",
@@ -1462,6 +1462,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tiny-skia",
  "tokio",
  "tracing",
  "tracing-subscriber",

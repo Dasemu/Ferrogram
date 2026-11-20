@@ -68,8 +68,15 @@ if set). Release builds ship with Ferrogram's own Telegram API credentials;
 * Global search across all chats (server side), jumping to the hit.
 * Attachments (from the file chooser or drag & drop) show a preview bar and
   are only sent after you confirm.
-* Search: chats, cached messages and server-side results in the sidebar,
-  server-side search inside a chat.
+* Search: chats, cached messages and server-side results in the sidebar;
+  in-chat search from the header (as you type, up/down through the hits,
+  "From" filter in groups).
+* The chat header's ⋮ menu: profile, mute (1 h to forever), search, select
+  messages (copy, delete), add to folder, clear history, delete or leave,
+  block. "Export chat" is not implemented.
+* Mute state follows your account: per-chat settings and the defaults for
+  private chats, groups and channels; muted chats do not notify and have grey
+  badges.
 
 Chat folders (create, edit, delete, reorder, "Add to folder"), Ctrl+V of images
 and files, "Copy image", and the chat info panel with shared Media, Files,
@@ -203,7 +210,8 @@ ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" \
 ```
 
 Screens: `login-phone`, `login-code`, `login-password`, `chats`, `search`,
-`reply`, `emoji`, `media`, `settings`.
+`reply`, `emoji`, `media`, `settings`, `header-menu`, `header-mute`,
+`header-confirm`, `select`, `search-from`.
 
 ## Development
 

@@ -3,12 +3,16 @@
 //! parser path (`Deserializable`) is exercised as well.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ferrogram::model::{CHANNEL_OFFSET, Folder, Media, SharedBody, SharedKind};
+use ferrogram::model::{
+    CHANNEL_OFFSET, Folder, Media, NotifyScope, NotifySettings, NotifyTarget, SharedBody,
+    SharedKind,
+};
 use ferrogram::net::Event;
 use ferrogram::net::types::{
     dialog_info, event_from_update, event_from_update_as, folder_from_tl, folder_to_tl,
-    folders_from_tl, largest_size, message_from_tl, peer_to_chat_id, rpc_error, shared_filter,
-    shared_item_from_tl, shared_page_from_tl, utf16_slice,
+    folders_from_tl, largest_size, members_from_channel, members_from_chat_full, message_from_tl,
+    messages_from_tl, notify_from_tl, peer_to_chat_id, rpc_error, shared_filter,
+    shared_item_from_tl, shared_page_from_tl, user_input_peers, utf16_slice,
 };
 use grammers_client::tl;
 use grammers_client::tl::{Deserializable, Serializable};
@@ -433,14 +437,19 @@ fn dialog_counters_and_mute() {
             ttl_period: None,
         })
     };
-    let info = dialog_info(&wire(d(Some(2_000_000_000))), 1_795_000_000);
-    assert!(info.pinned && info.muted);
+    let info = dialog_info(&wire(d(Some(2_000_000_000))));
+    assert!(info.pinned);
+    assert_eq!(info.notify.mute_until, Some(2_000_000_000));
     assert_eq!(
         (info.unread, info.read_inbox, info.read_outbox),
         (5, 45, 49)
     );
-    assert!(!dialog_info(&d(Some(10)), 1_795_000_000).muted);
-    assert!(!dialog_info(&d(None), 1_795_000_000).muted);
+    assert_eq!(dialog_info(&d(Some(10))).notify.mute_until, Some(10));
+    assert_eq!(
+        dialog_info(&d(None)).notify,
+        ferrogram::model::NotifySettings::default(),
+        "unset stays unset: the account default applies"
+    );
 }
 
 #[test]
@@ -1211,4 +1220,269 @@ fn pages_know_where_the_next_one_starts() {
     // A short page is the end.
     let page = shared_page_from_tl(&msgs, SharedKind::Files, 40);
     assert_eq!(page.next, None);
+}
+
+// ------------------------------------------------- notifications (round 4)
+
+fn peer_notify(
+    mute_until: Option<i32>,
+    silent: Option<bool>,
+    show_previews: Option<bool>,
+) -> tl::enums::PeerNotifySettings {
+    tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
+        show_previews,
+        silent,
+        mute_until,
+        ios_sound: None,
+        android_sound: None,
+        other_sound: None,
+        stories_muted: None,
+        stories_hide_sender: None,
+        stories_ios_sound: None,
+        stories_android_sound: None,
+        stories_other_sound: None,
+    })
+}
+
+#[test]
+fn peer_notify_settings_keep_unset_fields_unset() {
+    assert_eq!(
+        notify_from_tl(&wire(peer_notify(
+            Some(1_900_000_000),
+            Some(true),
+            Some(false)
+        ))),
+        NotifySettings {
+            mute_until: Some(1_900_000_000),
+            silent: Some(true),
+            show_previews: Some(false),
+        }
+    );
+    assert_eq!(
+        notify_from_tl(&wire(peer_notify(None, None, None))),
+        NotifySettings::default()
+    );
+}
+
+#[test]
+fn update_notify_settings_maps_chats_and_account_defaults() {
+    let upd = |peer| {
+        wire(tl::enums::Update::NotifySettings(
+            tl::types::UpdateNotifySettings {
+                peer,
+                notify_settings: peer_notify(Some(i32::MAX), None, Some(false)),
+            },
+        ))
+    };
+    let expect = NotifySettings {
+        mute_until: Some(i64::from(i32::MAX)),
+        silent: None,
+        show_previews: Some(false),
+    };
+    let chat = event_from_update(&upd(tl::enums::NotifyPeer::Peer(tl::types::NotifyPeer {
+        peer: channel(77),
+    })));
+    assert_eq!(
+        chat,
+        Some(Event::Notify {
+            target: NotifyTarget::Chat(-CHANNEL_OFFSET - 77),
+            settings: expect
+        })
+    );
+    for (peer, scope) in [
+        (tl::enums::NotifyPeer::NotifyUsers, NotifyScope::Users),
+        (tl::enums::NotifyPeer::NotifyChats, NotifyScope::Chats),
+        (
+            tl::enums::NotifyPeer::NotifyBroadcasts,
+            NotifyScope::Broadcasts,
+        ),
+    ] {
+        assert_eq!(
+            event_from_update(&upd(peer)),
+            Some(Event::Notify {
+                target: NotifyTarget::Scope(scope),
+                settings: expect
+            })
+        );
+    }
+}
+
+// ---------------------------------------------- search and members (round 4)
+
+fn raw_user(id: i64, first: &str, last: Option<&str>, deleted: bool) -> tl::enums::User {
+    tl::enums::User::User(tl::types::User {
+        is_self: false,
+        contact: false,
+        mutual_contact: false,
+        deleted,
+        bot: false,
+        bot_chat_history: false,
+        bot_nochats: false,
+        verified: false,
+        restricted: false,
+        min: false,
+        bot_inline_geo: false,
+        support: false,
+        scam: false,
+        apply_min_photo: false,
+        fake: false,
+        bot_attach_menu: false,
+        premium: false,
+        attach_menu_enabled: false,
+        bot_can_edit: false,
+        close_friend: false,
+        stories_hidden: false,
+        stories_unavailable: false,
+        contact_require_premium: false,
+        bot_business: false,
+        bot_has_main_app: false,
+        bot_forum_view: false,
+        bot_forum_can_manage_topics: false,
+        bot_can_manage_bots: false,
+        bot_guestchat: false,
+        bot_guard: false,
+        bot_forum_sidebar: false,
+        id,
+        access_hash: Some(id * 10),
+        first_name: Some(first.into()),
+        last_name: last.map(Into::into),
+        username: None,
+        phone: None,
+        photo: None,
+        status: None,
+        bot_info_version: None,
+        restriction_reason: None,
+        bot_inline_placeholder: None,
+        lang_code: None,
+        emoji_status: None,
+        usernames: None,
+        stories_max_id: None,
+        color: None,
+        profile_color: None,
+        bot_active_users: None,
+        bot_verification_icon: None,
+        send_paid_messages_stars: None,
+        linked_community_id: None,
+    })
+}
+
+#[test]
+fn search_answer_gets_sender_names_from_its_users() {
+    let mut m = raw_message(5, channel(9), false, "found it");
+    m.from_id = Some(user(42));
+    let mut mine = raw_message(6, channel(9), true, "mine");
+    mine.from_id = Some(user(1));
+    let answer = tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+        messages: vec![
+            tl::enums::Message::Message(m),
+            tl::enums::Message::Message(mine),
+        ],
+        topics: vec![],
+        chats: vec![],
+        users: vec![raw_user(42, "Ana", Some("Ruiz"), false)],
+    });
+    let out = messages_from_tl(&wire(answer));
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].sender_id, Some(42));
+    assert_eq!(out[0].sender_name.as_deref(), Some("Ana Ruiz"));
+    assert_eq!(out[1].sender_name, None, "our own messages carry no name");
+    assert!(
+        messages_from_tl(&tl::enums::messages::Messages::NotModified(
+            tl::types::messages::MessagesNotModified { count: 0 }
+        ))
+        .is_empty()
+    );
+}
+
+#[test]
+fn supergroup_members_skip_deleted_accounts_and_remember_access_hashes() {
+    let participant = |id| {
+        tl::enums::ChannelParticipant::Participant(tl::types::ChannelParticipant {
+            user_id: id,
+            date: 0,
+            subscription_until_date: None,
+            rank: None,
+        })
+    };
+    let users = vec![
+        raw_user(1, "Ana", None, false),
+        raw_user(2, "Gone", None, true),
+        raw_user(3, "Bruno", Some("Diaz"), false),
+    ];
+    let answer = tl::enums::channels::ChannelParticipants::Participants(
+        tl::types::channels::ChannelParticipants {
+            count: 3,
+            participants: vec![
+                participant(1),
+                participant(2),
+                participant(3),
+                participant(9),
+            ],
+            chats: vec![],
+            users: users.clone(),
+        },
+    );
+    let members = members_from_channel(&wire(answer));
+    let got: Vec<_> = members.iter().map(|m| (m.id, m.name.as_str())).collect();
+    assert_eq!(got, vec![(1, "Ana"), (3, "Bruno Diaz")]);
+    let peers = user_input_peers(&users);
+    assert_eq!(peers.len(), 3);
+    assert!(matches!(
+        &peers[0].1,
+        tl::enums::InputPeer::User(u) if u.user_id == 1 && u.access_hash == 10
+    ));
+    assert!(
+        members_from_channel(&tl::enums::channels::ChannelParticipants::NotModified).is_empty()
+    );
+}
+
+#[test]
+fn basic_group_members_come_from_the_full_chat() {
+    let full = tl::enums::messages::ChatFull::Full(tl::types::messages::ChatFull {
+        full_chat: tl::enums::ChatFull::Full(tl::types::ChatFull {
+            can_set_username: false,
+            has_scheduled: false,
+            translations_disabled: false,
+            has_welcome_messages: false,
+            id: 7,
+            about: String::new(),
+            participants: tl::enums::ChatParticipants::Participants(tl::types::ChatParticipants {
+                chat_id: 7,
+                participants: vec![
+                    tl::enums::ChatParticipant::Creator(tl::types::ChatParticipantCreator {
+                        user_id: 1,
+                        rank: None,
+                    }),
+                    tl::enums::ChatParticipant::Participant(tl::types::ChatParticipant {
+                        user_id: 3,
+                        inviter_id: 1,
+                        date: 0,
+                        rank: None,
+                    }),
+                ],
+                version: 1,
+            }),
+            chat_photo: None,
+            notify_settings: peer_notify(None, None, None),
+            exported_invite: None,
+            bot_info: None,
+            pinned_msg_id: None,
+            folder_id: None,
+            call: None,
+            ttl_period: None,
+            groupcall_default_join_as: None,
+            theme_emoticon: None,
+            requests_pending: None,
+            recent_requesters: None,
+            available_reactions: None,
+            reactions_limit: None,
+        }),
+        chats: vec![],
+        users: vec![
+            raw_user(1, "Ana", None, false),
+            raw_user(3, "Bruno", None, false),
+        ],
+    });
+    let m = members_from_chat_full(&full);
+    assert_eq!(m.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 3]);
 }

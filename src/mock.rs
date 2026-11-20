@@ -17,8 +17,9 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::auth::SignInOutcome;
 use crate::error::{AuthError, Error, Phone, Result};
 use crate::model::{
-    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Folder, GlobalHit, Media, Message, MessageId, PeerInfo,
-    Presence, Reaction, SharedBody, SharedItem, SharedKind, SharedPage, TypingAction, User,
+    CHANNEL_OFFSET, Chat, ChatId, ChatKind, Folder, GlobalHit, Media, Member, Message, MessageId,
+    NotifyDefaults, NotifySettings, NotifyTarget, PeerInfo, Presence, Reaction, SharedBody,
+    SharedItem, SharedKind, SharedPage, TypingAction, User,
 };
 use crate::net::{Event, EventHub, TelegramApi, UploadKind};
 
@@ -190,6 +191,9 @@ fn chats_and_history() -> (Vec<Chat>, BTreeMap<ChatId, Vec<Message>>) {
         let mut c = Chat::new(id, kind, title);
         c.unread_count = unread;
         c.muted = muted;
+        if muted {
+            c.notify.mute_until = Some(crate::model::MUTE_FOREVER);
+        }
         c.pinned = pinned;
         c.last_message = msgs.last().cloned();
         c.last_date = c.last_message.as_ref().map_or(0, |m| m.date);
@@ -536,6 +540,8 @@ struct State {
     /// How many dialogs the paging cursor has handed out.
     dialog_cursor: usize,
     folders: Vec<Folder>,
+    notify_defaults: NotifyDefaults,
+    blocked: std::collections::HashSet<ChatId>,
 }
 
 pub struct FakeTelegram {
@@ -573,6 +579,8 @@ impl FakeTelegram {
                 next_id: 10_000,
                 dialog_cursor: 0,
                 folders: mock_folders(),
+                notify_defaults: NotifyDefaults::default(),
+                blocked: std::collections::HashSet::new(),
             }),
             opts,
             events: Arc::new(EventHub::new()),
@@ -598,6 +606,41 @@ impl FakeTelegram {
             s.history.entry(m.chat_id).or_default().push(m.clone());
         }
         self.events.emit(ev);
+    }
+
+    /// Set the account defaults `notify_defaults` will return.
+    pub fn set_notify_defaults(&self, d: NotifyDefaults) {
+        if let Ok(mut s) = self.st() {
+            s.notify_defaults = d;
+        }
+    }
+
+    /// Whether `chat` is blocked on the fake server.
+    pub fn is_blocked(&self, chat: ChatId) -> bool {
+        self.st().is_ok_and(|s| s.blocked.contains(&chat))
+    }
+
+    /// The fake server's notification settings of `chat`.
+    pub fn notify_of(&self, chat: ChatId) -> Option<NotifySettings> {
+        self.st()
+            .ok()?
+            .chats
+            .iter()
+            .find(|c| c.id == chat)
+            .map(|c| c.notify)
+    }
+
+    /// Whether the fake server still has the chat.
+    pub fn has_chat(&self, chat: ChatId) -> bool {
+        self.st()
+            .is_ok_and(|s| s.chats.iter().any(|c| c.id == chat))
+    }
+
+    /// Number of messages the fake server holds for `chat`.
+    pub fn history_len(&self, chat: ChatId) -> usize {
+        self.st()
+            .map(|s| s.history.get(&chat).map_or(0, Vec::len))
+            .unwrap_or(0)
     }
 
     async fn call(&self, name: &str) -> Result<()> {
@@ -877,7 +920,14 @@ impl TelegramApi for FakeTelegram {
         Ok(())
     }
 
-    async fn search(&self, chat: ChatId, query: String) -> Result<Vec<Message>> {
+    async fn search(
+        &self,
+        chat: ChatId,
+        query: String,
+        from: Option<i64>,
+        offset_id: MessageId,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
         self.call("search").await?;
         let q = query.to_lowercase();
         let s = self.st()?;
@@ -886,13 +936,42 @@ impl TelegramApi for FakeTelegram {
             .get(&chat)
             .map(|h| {
                 h.iter()
-                    .filter(|m| m.text.to_lowercase().contains(&q))
+                    .filter(|m| !m.service && m.text.to_lowercase().contains(&q))
+                    .filter(|m| from.is_none_or(|f| m.sender_id == Some(f)))
+                    .filter(|m| offset_id <= 0 || m.id < offset_id)
                     .cloned()
                     .collect()
             })
             .unwrap_or_default();
         out.reverse();
-        out.truncate(50);
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn members(&self, chat: ChatId, limit: usize) -> Result<Vec<Member>> {
+        self.call("members").await?;
+        let s = self.st()?;
+        let mut out: Vec<Member> = Vec::new();
+        if chat < 0 {
+            for m in s.history.get(&chat).into_iter().flatten() {
+                if let (Some(id), Some(name)) = (m.sender_id, &m.sender_name)
+                    && !out.iter().any(|x| x.id == id)
+                {
+                    out.push(Member {
+                        id,
+                        name: name.clone(),
+                    });
+                }
+            }
+            out.insert(
+                0,
+                Member {
+                    id: SELF_ID,
+                    name: me().name,
+                },
+            );
+        }
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -977,16 +1056,84 @@ impl TelegramApi for FakeTelegram {
     async fn peer_info(&self, chat: ChatId) -> Result<PeerInfo> {
         self.call("peer_info").await?;
         self.require_auth()?;
-        Ok(mock_peer_info(chat))
+        let mut info = mock_peer_info(chat);
+        info.blocked = self.st()?.blocked.contains(&chat);
+        Ok(info)
     }
 
-    async fn set_muted(&self, chat: ChatId, muted: bool) -> Result<()> {
-        self.call(if muted { "mute" } else { "unmute" }).await?;
+    async fn set_mute(&self, chat: ChatId, until: i64) -> Result<()> {
+        self.call(if until == 0 { "unmute" } else { "mute" })
+            .await?;
         self.require_auth()?;
-        if let Some(c) = self.st()?.chats.iter_mut().find(|c| c.id == chat) {
-            c.muted = muted;
+        let settings = {
+            let mut s = self.st()?;
+            let c = s
+                .chats
+                .iter_mut()
+                .find(|c| c.id == chat)
+                .ok_or_else(|| Error::Protocol("unknown peer".into()))?;
+            c.notify.mute_until = Some(until);
+            c.notify
+        };
+        self.events.emit(Event::Notify {
+            target: NotifyTarget::Chat(chat),
+            settings,
+        });
+        Ok(())
+    }
+
+    async fn notify_defaults(&self) -> Result<NotifyDefaults> {
+        self.call("notify_defaults").await?;
+        self.require_auth()?;
+        Ok(self.st()?.notify_defaults)
+    }
+
+    async fn clear_history(&self, chat: ChatId, revoke: bool) -> Result<()> {
+        self.call(if revoke {
+            "clear_history+revoke"
+        } else {
+            "clear_history"
+        })
+        .await?;
+        self.require_auth()?;
+        let mut s = self.st()?;
+        s.history.insert(chat, Vec::new());
+        if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat) {
+            c.last_message = None;
+            c.unread_count = 0;
         }
-        self.events.emit(Event::Muted { chat, muted });
+        Ok(())
+    }
+
+    async fn delete_chat(&self, chat: ChatId, revoke: bool) -> Result<()> {
+        let name = if chat > 0 {
+            if revoke {
+                "delete_chat+revoke"
+            } else {
+                "delete_chat"
+            }
+        } else if chat > -CHANNEL_OFFSET {
+            "leave_group"
+        } else {
+            "leave_channel"
+        };
+        self.call(name).await?;
+        self.require_auth()?;
+        let mut s = self.st()?;
+        s.chats.retain(|c| c.id != chat);
+        s.history.remove(&chat);
+        Ok(())
+    }
+
+    async fn set_blocked(&self, chat: ChatId, blocked: bool) -> Result<()> {
+        self.call(if blocked { "block" } else { "unblock" }).await?;
+        self.require_auth()?;
+        let mut s = self.st()?;
+        if blocked {
+            s.blocked.insert(chat);
+        } else {
+            s.blocked.remove(&chat);
+        }
         Ok(())
     }
 
@@ -1089,30 +1236,35 @@ pub fn mock_peer_info(chat: ChatId) -> PeerInfo {
             username: Some("alice_j".into()),
             phone: Some("+34 600 111 222".into()),
             members: None,
+            blocked: false,
         },
         RUST_GROUP => PeerInfo {
             about: Some("Rust enthusiasts in Madrid. Be kind, share code, bring snacks.".into()),
             username: None,
             phone: None,
             members: Some(4_721),
+            blocked: false,
         },
         DEV_CHANNEL => PeerInfo {
             about: Some("Release notes and news about Ferrogram.".into()),
             username: Some("ferrogram_dev".into()),
             phone: None,
             members: Some(12_840),
+            blocked: false,
         },
         c if c > 0 => PeerInfo {
             about: None,
             username: None,
             phone: None,
             members: None,
+            blocked: false,
         },
         _ => PeerInfo {
             about: Some("A group chat.".into()),
             username: None,
             phone: None,
             members: Some(12),
+            blocked: false,
         },
     }
 }

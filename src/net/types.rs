@@ -7,8 +7,9 @@ use grammers_client::tl;
 
 use super::Event;
 use crate::model::{
-    CHANNEL_OFFSET, ChatId, Draft, Folder, Media, Message, PeerInfo, Presence, Reaction, SendState,
-    SharedBody, SharedItem, SharedKind, SharedPage, TypingAction,
+    CHANNEL_OFFSET, ChatId, Draft, Folder, Media, Member, Message, NotifyScope, NotifySettings,
+    NotifyTarget, PeerInfo, Presence, Reaction, SendState, SharedBody, SharedItem, SharedKind,
+    SharedPage, TypingAction,
 };
 
 /// `tl::Peer` → Bot-API style chat id.
@@ -245,18 +246,21 @@ pub fn event_from_update_as(update: &tl::enums::Update, self_id: i64) -> Option<
                 .and_then(|f| folder_from_tl(f, self_id))
                 .map(|(f, _)| f),
         }),
-        U::NotifySettings(u) => match &u.peer {
-            tl::enums::NotifyPeer::Peer(p) => {
-                let tl::enums::PeerNotifySettings::Settings(ns) = &u.notify_settings;
-                Some(Event::Muted {
-                    chat: peer_to_chat_id(&p.peer),
-                    muted: ns
-                        .mute_until
-                        .is_some_and(|t| i64::from(t) > chrono::Utc::now().timestamp()),
-                })
-            }
-            _ => None,
-        },
+        U::NotifySettings(u) => {
+            let target = match &u.peer {
+                tl::enums::NotifyPeer::Peer(p) => NotifyTarget::Chat(peer_to_chat_id(&p.peer)),
+                tl::enums::NotifyPeer::NotifyUsers => NotifyTarget::Scope(NotifyScope::Users),
+                tl::enums::NotifyPeer::NotifyChats => NotifyTarget::Scope(NotifyScope::Chats),
+                tl::enums::NotifyPeer::NotifyBroadcasts => {
+                    NotifyTarget::Scope(NotifyScope::Broadcasts)
+                }
+                _ => return None,
+            };
+            Some(Event::Notify {
+                target,
+                settings: notify_from_tl(&u.notify_settings),
+            })
+        }
         U::DialogFilterOrder(u) => Some(Event::FoldersOrder(u.order.clone())),
         U::DialogFilters => Some(Event::FoldersStale),
         U::NewMessage(u) => message_from_tl(&u.message).map(Event::NewMessage),
@@ -591,6 +595,7 @@ pub fn peer_info_from_user_full(r: &tl::enums::users::UserFull, user_id: i64) ->
     let tl::enums::UserFull::Full(full) = &r.full_user;
     let mut info = PeerInfo {
         about: full.about.clone().filter(|a| !a.trim().is_empty()),
+        blocked: full.blocked,
         ..PeerInfo::default()
     };
     for u in &r.users {
@@ -639,6 +644,120 @@ pub fn peer_info_from_chat_full(r: &tl::enums::messages::ChatFull, chat: ChatId)
         }
     }
     info
+}
+
+/// A `messages.search` answer → messages, newest first as the server sent
+/// them, with sender names filled in from the users it carried.
+pub fn messages_from_tl(r: &tl::enums::messages::Messages) -> Vec<Message> {
+    use tl::enums::messages::Messages as R;
+    let (messages, users) = match r {
+        R::Messages(m) => (&m.messages, &m.users),
+        R::Slice(m) => (&m.messages, &m.users),
+        R::ChannelMessages(m) => (&m.messages, &m.users),
+        R::NotModified(_) => return Vec::new(),
+    };
+    let names: std::collections::HashMap<i64, String> = users
+        .iter()
+        .filter_map(|u| user_display_name(u).map(|n| (user_id(u), n)))
+        .collect();
+    messages
+        .iter()
+        .filter_map(message_from_tl)
+        .map(|mut m| {
+            if m.sender_name.is_none() && !m.outgoing {
+                m.sender_name = m.sender_id.and_then(|id| names.get(&id).cloned());
+            }
+            m
+        })
+        .collect()
+}
+
+fn user_id(u: &tl::enums::User) -> i64 {
+    match u {
+        tl::enums::User::User(u) => u.id,
+        tl::enums::User::Empty(u) => u.id,
+    }
+}
+
+fn user_display_name(u: &tl::enums::User) -> Option<String> {
+    let tl::enums::User::User(u) = u else {
+        return None;
+    };
+    let name = [u.first_name.as_deref(), u.last_name.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(name).filter(|n| !n.is_empty())
+}
+
+fn members_from_users(ids: impl Iterator<Item = i64>, users: &[tl::enums::User]) -> Vec<Member> {
+    let by_id: std::collections::HashMap<i64, &tl::enums::User> =
+        users.iter().map(|u| (user_id(u), u)).collect();
+    ids.filter_map(|id| {
+        let u = by_id.get(&id)?;
+        // Deleted accounts and bots-by-name are not useful search targets.
+        if matches!(u, tl::enums::User::User(x) if x.deleted) {
+            return None;
+        }
+        Some(Member {
+            id,
+            name: user_display_name(u)?,
+        })
+    })
+    .collect()
+}
+
+/// `InputPeer`s (with access hashes) of the users in a response, so they can
+/// be used as the `from_id` of a search.
+pub fn user_input_peers(users: &[tl::enums::User]) -> Vec<(i64, tl::enums::InputPeer)> {
+    users
+        .iter()
+        .filter_map(|u| match u {
+            tl::enums::User::User(u) => Some((
+                u.id,
+                tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                    user_id: u.id,
+                    access_hash: u.access_hash?,
+                }),
+            )),
+            tl::enums::User::Empty(_) => None,
+        })
+        .collect()
+}
+
+/// Members of a supergroup from `channels.getParticipants`.
+pub fn members_from_channel(r: &tl::enums::channels::ChannelParticipants) -> Vec<Member> {
+    use tl::enums::ChannelParticipant as P;
+    let tl::enums::channels::ChannelParticipants::Participants(r) = r else {
+        return Vec::new();
+    };
+    let ids = r.participants.iter().filter_map(|p| match p {
+        P::Participant(p) => Some(p.user_id),
+        P::ParticipantSelf(p) => Some(p.user_id),
+        P::Creator(p) => Some(p.user_id),
+        P::Admin(p) => Some(p.user_id),
+        _ => None,
+    });
+    members_from_users(ids, &r.users)
+}
+
+/// Members of a basic group from `messages.getFullChat`.
+pub fn members_from_chat_full(r: &tl::enums::messages::ChatFull) -> Vec<Member> {
+    let tl::enums::messages::ChatFull::Full(r) = r;
+    let tl::enums::ChatFull::Full(c) = &r.full_chat else {
+        return Vec::new();
+    };
+    let tl::enums::ChatParticipants::Participants(p) = &c.participants else {
+        return Vec::new();
+    };
+    let ids = p.participants.iter().map(|x| match x {
+        tl::enums::ChatParticipant::Participant(x) => x.user_id,
+        tl::enums::ChatParticipant::Creator(x) => x.user_id,
+        tl::enums::ChatParticipant::Admin(x) => x.user_id,
+    });
+    members_from_users(ids, &r.users)
 }
 
 // ------------------------------------------------------------------ folders
@@ -804,30 +923,39 @@ pub fn folders_from_tl(
     (folders, peers)
 }
 
+/// `peerNotifySettings` → our model. Unset fields stay `None` (inherit the
+/// account default).
+pub fn notify_from_tl(s: &tl::enums::PeerNotifySettings) -> NotifySettings {
+    let tl::enums::PeerNotifySettings::Settings(ns) = s;
+    NotifySettings {
+        mute_until: ns.mute_until.map(i64::from),
+        silent: ns.silent,
+        show_previews: ns.show_previews,
+    }
+}
+
 /// Per-dialog counters from a raw `tl::Dialog`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DialogInfo {
     pub draft: Option<Draft>,
     pub unread: u32,
     pub pinned: bool,
-    pub muted: bool,
+    /// The dialog's own notification settings (defaults are applied later).
+    pub notify: NotifySettings,
     pub read_inbox: i32,
     pub read_outbox: i32,
 }
 
-pub fn dialog_info(raw: &tl::enums::Dialog, now: i64) -> DialogInfo {
+pub fn dialog_info(raw: &tl::enums::Dialog) -> DialogInfo {
     match raw {
-        tl::enums::Dialog::Dialog(d) => {
-            let tl::enums::PeerNotifySettings::Settings(ns) = &d.notify_settings;
-            DialogInfo {
-                draft: d.draft.as_ref().and_then(draft_from_tl),
-                unread: u32::try_from(d.unread_count).unwrap_or(0),
-                pinned: d.pinned,
-                muted: ns.mute_until.is_some_and(|t| i64::from(t) > now),
-                read_inbox: d.read_inbox_max_id,
-                read_outbox: d.read_outbox_max_id,
-            }
-        }
+        tl::enums::Dialog::Dialog(d) => DialogInfo {
+            draft: d.draft.as_ref().and_then(draft_from_tl),
+            unread: u32::try_from(d.unread_count).unwrap_or(0),
+            pinned: d.pinned,
+            notify: notify_from_tl(&d.notify_settings),
+            read_inbox: d.read_inbox_max_id,
+            read_outbox: d.read_outbox_max_id,
+        },
         _ => DialogInfo::default(),
     }
 }

@@ -183,6 +183,51 @@ impl AvatarImage {
     }
 }
 
+/// A shared-media preview, decoded and cropped to a fixed square off the UI
+/// thread, so the grid only ever draws small, equally sized RGBA tiles.
+#[derive(Clone)]
+pub struct ThumbImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl std::fmt::Debug for ThumbImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ThumbImage({}x{})", self.width, self.height)
+    }
+}
+
+impl ThumbImage {
+    /// Decoded size in memory (what the cache budget counts).
+    pub fn cost(&self) -> usize {
+        self.rgba.len().max(1)
+    }
+
+    /// Decode, then scale and centre-crop to `side` x `side` (the grid draws
+    /// cells with `ContentFit::Cover`, so this is what it showed before,
+    /// minus the per-frame scaling). The header is validated first
+    /// ([`crate::app::state::photo_is_acceptable`]), so a hostile preview
+    /// cannot make the decoder allocate more than the pixel cap allows.
+    pub fn decode(bytes: &[u8], side: u32) -> Option<Self> {
+        if side == 0 || !crate::app::state::photo_is_acceptable(bytes) {
+            return None;
+        }
+        let img = image::load_from_memory(bytes).ok()?;
+        if img.width() == 0 || img.height() == 0 {
+            return None;
+        }
+        let tile = img
+            .resize_to_fill(side, side, image::imageops::FilterType::Triangle)
+            .to_rgba8();
+        Some(Self {
+            width: tile.width(),
+            height: tile.height(),
+            rgba: tile.into_raw(),
+        })
+    }
+}
+
 /// Mark a downloaded file owner-read/write only: no execute bit, whatever
 /// the umask says.
 pub fn make_non_executable(path: &Path) {
@@ -204,6 +249,56 @@ mod tests {
         assert_eq!(alpha(63, 63), 0);
         assert_eq!(alpha(32, 32), 255, "centre is opaque");
         assert!(alpha(32, 1) > 0, "edge midpoints are inside the circle");
+    }
+
+    #[test]
+    fn thumbnails_become_fixed_size_tiles_whatever_the_source_shape() {
+        for (w, h) in [(320, 320), (90, 160), (400, 120), (32, 32)] {
+            let png = crate::mock::mock_photo_png(1, w, h);
+            let t = ThumbImage::decode(&png, 64).unwrap();
+            assert_eq!((t.width, t.height), (64, 64), "{w}x{h}");
+            assert_eq!(t.rgba.len(), 64 * 64 * 4);
+            assert_eq!(t.cost(), 64 * 64 * 4);
+        }
+    }
+
+    #[test]
+    fn thumbnail_crop_is_centred() {
+        // Left half red, right half blue: a wide source keeps both halves
+        // visible in the cropped square, not just the left.
+        let (w, h) = (40u32, 10u32);
+        let mut px = Vec::new();
+        for _ in 0..h {
+            for x in 0..w {
+                px.extend_from_slice(if x < w / 2 {
+                    &[255, 0, 0, 255]
+                } else {
+                    &[0, 0, 255, 255]
+                });
+            }
+        }
+        let png = crate::mock::encode_png(w, h, &px).unwrap();
+        let t = ThumbImage::decode(&png, 20).unwrap();
+        let at = |x: usize, y: usize| &t.rgba[(y * 20 + x) * 4..(y * 20 + x) * 4 + 3];
+        assert!(at(2, 10)[0] > 200 && at(2, 10)[2] < 60, "left is red");
+        assert!(at(17, 10)[2] > 200 && at(17, 10)[0] < 60, "right is blue");
+    }
+
+    #[test]
+    fn hostile_thumbnails_are_refused_not_decoded() {
+        assert!(ThumbImage::decode(b"", 64).is_none());
+        assert!(ThumbImage::decode(b"not an image at all", 64).is_none());
+        assert!(ThumbImage::decode(&crate::mock::mock_photo_png(1, 8, 8), 0).is_none());
+        let mut bomb = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bomb.extend_from_slice(&60_000u32.to_be_bytes());
+        bomb.extend_from_slice(&60_000u32.to_be_bytes());
+        bomb.extend_from_slice(&[8, 6, 0, 0, 0]);
+        assert!(
+            ThumbImage::decode(&bomb, 64).is_none(),
+            "refused from the header"
+        );
+        let png = crate::mock::mock_photo_png(3, 64, 64);
+        assert!(ThumbImage::decode(&png[..png.len() / 2], 64).is_none());
     }
 
     #[test]

@@ -139,11 +139,65 @@ parsed back before conversion, so the deserialiser is exercised too.
   `inputMessagesFilterPhotoVideo / Document / Url / Music / Voice / Gif`,
   40 per page, `offset_id` = oldest id of the previous page, at most 600
   items per tab. Previews (320 px "m" size) are downloaded 4 at a time from
-  a bounded queue into a 12 MB LRU that is dropped when the panel closes or
-  the chat changes. Photos open the viewer, other items jump to their
+  a bounded queue into a 16 MB LRU that is dropped when the panel closes or
+  the chat changes (round 4: only rows near the viewport are fetched, and the
+  previews are decoded and cropped to the drawn size; see "Round 4"). Photos open the viewer, other items jump to their
   message, links open in the browser (`desktop::open_url`: http(s) only).
 
+## Round 4 features
+
+**Notification settings** (`model::NotifySettings`, `NotifyDefaults`).
+`peerNotifySettings` is read from every `Dialog` (`mute_until`, `silent`,
+`show_previews`; unset stays unset) and from `updateNotifySettings`
+(`Event::Notify`, target = a chat or `notifyUsers/Chats/Broadcasts`). The
+account defaults come from `account.getNotifySettings` for
+`inputNotifyUsers` (private chats, bots), `inputNotifyChats` (groups and
+supergroups) and `inputNotifyBroadcasts` (channels), fetched after every
+sign-in. `NotifyDefaults::resolve` gives the effective state: the chat's own
+field if set, else the default of its kind, else loud with previews; Saved
+Messages is never muted. `Chat::muted` is that result, recomputed by
+`ChatList` when settings, defaults or the clock change (a 30 s tick expires
+timed mutes). A muted chat: no OS notification (`should_notify`), grey
+badge, left out of the tray unread count and attention state. `silent`
+shows the notification without sound (`SuppressSound` hint), `show_previews
+= false` shows "New message". Muting here calls `account.updateNotifySettings`
+with only `mute_until` (explicit `0` to unmute, which beats a "muted by
+default" setting) and is optimistic with revert. Cached in `chats`
+(`notify_*` columns, migration 6) and `kv` (`notify_defaults`).
+
+**In-chat search** (`app/chatmenu.rs::ChatSearch`). `messages.search` with
+the peer, 50 per page, `offset_id` = oldest id so far, at most 500 hits;
+typing searches after 350 ms, the arrows and Enter walk the hits (newest
+first; up = older) and jump to each with the existing window/highlight
+machinery; stepping past a full page fetches the next. The "from:" filter
+(`from_id`, groups only) lists members from `messages.getFullChat` (basic
+groups) or `channels.getParticipants` (recent 200); access hashes come from
+the same answers. Answers carry a version so a late page for an old query is
+ignored.
+
+**⋮ menu** (`menu_items` decides the entries per chat kind): View
+profile/info (toggles the panel), Mute for 1 h / 8 h / 1 day / 1 week /
+forever or Unmute, Search, Select messages (tick, Copy, Delete with
+confirmation), Add to folder, Clear history (`messages.deleteHistory`
+`just_clear`, repeated while `offset > 0`; basic groups and private chats
+only: clearing a supergroup needs admin rights we do not know), Delete chat
+(`messages.deleteHistory`), Leave group (`messages.deleteChatUser` + delete
+the dialog) / Leave channel (`channels.leaveChannel`), Block/Unblock
+(`contacts.block` / `contacts.unblock`; the state comes from
+`userFull.blocked`). Destructive entries ask first; private chats offer
+"Also delete for X" (`revoke`).
+
+**Media grid.** Fixed-height rows (`app::info::ROW_H`) let the view build
+only the rows around the viewport (scroll offset from `on_scroll`, spacers
+for the rest); only their previews are requested. Previews are decoded and
+centre-cropped on `spawn_blocking` to a square of exactly the drawn size
+(`CELL` x the window scale factor) and cached as RGBA handles.
+
 ## Not implemented (round 2)
+
+Round 4 leaves out "Export chat" (needs the desktop-only export flow),
+forwarding selected messages, per-chat sound/preview overrides in the UI
+(read and honoured, not editable) and a disk cache for shared-media previews.
 
 Archived chats (`DialogIter` cannot set `folder_id`; needs a raw
 `messages.getDialogs` with our own peer conversion and peer caching), voice

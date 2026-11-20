@@ -52,7 +52,13 @@ pub struct Chat {
     pub kind: ChatKind,
     pub title: String,
     pub unread_count: u32,
+    /// Effective mute state: this chat's own setting, or the account default
+    /// for its kind, evaluated at `now` (recomputed by
+    /// `ChatList::refresh_notify`; never stored on its own).
     pub muted: bool,
+    /// The chat's own notification settings as Telegram has them
+    /// (`peerNotifySettings`); unset fields inherit the account default.
+    pub notify: NotifySettings,
     pub pinned: bool,
     /// Highest outgoing message id the peer has read.
     pub read_outbox_max_id: MessageId,
@@ -71,6 +77,166 @@ pub struct Chat {
     /// The other side of a private chat is in our contacts (folders can
     /// include "Contacts" / "Non-contacts").
     pub contact: bool,
+}
+
+/// "Muted forever" as the official clients send it (the largest timestamp).
+pub const MUTE_FOREVER: i64 = i32::MAX as i64;
+
+/// `peerNotifySettings`: `None` means "not set for this peer", i.e. use the
+/// account default of its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct NotifySettings {
+    /// Muted while this unix time is in the future.
+    pub mute_until: Option<i64>,
+    /// Show the notification but play no sound.
+    pub silent: Option<bool>,
+    /// Show message text in notifications (`false` = sender only).
+    pub show_previews: Option<bool>,
+}
+
+impl NotifySettings {
+    /// Muted at `now` by this setting alone (`None` = not decided here).
+    pub fn muted_at(&self, now: i64) -> Option<bool> {
+        self.mute_until.map(|t| t > now)
+    }
+}
+
+/// Which account-wide default applies to a chat
+/// (`inputNotifyUsers` / `inputNotifyChats` / `inputNotifyBroadcasts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotifyScope {
+    Users,
+    Chats,
+    Broadcasts,
+}
+
+impl NotifyScope {
+    pub const ALL: [Self; 3] = [Self::Users, Self::Chats, Self::Broadcasts];
+
+    pub fn of(kind: ChatKind) -> Self {
+        match kind {
+            ChatKind::User | ChatKind::Bot | ChatKind::SavedMessages => Self::Users,
+            ChatKind::Group => Self::Chats,
+            ChatKind::Channel => Self::Broadcasts,
+        }
+    }
+}
+
+/// What a notification-settings update is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyTarget {
+    Chat(ChatId),
+    Scope(NotifyScope),
+}
+
+/// The account's default notification settings, one per chat kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct NotifyDefaults {
+    pub users: NotifySettings,
+    pub chats: NotifySettings,
+    pub broadcasts: NotifySettings,
+}
+
+/// What actually applies to a chat once defaults are taken into account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveNotify {
+    pub muted: bool,
+    pub silent: bool,
+    pub show_previews: bool,
+}
+
+impl NotifyDefaults {
+    pub fn get(&self, scope: NotifyScope) -> &NotifySettings {
+        match scope {
+            NotifyScope::Users => &self.users,
+            NotifyScope::Chats => &self.chats,
+            NotifyScope::Broadcasts => &self.broadcasts,
+        }
+    }
+
+    pub fn set(&mut self, scope: NotifyScope, s: NotifySettings) {
+        match scope {
+            NotifyScope::Users => self.users = s,
+            NotifyScope::Chats => self.chats = s,
+            NotifyScope::Broadcasts => self.broadcasts = s,
+        }
+    }
+
+    /// Own setting first, then the default of the chat's kind. Saved
+    /// Messages is never muted.
+    pub fn resolve(&self, chat: &Chat, now: i64) -> EffectiveNotify {
+        let default = self.get(NotifyScope::of(chat.kind));
+        let own = &chat.notify;
+        EffectiveNotify {
+            muted: chat.kind != ChatKind::SavedMessages
+                && own
+                    .muted_at(now)
+                    .or_else(|| default.muted_at(now))
+                    .unwrap_or(false),
+            silent: own.silent.or(default.silent).unwrap_or(false),
+            show_previews: own.show_previews.or(default.show_previews).unwrap_or(true),
+        }
+    }
+}
+
+/// How long the user mutes a chat for (the "Mute for…" menu).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuteFor {
+    Hour,
+    Hours8,
+    Day,
+    Week,
+    Forever,
+    /// Unmute.
+    Off,
+}
+
+impl MuteFor {
+    pub const CHOICES: [Self; 5] = [
+        Self::Hour,
+        Self::Hours8,
+        Self::Day,
+        Self::Week,
+        Self::Forever,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hour => "For 1 hour",
+            Self::Hours8 => "For 8 hours",
+            Self::Day => "For 1 day",
+            Self::Week => "For 1 week",
+            Self::Forever => "Forever",
+            Self::Off => "Unmute",
+        }
+    }
+
+    /// The `mute_until` to send: a unix time, `0` to unmute.
+    pub fn until(self, now: i64) -> i64 {
+        match self {
+            Self::Hour => now + 3600,
+            Self::Hours8 => now + 8 * 3600,
+            Self::Day => now + 86_400,
+            Self::Week => now + 7 * 86_400,
+            Self::Forever => MUTE_FOREVER,
+            Self::Off => 0,
+        }
+    }
+}
+
+/// A group member offered by the in-chat search "from:" filter.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Member {
+    pub id: i64,
+    pub name: String,
+}
+
+impl fmt::Debug for Member {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Member")
+            .field("name_len", &self.name.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A draft message. The body is private: `Debug` only prints its length.
@@ -139,6 +305,7 @@ impl Chat {
             title: title.into(),
             unread_count: 0,
             muted: false,
+            notify: NotifySettings::default(),
             pinned: false,
             read_outbox_max_id: 0,
             read_inbox_max_id: 0,
@@ -351,6 +518,8 @@ pub struct PeerInfo {
     pub phone: Option<String>,
     /// Members of a group or subscribers of a channel, when Telegram says.
     pub members: Option<u32>,
+    /// We blocked this user (`userFull.blocked`).
+    pub blocked: bool,
 }
 
 impl fmt::Debug for PeerInfo {
@@ -360,6 +529,7 @@ impl fmt::Debug for PeerInfo {
             .field("has_username", &self.username.is_some())
             .field("has_phone", &self.phone.is_some())
             .field("members", &self.members)
+            .field("blocked", &self.blocked)
             .finish()
     }
 }
@@ -707,6 +877,97 @@ pub enum ConnState {
     Connecting,
     Connected,
     Reconnecting { attempt: u32 },
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+
+    fn chat(kind: ChatKind) -> Chat {
+        Chat::new(1, kind, "c")
+    }
+
+    fn muted_until(t: i64) -> NotifySettings {
+        NotifySettings {
+            mute_until: Some(t),
+            ..NotifySettings::default()
+        }
+    }
+
+    #[test]
+    fn scopes_follow_the_chat_kind() {
+        assert_eq!(NotifyScope::of(ChatKind::User), NotifyScope::Users);
+        assert_eq!(NotifyScope::of(ChatKind::Bot), NotifyScope::Users);
+        assert_eq!(NotifyScope::of(ChatKind::Group), NotifyScope::Chats);
+        assert_eq!(NotifyScope::of(ChatKind::Channel), NotifyScope::Broadcasts);
+    }
+
+    #[test]
+    fn own_setting_beats_the_default_and_unset_inherits() {
+        let mut d = NotifyDefaults::default();
+        d.set(NotifyScope::Broadcasts, muted_until(MUTE_FOREVER));
+        let mut ch = chat(ChatKind::Channel);
+        assert!(d.resolve(&ch, 100).muted, "inherits 'muted by default'");
+        ch.notify = muted_until(0);
+        assert!(!d.resolve(&ch, 100).muted, "explicit unmute wins");
+        ch.notify = muted_until(50);
+        assert!(!d.resolve(&ch, 100).muted, "expired own mute wins too");
+        ch.notify = muted_until(500);
+        assert!(d.resolve(&ch, 100).muted);
+        // Other kinds are untouched by the channel default.
+        assert!(!d.resolve(&chat(ChatKind::Group), 100).muted);
+        assert!(!d.resolve(&chat(ChatKind::User), 100).muted);
+    }
+
+    #[test]
+    fn timed_defaults_expire() {
+        let mut d = NotifyDefaults::default();
+        d.set(NotifyScope::Users, muted_until(200));
+        assert!(d.resolve(&chat(ChatKind::User), 199).muted);
+        assert!(!d.resolve(&chat(ChatKind::User), 200).muted);
+    }
+
+    #[test]
+    fn silent_and_previews_inherit_independently() {
+        let mut d = NotifyDefaults::default();
+        d.set(
+            NotifyScope::Chats,
+            NotifySettings {
+                mute_until: None,
+                silent: Some(true),
+                show_previews: Some(false),
+            },
+        );
+        let mut g = chat(ChatKind::Group);
+        let e = d.resolve(&g, 0);
+        assert!(!e.muted && e.silent && !e.show_previews);
+        g.notify.silent = Some(false);
+        g.notify.show_previews = Some(true);
+        let e = d.resolve(&g, 0);
+        assert!(!e.silent && e.show_previews);
+        // Nothing set anywhere: loud, with previews.
+        let e = NotifyDefaults::default().resolve(&chat(ChatKind::User), 0);
+        assert_eq!((e.muted, e.silent, e.show_previews), (false, false, true));
+    }
+
+    #[test]
+    fn saved_messages_are_never_muted() {
+        let mut d = NotifyDefaults::default();
+        d.set(NotifyScope::Users, muted_until(MUTE_FOREVER));
+        assert!(!d.resolve(&chat(ChatKind::SavedMessages), 0).muted);
+        assert!(d.resolve(&chat(ChatKind::User), 0).muted);
+    }
+
+    #[test]
+    fn mute_durations() {
+        assert_eq!(MuteFor::Hour.until(1000), 4600);
+        assert_eq!(MuteFor::Hours8.until(0), 8 * 3600);
+        assert_eq!(MuteFor::Day.until(0), 86_400);
+        assert_eq!(MuteFor::Week.until(0), 7 * 86_400);
+        assert_eq!(MuteFor::Forever.until(0), MUTE_FOREVER);
+        assert_eq!(MuteFor::Off.until(1234), 0);
+        assert_eq!(MuteFor::CHOICES.len(), 5);
+    }
 }
 
 #[cfg(test)]
