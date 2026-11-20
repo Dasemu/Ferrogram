@@ -156,6 +156,20 @@ pub enum Ui {
     // background mode
     /// A request from the tray, a second launch or a notification click.
     Remote(crate::remote::Remote),
+    // one-to-one calls
+    /// The phone button in the chat header or the info panel.
+    CallStart(ChatId),
+    CallAccept,
+    /// Hang up, cancel or decline.
+    CallHangUp,
+    CallToggleMute,
+    /// Show the full call panel (`true`) or just the bar above the chat.
+    CallExpand(bool),
+    /// Open or close the microphone / speaker list.
+    CallDevices(Option<crate::app::phone::DeviceKind>),
+    CallPickDevice(crate::app::phone::DeviceKind, String),
+    CallTick,
+    CallEngine(crate::net::calls::engine::EngineEvent),
     /// The window's close button (or Alt+F4): to the tray, or quit.
     CloseRequested,
     WindowResized(iced::Size),
@@ -333,4 +347,14 @@ pub enum Done {
     AutostartSet(Result<bool, Error>),
     Screenshot(iced::window::Screenshot),
     ScreenshotSaved,
+    // one-to-one calls
+    CallConfig(Result<crate::net::calls::CallConfig, Error>),
+    CallPlaced(Result<Box<(crate::app::call::DhHalf, crate::net::calls::PhoneCall)>, Error>),
+    CallAccepted(Result<Box<(crate::app::call::DhHalf, crate::net::calls::PhoneCall)>, Error>),
+    CallConfirmed(Result<Box<crate::app::call::Confirmed>, Error>),
+    CallKey(Result<Box<(crate::net::calls::dh::CallKey, [&'static str; 4])>, Error>),
+    CallMedia(crate::app::phone::MediaSlot),
+    CallDevicesListed(Vec<String>, Vec<String>),
+    /// A `phone.*` request without a result we need finished.
+    CallSent(Result<(), Error>),
 }

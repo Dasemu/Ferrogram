@@ -341,3 +341,16 @@ colours chosen by `id % 7`.
 * `tests/chat_header.rs` runs the real `App::update` with its `Task`s against
   `FakeTelegram`; `tests/media_scroll.rs` lays out and rasterises the info
   panel on tiny-skia and compares 60 against 600 items.
+
+### 11.7 One-to-one calls
+
+* `net/calls/`: protocol and media (DH, signaling, STUN/ICE with reflectors,
+  SRTP, RTP, jitter buffer, Opus/cpal audio, the per-call engine task). Pure
+  pieces are sans-IO and unit-tested; `tests/call_loopback.rs` runs two
+  engines over loopback UDP, directly and through a fake reflector.
+* `app/call.rs`: pure reducer (`Calls`, `Phase`, `Cmd`) plus the async DH /
+  `phone.*` steps; `app/phone.rs` runs the commands, owns `CallMedia`
+  (engine + audio, dropped off the UI thread) and subscribes to engine events
+  per call. `ui/call.rs`: modal call panel and the in-call bar.
+* `mock_call.rs`: fake call server whose remote peer runs the real engine on
+  loopback with a test tone (`--mock` calls connect; `tests/call_flow.rs`).

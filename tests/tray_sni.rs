@@ -267,6 +267,7 @@ async fn tray_exports_a_status_notifier_item_and_menu() {
         .set_model(TrayModel {
             unread: 3,
             window_open: true,
+            ringing: false,
             muted: Some("until re-enabled".into()),
             start_minimized: true,
         })

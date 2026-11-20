@@ -147,6 +147,17 @@ pub fn script(config: &Config) -> Task<Message> {
             (500, ui(Ui::SelectChat(ALICE))),
             (1200, ui(Ui::OpenMedia(ALICE, 143))),
         ],
+        ScreenshotTarget::CallIncoming => vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (600, Message::Net(Event::PhoneCall(calls::incoming()))),
+        ],
+        ScreenshotTarget::CallOutgoing => calls::outgoing(),
+        ScreenshotTarget::CallActive => calls::active(),
+        ScreenshotTarget::CallBar => {
+            let mut s = calls::active();
+            s.push((1100, ui(Ui::CallExpand(false))));
+            s
+        }
     };
     let last = steps.iter().map(|s| s.0).max().unwrap_or(0);
     let mut tasks: Vec<Task<Message>> = steps.into_iter().map(|(t, m)| after(t, m)).collect();
@@ -184,4 +195,64 @@ pub fn save(config: &Config, shot: window::Screenshot) -> Task<Message> {
         },
         |_| Message::Done(Done::ScreenshotSaved),
     )
+}
+
+/// Call screens: the states are injected (as the server and engine would
+/// report them) so the images do not depend on timing.
+mod calls {
+    use super::{ALICE, Done, Event, Message, Ui, ui};
+    use crate::net::calls::dh::{self, CallKey};
+    use crate::net::calls::engine::{EngineEvent, LinkState};
+    use crate::net::calls::{CallRef, PhoneCall, Protocol};
+
+    const CALL: CallRef = CallRef {
+        id: 4242,
+        access_hash: 1,
+    };
+
+    pub fn incoming() -> PhoneCall {
+        PhoneCall::Requested {
+            call: CALL,
+            admin_id: ALICE,
+            participant_id: crate::mock::me().id,
+            video: false,
+            g_a_hash: vec![0; 32],
+            protocol: Protocol::ours(),
+        }
+    }
+
+    pub fn outgoing() -> Vec<(u64, Message)> {
+        vec![
+            (400, ui(Ui::SelectChat(ALICE))),
+            (600, ui(Ui::CallStart(ALICE))),
+            (
+                700,
+                Message::Net(Event::PhoneCall(PhoneCall::Waiting {
+                    call: CALL,
+                    admin_id: crate::mock::me().id,
+                    participant_id: ALICE,
+                    video: false,
+                    receive_date: Some(1),
+                })),
+            ),
+        ]
+    }
+
+    pub fn active() -> Vec<(u64, Message)> {
+        let key = CallKey([7; 256]);
+        let emoji = dh::emoji_fingerprint(&key, &[1; 256]);
+        let mut s = outgoing();
+        s.push((
+            800,
+            Message::Done(Done::CallKey(Ok(Box::new((key, emoji))))),
+        ));
+        s.push((
+            900,
+            ui(Ui::CallEngine(EngineEvent::State(LinkState::Connected {
+                relay: false,
+            }))),
+        ));
+        s.push((950, ui(Ui::CallEngine(EngineEvent::Quality(4)))));
+        s
+    }
 }

@@ -19,7 +19,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev \
-            libxkbcommon-dev libwayland-dev libx11-dev libfontconfig1-dev libssl-dev dbus gnome-keyring
+            libxkbcommon-dev libwayland-dev libx11-dev libfontconfig1-dev libssl-dev libasound2-dev libopus-dev cmake dbus gnome-keyring
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
