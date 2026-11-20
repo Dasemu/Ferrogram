@@ -64,7 +64,10 @@ pub struct CallUi {
 }
 
 /// Hashable source for the engine's event stream (one per call).
-struct EngineEvents(Arc<Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>>, i64);
+struct EngineEvents(
+    Arc<Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>>,
+    i64,
+);
 
 impl Hash for EngineEvents {
     fn hash<H: Hasher>(&self, state: &mut H) {

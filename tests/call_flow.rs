@@ -29,7 +29,11 @@ struct Driver {
     events: BoxStream<'static, Event>,
     calls: Calls,
     me: i64,
-    engine: Option<(EngineHandle, Arc<Shared>, mpsc::UnboundedReceiver<EngineEvent>)>,
+    engine: Option<(
+        EngineHandle,
+        Arc<Shared>,
+        mpsc::UnboundedReceiver<EngineEvent>,
+    )>,
     frames: Option<mpsc::Sender<Vec<u8>>>,
 }
 
@@ -72,7 +76,11 @@ impl Driver {
                     self.api.discard_call(call, 0, reason).await.unwrap();
                     Vec::new()
                 }
-                Cmd::Discard { call, duration, reason } => {
+                Cmd::Discard {
+                    call,
+                    duration,
+                    reason,
+                } => {
                     self.api.discard_call(call, duration, reason).await.unwrap();
                     Vec::new()
                 }
@@ -116,7 +124,8 @@ impl Driver {
                             let pcm: Vec<i16> = (0..960)
                                 .map(|_| {
                                     t += 1.0;
-                                    ((t * 660.0 / 48_000.0 * std::f32::consts::TAU).sin() * 9000.0) as i16
+                                    ((t * 660.0 / 48_000.0 * std::f32::consts::TAU).sin() * 9000.0)
+                                        as i16
                                 })
                                 .collect();
                             if ftx.send(enc.encode(&pcm).unwrap()).await.is_err() {
@@ -144,7 +153,11 @@ impl Driver {
     async fn pump_until(&mut self, what: &str, done: impl Fn(&Calls) -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
         while !done(&self.calls) {
-            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}: {:?}", self.calls.session.as_ref().map(|s| &s.phase));
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}: {:?}",
+                self.calls.session.as_ref().map(|s| &s.phase)
+            );
             let engine_ev = async {
                 match self.engine.as_mut() {
                     Some((_, _, rx)) => rx.recv().await,
@@ -192,8 +205,18 @@ impl Driver {
     /// Audio both ways for a moment.
     async fn check_audio(&mut self) {
         let until = std::time::Instant::now() + Duration::from_millis(1500);
-        self.pump_until("audio", move |_| std::time::Instant::now() >= until).await;
-        let ours = self.engine.as_ref().unwrap().1.jitter.lock().unwrap().stats.received;
+        self.pump_until("audio", move |_| std::time::Instant::now() >= until)
+            .await;
+        let ours = self
+            .engine
+            .as_ref()
+            .unwrap()
+            .1
+            .jitter
+            .lock()
+            .unwrap()
+            .stats
+            .received;
         assert!(ours > 20, "we hear the peer: {ours}");
         assert!(self.fake.phone().peer_received() > 20, "the peer hears us");
     }
@@ -208,7 +231,10 @@ fn fast() -> PeerBehaviour {
 }
 
 fn is_active(c: &Calls) -> bool {
-    matches!(c.session.as_ref().map(|s| &s.phase), Some(Phase::Active { .. }))
+    matches!(
+        c.session.as_ref().map(|s| &s.phase),
+        Some(Phase::Active { .. })
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -217,7 +243,10 @@ async fn outgoing_call_connects_and_hangs_up() {
     let cmds = d.calls.start(ALICE, now());
     d.run(cmds).await;
     d.pump_until("ringing", |c| {
-        matches!(c.session.as_ref().map(|s| &s.phase), Some(Phase::Ringing | Phase::ExchangingKeys | Phase::Connecting | Phase::Active { .. }))
+        matches!(
+            c.session.as_ref().map(|s| &s.phase),
+            Some(Phase::Ringing | Phase::ExchangingKeys | Phase::Connecting | Phase::Active { .. })
+        )
     })
     .await;
     d.pump_until("active", is_active).await;
@@ -227,12 +256,21 @@ async fn outgoing_call_connects_and_hangs_up() {
     assert!(matches!(d.phase(), Phase::Active { relay: false, .. }));
     d.check_audio().await;
     let cmds = d.calls.hang_up(now());
-    assert!(cmds.iter().any(|c| matches!(c, Cmd::Discard { reason: DiscardReason::Hangup, .. })));
+    assert!(cmds.iter().any(|c| matches!(
+        c,
+        Cmd::Discard {
+            reason: DiscardReason::Hangup,
+            ..
+        }
+    )));
     d.run(cmds).await;
     assert!(d.engine.is_none());
     let api_calls = d.fake.calls();
     for name in ["dh_config", "request_call", "confirm_call", "discard_call"] {
-        assert!(api_calls.iter().any(|c| c == name), "{name} in {api_calls:?}");
+        assert!(
+            api_calls.iter().any(|c| c == name),
+            "{name} in {api_calls:?}"
+        );
     }
 }
 
@@ -250,8 +288,17 @@ async fn incoming_call_is_accepted_and_peer_hangs_up() {
     assert_eq!(s.peer, ALICE);
     d.check_audio().await;
     d.fake.phone().peer_hang_up();
-    d.pump_until("ended", |c| c.session.as_ref().is_some_and(|s| s.is_ended())).await;
-    assert!(matches!(d.phase(), Phase::Ended { reason: EndReason::HungUp, .. }));
+    d.pump_until("ended", |c| {
+        c.session.as_ref().is_some_and(|s| s.is_ended())
+    })
+    .await;
+    assert!(matches!(
+        d.phase(),
+        Phase::Ended {
+            reason: EndReason::HungUp,
+            ..
+        }
+    ));
     assert!(d.engine.is_none(), "engine stopped");
 }
 
@@ -262,7 +309,13 @@ async fn declined_incoming_and_unanswered_outgoing() {
     d.fake.phone().ring(ALICE).await.unwrap();
     d.pump_until("ringing", |c| c.is_ringing_in()).await;
     let cmds = d.calls.hang_up(now());
-    assert!(cmds.iter().any(|c| matches!(c, Cmd::Discard { reason: DiscardReason::Busy, .. })));
+    assert!(cmds.iter().any(|c| matches!(
+        c,
+        Cmd::Discard {
+            reason: DiscardReason::Busy,
+            ..
+        }
+    )));
     d.run(cmds).await;
 
     // Nobody answers: the ring timeout cancels with Missed.
@@ -273,7 +326,16 @@ async fn declined_incoming_and_unanswered_outgoing() {
     d.calls.config.ring_timeout_ms = 2000;
     let cmds = d.calls.start(ALICE, now());
     d.run(cmds).await;
-    d.pump_until("missed", |c| c.session.as_ref().is_some_and(|s| s.is_ended())).await;
-    assert!(matches!(d.phase(), Phase::Ended { reason: EndReason::Missed, .. }));
+    d.pump_until("missed", |c| {
+        c.session.as_ref().is_some_and(|s| s.is_ended())
+    })
+    .await;
+    assert!(matches!(
+        d.phase(),
+        Phase::Ended {
+            reason: EndReason::Missed,
+            ..
+        }
+    ));
     assert!(d.fake.calls().iter().any(|c| c == "discard_call"));
 }

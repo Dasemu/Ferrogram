@@ -140,7 +140,9 @@ mod tests {
         p[12] = 0;
         assert!(parse(&p).is_none());
         // Extension beyond the end.
-        let p = [0x90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xbe, 0xde, 0xff, 0xff];
+        let p = [
+            0x90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xbe, 0xde, 0xff, 0xff,
+        ];
         assert!(parse(&p).is_none());
         assert!(header_len(&p).is_none());
         for n in 0..64u8 {

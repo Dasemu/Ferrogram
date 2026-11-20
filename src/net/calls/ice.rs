@@ -45,7 +45,10 @@ const TYPE_RELAY: u32 = 2;
 pub enum Target {
     Addr(SocketAddr),
     /// The peer's endpoint `tag` on reflector `server`.
-    Reflector { server: u8, tag: u32 },
+    Reflector {
+        server: u8,
+        tag: u32,
+    },
 }
 
 /// A datagram for the engine to send.
@@ -193,7 +196,9 @@ pub fn parse_candidate(line: &str) -> Option<ParsedCandidate> {
         }
         Target::Addr(SocketAddr::new(ip, port))
     } else {
-        let rest = f[4].strip_prefix("reflector-")?.strip_suffix(".reflector")?;
+        let rest = f[4]
+            .strip_prefix("reflector-")?
+            .strip_suffix(".reflector")?;
         let (server, tag) = rest.split_once('-')?;
         Target::Reflector {
             server: server.parse().ok()?,
@@ -355,10 +360,9 @@ impl Agent {
 
     fn local_priority(&self, l: LocalRef) -> u32 {
         match l {
-            LocalRef::Host(i) => candidate_priority(
-                TYPE_HOST,
-                65535 - u32::try_from(i).unwrap_or(0).min(1000),
-            ),
+            LocalRef::Host(i) => {
+                candidate_priority(TYPE_HOST, 65535 - u32::try_from(i).unwrap_or(0).min(1000))
+            }
             LocalRef::Reflector(i) => candidate_priority(
                 TYPE_RELAY,
                 65535 - u32::from(self.reflectors.get(i).map_or(0, |r| r.cfg.server)),
@@ -388,7 +392,11 @@ impl Agent {
             if self.pairs.len() >= MAX_PAIRS {
                 return;
             }
-            if self.pairs.iter().any(|p| p.local == local && p.target == target) {
+            if self
+                .pairs
+                .iter()
+                .any(|p| p.local == local && p.target == target)
+            {
                 continue;
             }
             let lp = self.local_priority(local);
@@ -418,8 +426,11 @@ impl Agent {
             .and_then(|i| self.pairs.get(i))
             .map(|p| (p.local, p.target));
         self.pairs.sort_by(|a, b| b.priority.cmp(&a.priority));
-        self.selected =
-            sel.and_then(|(l, t)| self.pairs.iter().position(|p| p.local == l && p.target == t));
+        self.selected = sel.and_then(|(l, t)| {
+            self.pairs
+                .iter()
+                .position(|p| p.local == l && p.target == t)
+        });
     }
 
     /// Wrap `data` for `target` from `local` into a datagram.
@@ -506,10 +517,16 @@ impl Agent {
             candidate_priority(TYPE_PRFLX, 65535).to_be_bytes().to_vec(),
         );
         if self.controlling {
-            m.push(stun::ATTR_CONTROLLING, self.tie_breaker.to_be_bytes().to_vec());
+            m.push(
+                stun::ATTR_CONTROLLING,
+                self.tie_breaker.to_be_bytes().to_vec(),
+            );
             m.push(stun::ATTR_USE_CANDIDATE, Vec::new());
         } else {
-            m.push(stun::ATTR_CONTROLLED, self.tie_breaker.to_be_bytes().to_vec());
+            m.push(
+                stun::ATTR_CONTROLLED,
+                self.tie_breaker.to_be_bytes().to_vec(),
+            );
         }
         Some(m.encode(Some(rpwd.as_bytes()), true))
     }
@@ -600,7 +617,10 @@ impl Agent {
         // Keepalive / consent on the selected pair.
         if let Some(i) = self.selected
             && self.last_keepalive.is_none_or(|t| now >= t + KEEPALIVE)
-            && self.pairs.get(i).is_some_and(|p| p.state != PairState::InProgress)
+            && self
+                .pairs
+                .get(i)
+                .is_some_and(|p| p.state != PairState::InProgress)
         {
             self.last_keepalive = Some(now);
             self.send_check(i, now);
@@ -622,7 +642,11 @@ impl Agent {
     fn select(&mut self, idx: usize) {
         let better = match self.selected {
             None => true,
-            Some(cur) => cur != idx && self.pairs.get(idx).map(|p| p.priority) > self.pairs.get(cur).map(|p| p.priority),
+            Some(cur) => {
+                cur != idx
+                    && self.pairs.get(idx).map(|p| p.priority)
+                        > self.pairs.get(cur).map(|p| p.priority)
+            }
         };
         if !better {
             return;
@@ -638,7 +662,11 @@ impl Agent {
     }
 
     fn pair_index(&mut self, local: LocalRef, target: Target) -> Option<usize> {
-        if let Some(i) = self.pairs.iter().position(|p| p.local == local && p.target == target) {
+        if let Some(i) = self
+            .pairs
+            .iter()
+            .position(|p| p.local == local && p.target == target)
+        {
             return Some(i);
         }
         // Peer-reflexive: learn the address from the check.
@@ -663,12 +691,20 @@ impl Agent {
             nominated: false,
         });
         self.sort_pairs();
-        self.pairs.iter().position(|p| p.local == local && p.target == target)
+        self.pairs
+            .iter()
+            .position(|p| p.local == local && p.target == target)
     }
 
     /// Feed a datagram received on `socket` from `from`. Returns application
     /// data (DTLS / SRTP) to hand to the upper layers.
-    pub fn handle(&mut self, socket: usize, from: SocketAddr, data: &[u8], now: Instant) -> Option<Vec<u8>> {
+    pub fn handle(
+        &mut self,
+        socket: usize,
+        from: SocketAddr,
+        data: &[u8],
+        now: Instant,
+    ) -> Option<Vec<u8>> {
         if data.len() > MAX_DATAGRAM {
             return None;
         }
@@ -696,7 +732,10 @@ impl Agent {
             let server = self.reflectors[ri].cfg.server;
             (
                 LocalRef::Reflector(ri),
-                Target::Reflector { server, tag: sender },
+                Target::Reflector {
+                    server,
+                    tag: sender,
+                },
                 payload,
             )
         };
@@ -705,10 +744,11 @@ impl Agent {
             return None;
         }
         // Only accept data from a path that proved itself with STUN.
-        let known = self
-            .pairs
-            .iter()
-            .any(|p| p.local == local && p.target == target && (p.state == PairState::Succeeded || p.nominated));
+        let known = self.pairs.iter().any(|p| {
+            p.local == local
+                && p.target == target
+                && (p.state == PairState::Succeeded || p.nominated)
+        });
         let peer_seen = self.last_data_path == Some((local, target));
         if !known && !peer_seen {
             return None;
@@ -720,7 +760,14 @@ impl Agent {
         Some(payload.to_vec())
     }
 
-    fn handle_stun(&mut self, local: LocalRef, target: Target, from: SocketAddr, raw: &[u8], now: Instant) {
+    fn handle_stun(
+        &mut self,
+        local: LocalRef,
+        target: Target,
+        from: SocketAddr,
+        raw: &[u8],
+        now: Instant,
+    ) {
         let Some(msg) = Message::decode(raw) else {
             return;
         };
@@ -740,7 +787,10 @@ impl Agent {
                     return;
                 }
                 let mut resp = Message::new(stun::BINDING_SUCCESS, msg.txid);
-                resp.push(stun::ATTR_XOR_MAPPED, stun::encode_xor_addr(from, &msg.txid));
+                resp.push(
+                    stun::ATTR_XOR_MAPPED,
+                    stun::encode_xor_addr(from, &msg.txid),
+                );
                 let resp = resp.encode(Some(self.pwd.as_bytes()), true);
                 if let Some(t) = self.transmit_to(local, target, resp) {
                     self.transmits.push_back(t);
@@ -751,7 +801,11 @@ impl Agent {
                 };
                 let use_candidate = msg.has(stun::ATTR_USE_CANDIDATE) || msg.has(0xc001);
                 // Triggered check for pairs we have not validated yet.
-                if self.pairs.get(idx).is_some_and(|p| p.state == PairState::Waiting || p.state == PairState::Failed) {
+                if self
+                    .pairs
+                    .get(idx)
+                    .is_some_and(|p| p.state == PairState::Waiting || p.state == PairState::Failed)
+                {
                     self.send_check(idx, now);
                 }
                 if !self.controlling && use_candidate {
@@ -759,7 +813,11 @@ impl Agent {
                 }
             }
             stun::BINDING_SUCCESS | stun::BINDING_ERROR => {
-                let Some(idx) = self.pairs.iter().position(|p| p.txid == msg.txid && p.state == PairState::InProgress) else {
+                let Some(idx) = self
+                    .pairs
+                    .iter()
+                    .position(|p| p.txid == msg.txid && p.state == PairState::InProgress)
+                else {
                     return;
                 };
                 let Some((_, rpwd)) = self.remote_creds.as_ref() else {
@@ -804,7 +862,13 @@ mod tests {
         assert_eq!(c.target, Target::Addr(addr("203.0.113.7:46154")));
         assert_eq!(c.kind, "srflx");
         let c = parse_candidate("a=candidate:1 1 UDP 2 reflector-3-4000000000.reflector 599 typ relay raddr 0.0.0.0 rport 0").unwrap();
-        assert_eq!(c.target, Target::Reflector { server: 3, tag: 4_000_000_000 });
+        assert_eq!(
+            c.target,
+            Target::Reflector {
+                server: 3,
+                tag: 4_000_000_000
+            }
+        );
         let c = parse_candidate("candidate:1 1 udp 5 2001:db8::1 9 typ host").unwrap();
         assert_eq!(c.target, Target::Addr(addr("[2001:db8::1]:9")));
         for bad in [
@@ -823,7 +887,10 @@ mod tests {
         }
         let a = Agent::new(true, vec![addr("10.0.0.1:5000")], vec![], false);
         let line = &a.host_candidates()[0];
-        assert_eq!(parse_candidate(line).unwrap().target, Target::Addr(addr("10.0.0.1:5000")));
+        assert_eq!(
+            parse_candidate(line).unwrap().target,
+            Target::Addr(addr("10.0.0.1:5000"))
+        );
     }
 
     /// Shuttle datagrams between two agents (and an in-memory reflector).
@@ -851,12 +918,28 @@ mod tests {
                         break;
                     }
                     if let Some(t) = ta
-                        && let Some(d) = Self::deliver(&self.a_addrs, &self.b_addrs, self.reflector, self.drop_direct, &mut self.b, t, *now)
+                        && let Some(d) = Self::deliver(
+                            &self.a_addrs,
+                            &self.b_addrs,
+                            self.reflector,
+                            self.drop_direct,
+                            &mut self.b,
+                            t,
+                            *now,
+                        )
                     {
                         got_b.push(d);
                     }
                     if let Some(t) = tb
-                        && let Some(d) = Self::deliver(&self.b_addrs, &self.a_addrs, self.reflector, self.drop_direct, &mut self.a, t, *now)
+                        && let Some(d) = Self::deliver(
+                            &self.b_addrs,
+                            &self.a_addrs,
+                            self.reflector,
+                            self.drop_direct,
+                            &mut self.a,
+                            t,
+                            *now,
+                        )
                     {
                         got_a.push(d);
                     }
@@ -1037,7 +1120,10 @@ mod tests {
         assert_eq!(a.handle(0, addr("10.9.9.9:1"), &[0x80; 30], now), None);
         // A request signed with the wrong password gets no answer.
         let mut m = Message::new(stun::BINDING_REQUEST, [1; 12]);
-        m.push(stun::ATTR_USERNAME, format!("{}:peer", a.ufrag()).into_bytes());
+        m.push(
+            stun::ATTR_USERNAME,
+            format!("{}:peer", a.ufrag()).into_bytes(),
+        );
         let raw = m.encode(Some(b"wrong"), true);
         a.handle(0, addr("10.9.9.9:1"), &raw, now);
         assert!(a.poll_transmit().is_none());

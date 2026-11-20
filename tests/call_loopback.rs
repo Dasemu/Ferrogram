@@ -107,8 +107,16 @@ async fn call(reflectors: Vec<ReflectorConfig>, p2p: bool) -> (LinkState, LinkSt
     let shared_b = Shared::new();
     let (fa_tx, fa_rx) = mpsc::channel(64);
     let (fb_tx, fb_rx) = mpsc::channel(64);
-    let a = Arc::new(engine::start(config(true, reflectors.clone(), p2p), Arc::clone(&shared_a), fa_rx));
-    let b = Arc::new(engine::start(config(false, reflectors, p2p), Arc::clone(&shared_b), fb_rx));
+    let a = Arc::new(engine::start(
+        config(true, reflectors.clone(), p2p),
+        Arc::clone(&shared_a),
+        fa_rx,
+    ));
+    let b = Arc::new(engine::start(
+        config(false, reflectors, p2p),
+        Arc::clone(&shared_b),
+        fb_rx,
+    ));
     let (sa_tx, mut sa_rx) = mpsc::unbounded_channel();
     let (sb_tx, mut sb_rx) = mpsc::unbounded_channel();
     let pa = pump(a.take_events().unwrap(), Arc::clone(&b), sa_tx);
@@ -149,7 +157,9 @@ async fn fake_reflector() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let mut peers: HashMap<[u8; 4], SocketAddr> = HashMap::new();
         let mut buf = vec![0u8; 4096];
         loop {
-            let Ok((n, from)) = sock.recv_from(&mut buf).await else { return };
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
             let p = &buf[..n];
             if n < 24 {
                 continue;

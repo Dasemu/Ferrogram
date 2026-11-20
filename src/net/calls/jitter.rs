@@ -18,7 +18,9 @@ pub enum Frame {
     Packet(Vec<u8>),
     /// The packet for this slot is missing; `next` is the following packet
     /// if it already arrived (decode it with FEC to recover this one).
-    Lost { next: Option<Vec<u8>> },
+    Lost {
+        next: Option<Vec<u8>>,
+    },
     /// Buffering: play silence (or comfort noise).
     Silence,
 }

@@ -382,6 +382,5 @@ mod tests {
 
     const FP_VECTOR: i64 = -3972359982579920590;
     const EMOJI_VECTOR: [usize; 4] = [122, 225, 65, 23];
-    const GA_HASH_VECTOR: &str =
-        "cd6816b77f68d70001fc3eaa4d42bdd67cb5973b3151cc5292ecc02a3daac6ab";
+    const GA_HASH_VECTOR: &str = "cd6816b77f68d70001fc3eaa4d42bdd67cb5973b3151cc5292ecc02a3daac6ab";
 }

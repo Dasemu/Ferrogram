@@ -243,6 +243,84 @@ impl FerroTheme {
 /// Dim layer behind modal cards.
 pub const SCRIM: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.55);
 
+// ---- calls (ui/call.rs)
+pub const CALL_PANEL_WIDTH: f32 = 340.0;
+pub const CALL_PANEL_HEIGHT: f32 = 500.0;
+pub const CALL_AVATAR: f32 = 120.0;
+pub const CALL_BUTTON: f32 = 56.0;
+pub const CALL_BUTTON_ICON: f32 = 24.0;
+pub const CALL_BAR_HEIGHT: f32 = 38.0;
+pub const CALL_EMOJI: f32 = 26.0;
+pub const CALL_SIGNAL_BAR: f32 = 4.0;
+/// The call panel background (Telegram's call window is a deep blue).
+pub const CALL_BG: Color = rgb(0x1b2838);
+pub const CALL_BUTTON_BG: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.12);
+pub const CALL_BUTTON_ON: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.9);
+
+/// A filled circular button (call controls).
+pub fn round_button(bg: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let k = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+            1.12
+        } else {
+            1.0
+        };
+        button::Style {
+            background: Some(Background::Color(Color {
+                r: (bg.r * k).min(1.0),
+                g: (bg.g * k).min(1.0),
+                b: (bg.b * k).min(1.0),
+                a: if k > 1.0 { (bg.a * 1.4).min(1.0) } else { bg.a },
+            })),
+            text_color: Color::WHITE,
+            border: border::rounded(CALL_BUTTON / 2.0),
+            shadow: Shadow::default(),
+            snap: true,
+        }
+    }
+}
+
+/// The call card.
+pub fn call_card(_p: Palette) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(CALL_BG)),
+        border: Border {
+            radius: 12.0.into(),
+            width: 0.0,
+            color: Color::TRANSPARENT,
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 18.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The in-call bar above the chat (click to open the panel).
+pub fn call_bar(p: Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let k = if matches!(status, button::Status::Hovered) {
+            1.08
+        } else {
+            1.0
+        };
+        button::Style {
+            background: Some(Background::Color(Color {
+                r: (p.success.r * k).min(1.0),
+                g: (p.success.g * k).min(1.0),
+                b: (p.success.b * k).min(1.0),
+                a: 1.0,
+            })),
+            text_color: Color::WHITE,
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: true,
+        }
+    }
+}
+
 pub fn fill(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
         background: Some(Background::Color(color)),

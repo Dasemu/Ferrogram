@@ -223,7 +223,9 @@ impl Context {
             return None;
         }
         self.replay.accept(index);
-        let newer = self.rx_seq.is_none() || roc > self.rx_roc || (roc == self.rx_roc && Some(seq) > self.rx_seq);
+        let newer = self.rx_seq.is_none()
+            || roc > self.rx_roc
+            || (roc == self.rx_roc && Some(seq) > self.rx_seq);
         if newer {
             self.rx_roc = roc;
             self.rx_seq = Some(seq);
@@ -241,7 +243,8 @@ impl Context {
         self.srtcp_index = (self.srtcp_index + 1) & 0x7fff_ffff;
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
         let mut out = packet.to_vec();
-        self.rtcp.crypt(ssrc, u64::from(self.srtcp_index), &mut out[8..]);
+        self.rtcp
+            .crypt(ssrc, u64::from(self.srtcp_index), &mut out[8..]);
         out.extend_from_slice(&(self.srtcp_index | 0x8000_0000).to_be_bytes());
         let tag = self.rtcp.tag(&[&out]);
         out.extend_from_slice(&tag);
@@ -289,10 +292,7 @@ mod tests {
     const MS: &str = "0ec675ad498afeebb6960b3aabe6";
 
     fn ctx() -> Context {
-        Context::new(
-            &hex(MK).try_into().unwrap(),
-            &hex(MS).try_into().unwrap(),
-        )
+        Context::new(&hex(MK).try_into().unwrap(), &hex(MS).try_into().unwrap())
     }
 
     /// RFC 3711 appendix B.3 (key derivation).
@@ -328,7 +328,8 @@ mod tests {
         assert_eq!(ctx().unprotect_rtp(&p).unwrap(), rtp);
     }
 
-    const SRTP_VECTOR: &str = "806f1234cafebabedeadbeef767243821922664e5059641bfc6b9620ac213b96df8e6a6e601621";
+    const SRTP_VECTOR: &str =
+        "806f1234cafebabedeadbeef767243821922664e5059641bfc6b9620ac213b96df8e6a6e601621";
 
     #[test]
     fn round_trips_and_replay() {

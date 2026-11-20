@@ -1010,7 +1010,11 @@ impl TelegramApi for Grammers {
         Ok(cfg)
     }
 
-    async fn request_call(&self, user: ChatId, g_a_hash: Vec<u8>) -> Result<super::calls::PhoneCall> {
+    async fn request_call(
+        &self,
+        user: ChatId,
+        g_a_hash: Vec<u8>,
+    ) -> Result<super::calls::PhoneCall> {
         use grammers_client::tl;
         use rand::Rng as _;
         let api = &self.0;
@@ -1045,7 +1049,11 @@ impl TelegramApi for Grammers {
         Ok(())
     }
 
-    async fn accept_call(&self, call: super::calls::CallRef, g_b: Vec<u8>) -> Result<super::calls::PhoneCall> {
+    async fn accept_call(
+        &self,
+        call: super::calls::CallRef,
+        g_b: Vec<u8>,
+    ) -> Result<super::calls::PhoneCall> {
         use grammers_client::tl;
         let r = self
             .0

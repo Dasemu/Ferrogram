@@ -1006,7 +1006,12 @@ pub fn phone_call_from_tl(c: &tl::enums::PhoneCall) -> PhoneCall {
             g_a_or_b: c.g_a_or_b.clone(),
             key_fingerprint: c.key_fingerprint,
             protocol: protocol_from_tl(&c.protocol),
-            connections: c.connections.iter().take(64).map(connection_from_tl).collect(),
+            connections: c
+                .connections
+                .iter()
+                .take(64)
+                .map(connection_from_tl)
+                .collect(),
             p2p_allowed: c.p2p_allowed,
             start_date: c.start_date,
             custom_parameters: c.custom_parameters.as_ref().map(|d| {

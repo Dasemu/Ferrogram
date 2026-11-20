@@ -63,6 +63,10 @@ icons! {
     Info => "info.svg",
     AtSign => "at-sign.svg",
     ImagePlay => "image-play.svg",
+    MicOff => "mic-off.svg",
+    PhoneOff => "phone-off.svg",
+    Speaker => "volume-2.svg",
+    ChevronDown => "chevron-down.svg",
 }
 
 /// Handles are built once per icon and cloned (an `Arc` bump) by `view()`.

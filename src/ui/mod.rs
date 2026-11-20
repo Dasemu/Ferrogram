@@ -1,5 +1,6 @@
 //! Views: pure functions `&App -> Element<Message>`.
 
+pub mod call;
 pub mod chat;
 pub mod folders;
 pub mod format;
@@ -29,6 +30,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .style(theme::fill(p.border));
         main = main.push(divider2).push(panel);
     }
+    let main: Element<'_, Message> = match call::bar(app) {
+        Some(bar) => iced::widget::column![bar, main].into(),
+        None => main.into(),
+    };
     let mut layers = stack![main].width(Length::Fill).height(Length::Fill);
     if let Some(toast) = &app.toast {
         layers = layers.push(
@@ -53,6 +58,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     if let Some(editor) = folders::editor(app) {
         layers = layers.push(editor);
+    }
+    if let Some(panel) = call::panel(app) {
+        layers = layers.push(panel);
     }
     layers.into()
 }

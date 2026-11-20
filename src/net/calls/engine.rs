@@ -24,9 +24,7 @@ use super::audio::Shared;
 use super::dh::CallKey;
 use super::ice::{self, Agent, ReflectorConfig};
 use super::rtp;
-use super::signaling::{
-    Channel, DtlsFingerprint, MediaContent, MediaKind, Message, PayloadType,
-};
+use super::signaling::{Channel, DtlsFingerprint, MediaContent, MediaKind, Message, PayloadType};
 use super::srtp;
 
 const OPUS_PT: u32 = 111;
@@ -65,7 +63,9 @@ impl std::fmt::Debug for EngineConfig {
 pub enum LinkState {
     Connecting,
     /// Media flows; `relay` = through a Telegram reflector.
-    Connected { relay: bool },
+    Connected {
+        relay: bool,
+    },
     Reconnecting,
 }
 
@@ -123,7 +123,11 @@ impl Drop for EngineHandle {
 /// Start an engine on the current tokio runtime. `frames` delivers encoded
 /// Opus frames from the capture side; received audio goes to
 /// `shared.jitter`.
-pub fn start(cfg: EngineConfig, shared: Arc<Shared>, frames: mpsc::Receiver<Vec<u8>>) -> EngineHandle {
+pub fn start(
+    cfg: EngineConfig,
+    shared: Arc<Shared>,
+    frames: mpsc::Receiver<Vec<u8>>,
+) -> EngineHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     let task_shared = Arc::clone(&shared);
@@ -160,7 +164,9 @@ fn default_route(v6: bool) -> Option<IpAddr> {
     (!ip.is_unspecified()).then_some(ip)
 }
 
-async fn bind_sockets(cfg: &EngineConfig) -> Result<(Vec<Arc<UdpSocket>>, Vec<SocketAddr>), String> {
+async fn bind_sockets(
+    cfg: &EngineConfig,
+) -> Result<(Vec<Arc<UdpSocket>>, Vec<SocketAddr>), String> {
     let mut sockets = Vec::new();
     let mut hosts = Vec::new();
     if cfg.p2p {
@@ -284,11 +290,9 @@ async fn dtls_handshake(
         extended_master_secret: ExtendedMasterSecretType::Request,
         client_auth: ClientAuthType::RequireAnyClientCert,
         insecure_skip_verify: true,
-        verify_peer_certificate: Some(Arc::new(move |certs: &[Vec<u8>], _| {
-            match certs.first() {
-                Some(c) if fingerprint_matches(&fingerprint(c), &expected) => Ok(()),
-                _ => Err(webrtc_dtls::Error::ErrVerifyDataMismatch),
-            }
+        verify_peer_certificate: Some(Arc::new(move |certs: &[Vec<u8>], _| match certs.first() {
+            Some(c) if fingerprint_matches(&fingerprint(c), &expected) => Ok(()),
+            _ => Err(webrtc_dtls::Error::ErrVerifyDataMismatch),
         })),
         ..Default::default()
     };
@@ -299,7 +303,8 @@ async fn dtls_handshake(
     .await
     .map_err(|_| "dtls timeout".to_string())?
     .map_err(|e| format!("dtls: {e}"))?;
-    if dtls.selected_srtpprotection_profile() != SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80 {
+    if dtls.selected_srtpprotection_profile() != SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80
+    {
         return Err("no common SRTP profile".into());
     }
     let state = dtls.connection_state().await;
@@ -474,7 +479,11 @@ impl Run {
             return;
         }
         self.sent_setup = true;
-        let setup = if self.cfg.outgoing { "actpass" } else { "passive" };
+        let setup = if self.cfg.outgoing {
+            "actpass"
+        } else {
+            "passive"
+        };
         let m = Message::InitialSetup {
             ufrag: self.agent.ufrag().to_owned(),
             pwd: self.agent.pwd().to_owned(),
@@ -505,8 +514,13 @@ impl Run {
                     fingerprints,
                     ..
                 } => {
-                    let Some(fp) = fingerprints.into_iter().find(|f| f.hash.eq_ignore_ascii_case("sha-256")) else {
-                        self.emit(EngineEvent::Failed("peer sent no sha-256 fingerprint".into()));
+                    let Some(fp) = fingerprints
+                        .into_iter()
+                        .find(|f| f.hash.eq_ignore_ascii_case("sha-256"))
+                    else {
+                        self.emit(EngineEvent::Failed(
+                            "peer sent no sha-256 fingerprint".into(),
+                        ));
                         continue;
                     };
                     if self.remote_setup.is_some() {
@@ -654,7 +668,10 @@ impl Run {
             ts: rand::rng().next_u32(),
             _dtls: dtls,
         });
-        info!(route = self.agent.route().unwrap_or("?"), "call media connected");
+        info!(
+            route = self.agent.route().unwrap_or("?"),
+            "call media connected"
+        );
         self.set_state(LinkState::Connected {
             relay: self.agent.route() == Some("relay"),
         });
@@ -735,7 +752,9 @@ impl Run {
             .map(|j| (j.stats.received, j.stats.lost))
             .unwrap_or((0, 0));
         let (drx, dlost) = (rx.saturating_sub(rx0), lost.saturating_sub(lost0));
-        let silent = self.last_rtp_rx.is_none_or(|t| now >= t + Duration::from_secs(2));
+        let silent = self
+            .last_rtp_rx
+            .is_none_or(|t| now >= t + Duration::from_secs(2));
         let bars = if silent || !self.agent.is_connected() {
             0
         } else {
@@ -877,12 +896,18 @@ mod tests {
     fn negotiation_offer_answer() {
         let mut caller = Negotiation::new(true);
         let mut callee = Negotiation::new(false);
-        let Some(Message::NegotiateChannels { exchange_id, contents }) = caller.offer() else {
+        let Some(Message::NegotiateChannels {
+            exchange_id,
+            contents,
+        }) = caller.offer()
+        else {
             panic!()
         };
         assert!(caller.offer().is_none(), "one offer at a time");
-        let Some(Message::NegotiateChannels { exchange_id: ax, contents: ac }) =
-            callee.on_message(exchange_id, &contents)
+        let Some(Message::NegotiateChannels {
+            exchange_id: ax,
+            contents: ac,
+        }) = callee.on_message(exchange_id, &contents)
         else {
             panic!()
         };
@@ -890,10 +915,18 @@ mod tests {
         assert!(caller.on_message(ax, &ac).is_none());
         assert_eq!(caller.send_pt, Some(111));
         // Then the callee offers its stream.
-        let Some(Message::NegotiateChannels { exchange_id: e2, contents: c2 }) = callee.offer() else {
+        let Some(Message::NegotiateChannels {
+            exchange_id: e2,
+            contents: c2,
+        }) = callee.offer()
+        else {
             panic!()
         };
-        let Some(Message::NegotiateChannels { exchange_id: a2, contents: ac2 }) = caller.on_message(e2, &c2) else {
+        let Some(Message::NegotiateChannels {
+            exchange_id: a2,
+            contents: ac2,
+        }) = caller.on_message(e2, &c2)
+        else {
             panic!()
         };
         callee.on_message(a2, &ac2);
@@ -921,7 +954,9 @@ mod tests {
         video.kind = MediaKind::Video;
         let mut g722 = opus_content(2, 9);
         g722.payload_types[0].name = "G722".into();
-        let Some(Message::NegotiateChannels { contents, .. }) = n.on_message(9, &[video, g722, opus_content(3, 200)]) else {
+        let Some(Message::NegotiateChannels { contents, .. }) =
+            n.on_message(9, &[video, g722, opus_content(3, 200)])
+        else {
             panic!()
         };
         assert!(contents.is_empty());

@@ -330,11 +330,16 @@ mod tests {
         assert_eq!(p.chosen_supported(), Some("9.0.0"));
         p.library_versions = vec!["11.0.0".into()];
         assert_eq!(p.chosen_supported(), None);
-        let c = CallConfig::from_json(r#"{"call_connect_timeout_ms":15000,"call_packet_timeout_ms":5,"x":1}"#);
+        let c = CallConfig::from_json(
+            r#"{"call_connect_timeout_ms":15000,"call_packet_timeout_ms":5,"x":1}"#,
+        );
         assert_eq!(c.connect_timeout_ms, 15_000);
         assert_eq!(c.packet_timeout_ms, 10_000);
         assert_eq!(CallConfig::from_json("nope"), CallConfig::default());
-        assert!(custom_flag(Some(r#"{"network_standalone_reflectors":true}"#), "network_standalone_reflectors"));
+        assert!(custom_flag(
+            Some(r#"{"network_standalone_reflectors":true}"#),
+            "network_standalone_reflectors"
+        ));
         assert!(!custom_flag(Some("{}"), "network_standalone_reflectors"));
         assert!(!custom_flag(None, "x"));
     }

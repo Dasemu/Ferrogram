@@ -52,10 +52,18 @@ pub enum Phase {
     ExchangingKeys,
     Connecting,
     /// Media flows since `since` (unix seconds).
-    Active { since: i64, relay: bool },
-    Reconnecting { since: i64 },
+    Active {
+        since: i64,
+        relay: bool,
+    },
+    Reconnecting {
+        since: i64,
+    },
     /// Shown briefly, then the session is dropped.
-    Ended { reason: EndReason, at: i64 },
+    Ended {
+        reason: EndReason,
+        at: i64,
+    },
 }
 
 /// Our DH half: config, secret exponent and public value.
@@ -95,18 +103,34 @@ pub struct CallSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
     /// Outgoing: DH config, `g_a`, `phone.requestCall`.
-    Request { peer: ChatId },
+    Request {
+        peer: ChatId,
+    },
     /// `phone.receivedCall` (we are ringing) + notification.
-    Received { call: CallRef, peer: ChatId },
+    Received {
+        call: CallRef,
+        peer: ChatId,
+    },
     /// Turn down a call we cannot take (already in a call).
-    Reject { call: CallRef, reason: DiscardReason },
+    Reject {
+        call: CallRef,
+        reason: DiscardReason,
+    },
     /// Outgoing: derive the key from `g_b` and `phone.confirmCall`.
-    Confirm { call: CallRef, g_b: Vec<u8> },
+    Confirm {
+        call: CallRef,
+        g_b: Vec<u8>,
+    },
     /// Incoming: DH config, `g_b`, `phone.acceptCall`.
-    Accept { call: CallRef },
+    Accept {
+        call: CallRef,
+    },
     /// Incoming: check the revealed `g_a`, derive the key, check the
     /// fingerprint.
-    Finish { g_a: Vec<u8>, fingerprint: i64 },
+    Finish {
+        g_a: Vec<u8>,
+        fingerprint: i64,
+    },
     /// Start the media engine (key and connections are in the session).
     StartEngine,
     StopEngine,
@@ -345,11 +369,17 @@ impl Calls {
         };
         s.phase = match (state, &s.phase) {
             (_, Phase::Ended { .. }) => return,
-            (LinkState::Connected { relay }, Phase::Active { since, .. } | Phase::Reconnecting { since }) => {
-                Phase::Active { since: *since, relay }
-            }
+            (
+                LinkState::Connected { relay },
+                Phase::Active { since, .. } | Phase::Reconnecting { since },
+            ) => Phase::Active {
+                since: *since,
+                relay,
+            },
             (LinkState::Connected { relay }, _) => Phase::Active { since: now, relay },
-            (LinkState::Reconnecting, Phase::Active { since, .. }) => Phase::Reconnecting { since: *since },
+            (LinkState::Reconnecting, Phase::Active { since, .. }) => {
+                Phase::Reconnecting { since: *since }
+            }
             (LinkState::Reconnecting | LinkState::Connecting, p) => p.clone(),
         };
     }
@@ -503,14 +533,18 @@ impl Calls {
             }
             PhoneCall::Discarded { reason, .. } => {
                 let reason = match (s.direction, reason, &s.phase) {
-                    (Direction::Outgoing, Some(DiscardReason::Busy), Phase::Requesting | Phase::Waiting | Phase::Ringing) => {
-                        EndReason::Declined
-                    }
+                    (
+                        Direction::Outgoing,
+                        Some(DiscardReason::Busy),
+                        Phase::Requesting | Phase::Waiting | Phase::Ringing,
+                    ) => EndReason::Declined,
                     (_, Some(DiscardReason::Missed), _) => EndReason::Missed,
                     (_, Some(DiscardReason::Busy), _) => EndReason::Busy,
-                    (_, Some(DiscardReason::Disconnect), Phase::Active { .. } | Phase::Reconnecting { .. }) => {
-                        EndReason::Failed("disconnected".into())
-                    }
+                    (
+                        _,
+                        Some(DiscardReason::Disconnect),
+                        Phase::Active { .. } | Phase::Reconnecting { .. },
+                    ) => EndReason::Failed("disconnected".into()),
                     _ => EndReason::HungUp,
                 };
                 s.phase = Phase::Ended { reason, at: now };
@@ -566,7 +600,9 @@ pub async fn make_half(config: DhConfig) -> Result<DhHalf> {
                 });
             }
         }
-        Err(Error::Protocol("call key exchange: no usable secret".into()))
+        Err(Error::Protocol(
+            "call key exchange: no usable secret".into(),
+        ))
     })
     .await
     .map_err(|_| Error::Cancelled)?
@@ -751,13 +787,28 @@ mod tests {
             ME,
             3,
         );
-        assert_eq!(cmds, vec![Cmd::Confirm { call: cref(10), g_b: vec![4; 256] }]);
+        assert_eq!(
+            cmds,
+            vec![Cmd::Confirm {
+                call: cref(10),
+                g_b: vec![4; 256]
+            }]
+        );
         assert_eq!(phase(&c), Phase::ExchangingKeys);
         assert!(c.key_ready(CallKey([1; 256]), ["a"; 4]).is_empty());
-        assert_eq!(c.on_phone_call(&active(10, ME, PEER), ME, 4), vec![Cmd::StartEngine]);
+        assert_eq!(
+            c.on_phone_call(&active(10, ME, PEER), ME, 4),
+            vec![Cmd::StartEngine]
+        );
         assert_eq!(phase(&c), Phase::Connecting);
         c.link(LinkState::Connected { relay: true }, 5);
-        assert_eq!(phase(&c), Phase::Active { since: 5, relay: true });
+        assert_eq!(
+            phase(&c),
+            Phase::Active {
+                since: 5,
+                relay: true
+            }
+        );
         c.link(LinkState::Reconnecting, 9);
         assert_eq!(phase(&c), Phase::Reconnecting { since: 5 });
         c.link(LinkState::Connected { relay: false }, 10);
@@ -767,7 +818,11 @@ mod tests {
             cmds,
             vec![
                 Cmd::StopEngine,
-                Cmd::Discard { call: cref(10), duration: 65, reason: DiscardReason::Hangup }
+                Cmd::Discard {
+                    call: cref(10),
+                    duration: 65,
+                    reason: DiscardReason::Hangup
+                }
             ]
         );
         assert!(!c.is_busy());
@@ -786,7 +841,13 @@ mod tests {
             g_a_hash: vec![9; 32],
             protocol: Protocol::ours(),
         };
-        assert_eq!(c.on_phone_call(&req, ME, 0), vec![Cmd::Received { call: cref(20), peer: PEER }]);
+        assert_eq!(
+            c.on_phone_call(&req, ME, 0),
+            vec![Cmd::Received {
+                call: cref(20),
+                peer: PEER
+            }]
+        );
         assert!(c.is_ringing_in());
         assert!(c.on_phone_call(&req, ME, 0).is_empty(), "duplicate update");
         // A second caller gets "busy".
@@ -800,7 +861,10 @@ mod tests {
         };
         assert_eq!(
             c.on_phone_call(&other, ME, 0),
-            vec![Cmd::Reject { call: cref(21), reason: DiscardReason::Busy }]
+            vec![Cmd::Reject {
+                call: cref(21),
+                reason: DiscardReason::Busy
+            }]
         );
         assert_eq!(c.accept(), vec![Cmd::Accept { call: cref(20) }]);
         let w = PhoneCall::Waiting {
@@ -814,9 +878,15 @@ mod tests {
         assert_eq!(phase(&c), Phase::ExchangingKeys);
         assert_eq!(
             c.on_phone_call(&active(20, PEER, ME), ME, 2),
-            vec![Cmd::Finish { g_a: vec![3; 256], fingerprint: 99 }]
+            vec![Cmd::Finish {
+                g_a: vec![3; 256],
+                fingerprint: 99
+            }]
         );
-        assert_eq!(c.key_ready(CallKey([1; 256]), ["b"; 4]), vec![Cmd::StartEngine]);
+        assert_eq!(
+            c.key_ready(CallKey([1; 256]), ["b"; 4]),
+            vec![Cmd::StartEngine]
+        );
         assert_eq!(phase(&c), Phase::Connecting);
     }
 
@@ -835,46 +905,86 @@ mod tests {
         c.on_phone_call(&req, ME, 0);
         assert_eq!(
             c.hang_up(3),
-            vec![Cmd::StopEngine, Cmd::Discard { call: cref(30), duration: 0, reason: DiscardReason::Busy }]
+            vec![
+                Cmd::StopEngine,
+                Cmd::Discard {
+                    call: cref(30),
+                    duration: 0,
+                    reason: DiscardReason::Busy
+                }
+            ]
         );
         // Caller gave up: Missed on our side.
         let mut c = Calls::default();
         c.on_phone_call(&req, ME, 0);
         c.on_phone_call(&discarded(30, DiscardReason::Missed), ME, 5);
-        assert_eq!(phase(&c), Phase::Ended { reason: EndReason::Missed, at: 5 });
+        assert_eq!(
+            phase(&c),
+            Phase::Ended {
+                reason: EndReason::Missed,
+                at: 5
+            }
+        );
         // Outgoing, peer declined.
         let mut c = Calls::default();
         c.start(PEER, 0);
         c.placed(half(), &waiting(31, true), ME, 0);
         c.on_phone_call(&discarded(31, DiscardReason::Busy), ME, 2);
-        assert_eq!(phase(&c), Phase::Ended { reason: EndReason::Declined, at: 2 });
+        assert_eq!(
+            phase(&c),
+            Phase::Ended {
+                reason: EndReason::Declined,
+                at: 2
+            }
+        );
         // Outgoing cancelled by us while ringing: Missed.
         let mut c = Calls::default();
         c.start(PEER, 0);
         c.placed(half(), &waiting(32, true), ME, 0);
         assert_eq!(
             c.hang_up(4)[1],
-            Cmd::Discard { call: cref(32), duration: 0, reason: DiscardReason::Missed }
+            Cmd::Discard {
+                call: cref(32),
+                duration: 0,
+                reason: DiscardReason::Missed
+            }
         );
     }
 
     #[test]
     fn ring_timeout_and_orphans() {
         let mut c = Calls {
-            config: CallConfig { ring_timeout_ms: 30_000, ..Default::default() },
+            config: CallConfig {
+                ring_timeout_ms: 30_000,
+                ..Default::default()
+            },
             ..Default::default()
         };
         c.start(PEER, 0);
         c.placed(half(), &waiting(40, true), ME, 0);
         assert!(c.tick(10).is_empty());
         let cmds = c.tick(31);
-        assert!(cmds.contains(&Cmd::Discard { call: cref(40), duration: 0, reason: DiscardReason::Missed }));
-        assert_eq!(phase(&c), Phase::Ended { reason: EndReason::Missed, at: 31 });
+        assert!(cmds.contains(&Cmd::Discard {
+            call: cref(40),
+            duration: 0,
+            reason: DiscardReason::Missed
+        }));
+        assert_eq!(
+            phase(&c),
+            Phase::Ended {
+                reason: EndReason::Missed,
+                at: 31
+            }
+        );
         // RPC reply for a call the user already hung up.
         let mut c = Calls::default();
         assert_eq!(
             c.placed(half(), &waiting(41, false), ME, 0),
-            vec![Cmd::Discard { call: cref(41), duration: 0, reason: DiscardReason::Hangup }]
+            vec![Cmd::Discard {
+                call: cref(41),
+                duration: 0,
+                reason: DiscardReason::Hangup
+            }]
         );
         // Updates for other calls are ignored; the id is adopted early.
         let mut c = Calls::default();
@@ -901,7 +1011,10 @@ mod tests {
         assert!(c.on_phone_call(&acc, ME, 0).is_empty(), "no DH half yet");
         assert_eq!(
             c.placed(half(), &waiting(70, true), ME, 1),
-            vec![Cmd::Confirm { call: cref(70), g_b: vec![4; 256] }]
+            vec![Cmd::Confirm {
+                call: cref(70),
+                g_b: vec![4; 256]
+            }]
         );
         let mut c = Calls::default();
         let req = PhoneCall::Requested {
@@ -915,10 +1028,19 @@ mod tests {
         c.on_phone_call(&req, ME, 0);
         c.accept();
         assert!(c.on_phone_call(&active(71, PEER, ME), ME, 1).is_empty());
-        let w = PhoneCall::Waiting { call: cref(71), admin_id: PEER, participant_id: ME, video: false, receive_date: None };
+        let w = PhoneCall::Waiting {
+            call: cref(71),
+            admin_id: PEER,
+            participant_id: ME,
+            video: false,
+            receive_date: None,
+        };
         assert_eq!(
             c.accepted(half(), &w, ME, 2),
-            vec![Cmd::Finish { g_a: vec![3; 256], fingerprint: 99 }]
+            vec![Cmd::Finish {
+                g_a: vec![3; 256],
+                fingerprint: 99
+            }]
         );
     }
 
@@ -930,7 +1052,14 @@ mod tests {
         let cmds = c.failed("boom", 1);
         assert_eq!(
             cmds,
-            vec![Cmd::StopEngine, Cmd::Discard { call: cref(60), duration: 0, reason: DiscardReason::Disconnect }]
+            vec![
+                Cmd::StopEngine,
+                Cmd::Discard {
+                    call: cref(60),
+                    duration: 0,
+                    reason: DiscardReason::Disconnect
+                }
+            ]
         );
         assert!(c.failed("again", 2).is_empty());
         assert_eq!(c.session.as_ref().unwrap().status_text(2), "Call failed");
@@ -950,7 +1079,11 @@ mod tests {
         if let Some(PhoneCall::Active { protocol, .. }) = s.active.as_mut() {
             protocol.library_versions = vec!["13.0.0".into()];
         }
-        assert!(engine_config(&s, &CallConfig::default(), false).unwrap_err().contains("incompatible"));
+        assert!(
+            engine_config(&s, &CallConfig::default(), false)
+                .unwrap_err()
+                .contains("incompatible")
+        );
         assert_eq!(format_duration(3725), "1:02:05");
     }
 }

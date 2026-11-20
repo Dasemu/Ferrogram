@@ -85,7 +85,8 @@ pub struct FakeCalls {
 }
 
 fn lock<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>> {
-    m.lock().map_err(|_| Error::Net("fake call poisoned".into()))
+    m.lock()
+        .map_err(|_| Error::Net("fake call poisoned".into()))
 }
 
 fn active(live: &Live, g_a_or_b: Vec<u8>, key_fingerprint: i64, me: i64) -> PhoneCall {
@@ -170,7 +171,9 @@ impl FakeCalls {
     fn new_ref() -> CallRef {
         let mut b = [0u8; 16];
         rand::rng().fill_bytes(&mut b);
-        let id = i64::from_le_bytes(b[..8].try_into().unwrap_or([1; 8])).abs().max(1);
+        let id = i64::from_le_bytes(b[..8].try_into().unwrap_or([1; 8]))
+            .abs()
+            .max(1);
         let access_hash = i64::from_le_bytes(b[8..].try_into().unwrap_or([2; 8]));
         CallRef { id, access_hash }
     }
@@ -284,7 +287,9 @@ impl FakeCalls {
                 .filter(|l| l.call == call)
                 .ok_or_else(|| Error::Protocol("400 CALL_PEER_INVALID".into()))?;
             (
-                l.half.clone().ok_or_else(|| Error::Protocol("400 CALL_ALREADY_DECLINED".into()))?,
+                l.half
+                    .clone()
+                    .ok_or_else(|| Error::Protocol("400 CALL_ALREADY_DECLINED".into()))?,
                 l.g_a_hash.clone(),
             )
         };
@@ -333,15 +338,13 @@ impl FakeCalls {
                 .as_ref()
                 .filter(|l| l.call == call && !l.app_is_caller)
                 .ok_or_else(|| Error::Protocol("400 CALL_PEER_INVALID".into()))?;
-            (
-                l.half.clone().ok_or(Error::Cancelled)?,
-                l.peer_g_a.clone(),
-            )
+            (l.half.clone().ok_or(Error::Cancelled)?, l.peer_g_a.clone())
         };
-        let key = tokio::task::spawn_blocking(move || dh::shared_key(&g_b, &half.secret, &half.config.p))
-            .await
-            .map_err(|_| Error::Cancelled)?
-            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let key =
+            tokio::task::spawn_blocking(move || dh::shared_key(&g_b, &half.secret, &half.config.p))
+                .await
+                .map_err(|_| Error::Cancelled)?
+                .map_err(|e| Error::Protocol(e.to_string()))?;
         let fp = dh::key_fingerprint(&key);
         let (pc, waiting) = {
             let g = lock(&self.live)?;
@@ -399,7 +402,9 @@ impl FakeCalls {
 
     /// The peer hangs up.
     pub fn peer_hang_up(&self) {
-        let call = lock(&self.live).ok().and_then(|g| g.as_ref().map(|l| l.call));
+        let call = lock(&self.live)
+            .ok()
+            .and_then(|g| g.as_ref().map(|l| l.call));
         if let Some(call) = call {
             let _ = self.discard(call, 0, DiscardReason::Hangup);
         }

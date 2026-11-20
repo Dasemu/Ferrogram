@@ -57,7 +57,9 @@ pub struct OpusDecoder(opus::Decoder);
 
 impl OpusDecoder {
     pub fn new() -> Option<Self> {
-        opus::Decoder::new(RATE, opus::Channels::Mono).ok().map(Self)
+        opus::Decoder::new(RATE, opus::Channels::Mono)
+            .ok()
+            .map(Self)
     }
 
     /// Decode one jitter-buffer slot into exactly [`FRAME`] samples.
@@ -143,7 +145,13 @@ impl CapturePipeline {
     /// Feed interleaved samples; every complete 20 ms frame is encoded and
     /// passed to `emit`. `muted` sends silence (the stream keeps running, as
     /// in the official apps).
-    pub fn push(&mut self, data: &[f32], muted: bool, shared: &Shared, mut emit: impl FnMut(Vec<u8>)) {
+    pub fn push(
+        &mut self,
+        data: &[f32],
+        muted: bool,
+        shared: &Shared,
+        mut emit: impl FnMut(Vec<u8>),
+    ) {
         self.mono.clear();
         self.mono.extend(
             data.chunks(self.channels)
@@ -155,7 +163,12 @@ impl CapturePipeline {
             let v = if muted { 0.0 } else { s };
             self.pending.push((v.clamp(-1.0, 1.0) * 32767.0) as i16);
             if self.pending.len() == FRAME {
-                let peak = self.pending.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                let peak = self
+                    .pending
+                    .iter()
+                    .map(|s| s.unsigned_abs())
+                    .max()
+                    .unwrap_or(0);
                 shared.mic_level.store(u32::from(peak), Ordering::Relaxed);
                 if let Some(p) = self.encoder.encode(&self.pending) {
                     emit(p);
@@ -296,9 +309,7 @@ fn find_device(
 ) -> Option<cpal::Device> {
     use cpal::traits::DeviceTrait;
     let name = name?;
-    devices
-        .take(64)
-        .find(|d| d.name().is_ok_and(|n| n == name))
+    devices.take(64).find(|d| d.name().is_ok_and(|n| n == name))
 }
 
 fn open_streams(
@@ -427,14 +438,23 @@ mod tests {
 
     #[test]
     fn resampler_lengths() {
-        for (from, to) in [(44_100, 48_000), (48_000, 44_100), (16_000, 48_000), (48_000, 48_000)] {
+        for (from, to) in [
+            (44_100, 48_000),
+            (48_000, 44_100),
+            (16_000, 48_000),
+            (48_000, 48_000),
+        ] {
             let mut r = Resampler::new(from, to);
             let mut out = Vec::new();
             for _ in 0..100 {
                 r.process(&[0.25; 441], &mut out);
             }
             let expect = 44_100.0 * f64::from(to) / f64::from(from);
-            assert!((out.len() as f64 - expect).abs() < 3.0, "{from}->{to}: {}", out.len());
+            assert!(
+                (out.len() as f64 - expect).abs() < 3.0,
+                "{from}->{to}: {}",
+                out.len()
+            );
             assert!(out.iter().all(|v| (v - 0.25).abs() < 0.26));
         }
     }
@@ -462,7 +482,8 @@ mod tests {
         let mut out = vec![0.0f32; 960 * 20];
         play.fill(&mut out, &shared);
         // Skip codec warm-up; the tone must come through with real energy.
-        let rms = (out[4800..].iter().map(|s| s * s).sum::<f32>() / (out.len() - 4800) as f32).sqrt();
+        let rms =
+            (out[4800..].iter().map(|s| s * s).sum::<f32>() / (out.len() - 4800) as f32).sqrt();
         assert!(rms > 0.15, "rms {rms}");
     }
 
@@ -473,7 +494,9 @@ mod tests {
         let mut phase = 0.0;
         let mut n = 0;
         for _ in 0..10 {
-            cap.push(&sine(440.0, 48_000, 960, &mut phase), true, &shared, |_| n += 1);
+            cap.push(&sine(440.0, 48_000, 960, &mut phase), true, &shared, |_| {
+                n += 1
+            });
         }
         assert_eq!(n, 10);
         assert_eq!(shared.mic_level.load(Ordering::Relaxed), 0);
@@ -485,7 +508,9 @@ mod tests {
         for f in [
             Frame::Packet(vec![0xff; 3]),
             Frame::Packet(vec![]),
-            Frame::Lost { next: Some(vec![1, 2, 3]) },
+            Frame::Lost {
+                next: Some(vec![1, 2, 3]),
+            },
             Frame::Lost { next: None },
             Frame::Silence,
         ] {

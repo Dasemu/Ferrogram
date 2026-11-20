@@ -299,9 +299,15 @@ mod tests {
     #[test]
     fn xor_address_round_trip() {
         let tx = [9u8; 12];
-        for a in ["192.0.2.1:32853", "[2001:db8:1234:5678:11:2233:4455:6677]:32853"] {
+        for a in [
+            "192.0.2.1:32853",
+            "[2001:db8:1234:5678:11:2233:4455:6677]:32853",
+        ] {
             let addr: SocketAddr = a.parse().unwrap();
-            assert_eq!(decode_xor_addr(&encode_xor_addr(addr, &tx), &tx), Some(addr));
+            assert_eq!(
+                decode_xor_addr(&encode_xor_addr(addr, &tx), &tx),
+                Some(addr)
+            );
         }
         // RFC 5769 §2.2 response: XOR-MAPPED-ADDRESS 192.0.2.1:32853.
         let v = hex("0001a147e112a643");

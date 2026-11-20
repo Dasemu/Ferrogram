@@ -92,7 +92,10 @@ pub fn decrypt(key: &CallKey, dir: Direction, packet: &[u8]) -> Option<Vec<u8>> 
     ctr(&k, &iv, &mut plain);
     let expect = msg_key(&key.0, x, &plain);
     // Constant-time compare.
-    let diff = expect.iter().zip(mk.iter()).fold(0u8, |d, (a, b)| d | (a ^ b));
+    let diff = expect
+        .iter()
+        .zip(mk.iter())
+        .fold(0u8, |d, (a, b)| d | (a ^ b));
     (diff == 0).then_some(plain)
 }
 

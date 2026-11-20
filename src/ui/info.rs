@@ -65,6 +65,7 @@ pub fn view<'a>(app: &'a App) -> Option<Element<'a, Message>> {
                 ),
                 emoji_title(chat.title.clone(), m.font_l, p.text_primary),
                 text(status).size(m.font_s).color(p.text_secondary),
+                call_action(app, chat),
             ]
             .spacing(6)
             .align_x(Alignment::Center),
@@ -388,4 +389,24 @@ fn list_row<'a>(app: &'a App, chat: i64, item: &'a SharedItem) -> Element<'a, Me
         .on_press(msg)
         .style(theme::menu_item(p, false))
         .into()
+}
+
+/// "Call" under the name of a user, like the official profile actions.
+fn call_action<'a>(app: &'a App, chat: &'a crate::model::Chat) -> Element<'a, Message> {
+    if chat.kind != ChatKind::User {
+        return Space::new().into();
+    }
+    let p = app.theme.palette;
+    button(
+        row![
+            icon(Icon::Phone, 18.0, p.link),
+            text("Call").size(app.theme.metrics.font_m)
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .padding([6, 12])
+    .on_press(Message::Ui(Ui::CallStart(chat.id)))
+    .style(theme::link_button(p))
+    .into()
 }

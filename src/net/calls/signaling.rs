@@ -124,7 +124,9 @@ fn string(v: Option<&Value>) -> Option<String> {
 }
 
 fn array(v: Option<&Value>) -> &[Value] {
-    v.and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
+    v.and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
 }
 
 /// Hostile-input bounds for list lengths inside a message.
@@ -732,7 +734,9 @@ mod tests {
         let m = Message::parse(
             br#"{"@type":"NegotiateChannels","exchangeId":7,"contents":[{"type":"data","ssrc":"1"},{"type":"audio","ssrc":"9"}]}"#,
         );
-        assert!(matches!(m, Some(Message::NegotiateChannels { ref contents, .. }) if contents.len() == 1));
+        assert!(
+            matches!(m, Some(Message::NegotiateChannels { ref contents, .. }) if contents.len() == 1)
+        );
     }
 
     #[test]
